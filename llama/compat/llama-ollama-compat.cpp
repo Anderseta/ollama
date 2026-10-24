@@ -975,6 +975,11 @@ void handle_qwen3next(gguf_context * meta, ggml_context * ctx) {
 // Split expert gate/up tensors are valid in llama.cpp GGUFs, so they are not
 // sufficient to identify an existing published Ollama model.
 
+bool needs_gemma4_tokenizer_fix(const gguf_context * meta) {
+    return string_kv_equals(meta, "tokenizer.ggml.model", "llama") &&
+        (has_key(meta, "tokenizer.ggml.merges") || string_kv_equals(meta, "tokenizer.ggml.pre", "gemma4"));
+}
+
 bool detect_ollama_gemma4(const gguf_context * meta, const ggml_context * ctx) {
     const int64_t arch_kid = gguf_find_key(meta, "general.architecture");
     if (arch_kid < 0) return false;
@@ -983,7 +988,7 @@ bool detect_ollama_gemma4(const gguf_context * meta, const ggml_context * ctx) {
         || any_tensor_with_prefix(ctx, "v.")
         || any_tensor_with_prefix(ctx, "mm.")
         || any_tensor_with_prefix(ctx, "model.vision_tower.")
-        || string_kv_equals(meta, "tokenizer.ggml.model", "llama");
+        || needs_gemma4_tokenizer_fix(meta);
 }
 
 bool has_gemma4_split_expert_sidecars(ggml_context * ctx, uint32_t b) {
@@ -1067,14 +1072,8 @@ void handle_gemma4(const llama_model_loader * ml, gguf_context * meta, ggml_cont
     //
     // Ollama already supplies `tokenizer.ggml.merges` (needed for BPE) and
     // `tokenizer.ggml.pre = 'gemma4'`, so flipping the model name is enough.
-    {
-        const int64_t kid = gguf_find_key(meta, "tokenizer.ggml.model");
-        if (kid >= 0) {
-            const char * cur = gguf_get_val_str(meta, kid);
-            if (cur && std::strcmp(cur, "llama") == 0) {
-                gguf_set_val_str(meta, "tokenizer.ggml.model", "gemma4");
-            }
-        }
+    if (needs_gemma4_tokenizer_fix(meta)) {
+        gguf_set_val_str(meta, "tokenizer.ggml.model", "gemma4");
     }
 
     // Hide embedded audio + vision + projector tensors from the text loader.
