@@ -48,7 +48,7 @@ avoids reading and caching experts unrelated to the first user prompt.
   decommits adjacent cold pages in batches and checks success before reducing the
   resident counter. Queue entries are allocated before committing pages, so an
   allocation failure cannot leave resident pages uncharged. A fixed aligned
-  4 MiB I/O staging buffer is also locked; it is
+  4 MiB I/O staging buffer (plus alignment padding) is also locked; it is
   separate from the host-weight quota.
 * CPU operations, host-to-GPU expert copies, and existing GPU expert-cache misses
   all use the same model-owned cache. Device uploads complete before staging or
@@ -58,6 +58,17 @@ avoids reading and caching experts unrelated to the first user prompt.
   in ranges, retaining the finite padding needed by CUDA MMQ.
 * Initial device weights load through the locked I/O staging buffer, without a
   second pageable host copy or whole-model page-cache scan.
+* Selected expert ranges are prepared together, ordered by GGUF shard and file
+  offset. Windows queues up to four unbuffered reads, using a fixed 4 MiB plus
+  16 KiB staging allocation. Committed pages, including reads in flight, remain
+  charged to the weight budget. Platforms without this queued path retain
+  synchronous direct reads. An oversized prefetch batch falls back to bounded
+  streaming rather than increasing the quota.
+* Read-ahead only covers experts already selected by the router. It neither
+  predicts nor drops experts. The copy following a prefetch does not promote a
+  newly loaded page as if it had been reused. Cache hits skip I/O planning.
+  Failed reads drain outstanding I/O before releasing buffers, and incomplete
+  GPU fills invalidate their new mappings rather than exposing old device bytes.
 * Token embedding export/lookup helpers also use the cache, including accesses
   made outside graph execution. Their original bulk path stays unchanged for
   unmanaged tensors. Managed weights are read-only; in-place graph updates and
@@ -125,6 +136,14 @@ expert biases, tied storage, cache hits/evictions, bounds, unaligned EOF reads,
 truncation failures and read-only enforcement. CTest uses the build directory.
 The Ollama compatibility layer is built and tested separately, with both patches
 applied to clean b11845 sources. Go tests cover `llm`, `api`, and `envconfig`.
+
+The 2026-10-24 efficiency pass additionally tests queued prefetch, duplicate and
+out-of-bounds ranges, fallback when a prefetch exceeds the quota, truncated reads
+with multiple requests in flight, and split GGUF files. It rechecks complete
+logits, quantized expert banks, larger prompt batches and concurrent contexts.
+The Windows I/O optimization does not change model weights, quantization,
+routing, context size or arithmetic. It adds no second on-disk model index:
+GGUF tensor offsets are already indexed at load time.
 
 Additional tiny fixtures can be generated using the native tree's `gguf-py` and
 NumPy, with an explicit output directory; they are not trained language models:
