@@ -37,21 +37,31 @@ avoids reading and caching experts unrelated to the first user prompt.
 * Raw host GGUF tensors receive stable virtual address reservations. Reserving
   addresses does not read or commit the complete tensor.
 * A scheduler preparation hook loads weights before each active consuming op.
-  `MUL_MAT_ID` loads selected experts; `GET_ROWS` loads selected rows. Other ops
+  `MUL_MAT_ID` loads selected experts; `GET_ROWS` loads selected rows; `ADD_ID`
+  loads selected expert biases. Other ops
   require their complete managed input spans. Inactive SELECT branches are skipped.
 * Resident pages are 64 KiB, charged including padding. A segmented LRU promotes
   reuse and evicts probation pages first; all pages needed by the current operation
   are pinned during selection. A required set larger than the quota aborts cleanly.
 * Windows uses unbuffered GGUF reads and VirtualLock; Linux uses O_DIRECT and mlock.
   Failure to lock is an error, never a switch to pageable model weights. Eviction
-  decommits pages. A fixed aligned 4 MiB I/O staging buffer is also locked; it is
+  decommits adjacent cold pages in batches and checks success before reducing the
+  resident counter. Queue entries are allocated before committing pages, so an
+  allocation failure cannot leave resident pages uncharged. A fixed aligned
+  4 MiB I/O staging buffer is also locked; it is
   separate from the host-weight quota.
 * CPU operations, host-to-GPU expert copies, and existing GPU expert-cache misses
   all use the same model-owned cache. Device uploads complete before staging or
   host cache pages can be reused. Concurrent contexts serialize managed-weight
   execution until a separate pinning/prefetch design is implemented.
+  Prompt batches also reuse experts already on the GPU and copy adjacent experts
+  in ranges, retaining the finite padding needed by CUDA MMQ.
 * Initial device weights load through the locked I/O staging buffer, without a
   second pageable host copy or whole-model page-cache scan.
+* Token embedding export/lookup helpers also use the cache, including accesses
+  made outside graph execution. Their original bulk path stays unchanged for
+  unmanaged tensors. Managed weights are read-only; in-place graph updates and
+  whole-model GGUF export are rejected. Use the original GGUF for export.
 * Host weight mapping spans are replaced by the weight-cache allowance in Ollama's
   memory accounting. Device, KV, and other buffer allocations remain counted.
 
@@ -64,10 +74,10 @@ while searching the number of GPU layers when the initial placement does not fit
 
 This requires a supported raw GGUF MoE, mmap, disabled host repacking, disabled
 whole-model tensor checking, and no whole-model mlock. The common model-parameter
-conversion selects the compatible loading settings. Transformed host layouts and
+conversion selects the compatible loading settings. Transformed layouts and
 non-MoE explicit requests fail rather than silently ignoring the limit.
 It is architecture-independent at the graph-op level, but universal support is not
-established by the initial three-architecture test matrix. Windows/CUDA is the
+established by the test matrix below. Windows/CUDA is the
 local validation target; other OS and backend paths still require validation.
 
 ## Source and builds
@@ -90,3 +100,44 @@ results are recorded in the laboratory diagnostics, not production models.
 This is an experimental fork. No upstream acceptance or production
 readiness is implied; an upstream design discussion and wider platform testing
 would be needed before proposing a contribution.
+
+## Expanded local validation (2026-10-23)
+
+Windows CPU and CUDA tests cover small random-weight fixtures for qwen3moe,
+llama/Mixtral (including tied input/output weights), qwen2moe with shared experts,
+olmoe, gpt-oss with expert biases, gemma4 with fused experts, and nemotron_h_moe
+with recurrent layers. The extended mode compares full logits over 97 decode
+calls, including 32-token and 48-token prompt batches, q8_0 KV caches, embedding lookup, and state
+save/restore. Separate parallel-context tests compare concurrent execution
+against serial execution on a shared model. Q4_K_M, Q8_0 and MXFP4 expert tensors
+are covered, including dimensions large enough to avoid K-quant fallback.
+
+The standalone cache test needs no model download:
+
+```sh
+test-moe-ram --cache /explicit/test/directory
+test-moe-ram small-moe.gguf 2 0 0 extended
+test-moe-ram small-moe.gguf 2 99 1 parallel
+```
+
+It checks exact bytes, strided and duplicate routing, multidimensional rows,
+expert biases, tied storage, cache hits/evictions, bounds, unaligned EOF reads,
+truncation failures and read-only enforcement. CTest uses the build directory.
+The Ollama compatibility layer is built and tested separately, with both patches
+applied to clean b11845 sources. Go tests cover `llm`, `api`, and `envconfig`.
+
+Additional tiny fixtures can be generated using the native tree's `gguf-py` and
+NumPy, with an explicit output directory; they are not trained language models:
+
+```sh
+python scripts/make-moe-ram-fixtures.py --native-source /path/to/llama.cpp --output /path/to/fixtures
+```
+
+Linux and macOS remain unvalidated at runtime. Linux needs a filesystem that
+supports direct I/O with the current 4096-byte alignment and sufficient locked
+memory allowance (`ulimit -l`, or `LimitMEMLOCK` for a service). A low allowance
+is reported, and lock failure never falls back to pageable weights. GPU backends
+other than CUDA, multimodal projectors, adapters, training, speculative decoding
+and every architecture/quantization combination are not covered by this matrix.
+Projectors/adapters are separate allocations outside this cache. Passing these
+tests does not establish universal MoE support or a total process-RAM cap.

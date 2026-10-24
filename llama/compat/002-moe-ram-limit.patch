@@ -228,7 +228,7 @@ index 97250c2..39ee851 100644
      llama-sampler.cpp
      llama-vocab.cpp
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ca84fc4..5b4f620 100644
+index ca84fc4..2e707f8 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,6 @@
@@ -269,7 +269,7 @@ index ca84fc4..5b4f620 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
      }
-@@ -2783,6 +2805,39 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+@@ -2783,6 +2805,59 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
          return true;
      }
  
@@ -296,8 +296,28 @@ index ca84fc4..5b4f620 100644
 +                selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
 +                for (int32_t id : selected) {
 +                    if (id < 0 || id >= src->ne[2]) { throw std::runtime_error("invalid expert-copy index"); }
-+                    const size_t padding = id + 1 < src->ne[2] ? std::min<size_t>(src->nb[2], 512) : 0;
-+                    lctx->model.ram_cache->copy(backend, src, dst, id*src->nb[2], id*dst->nb[2], src->nb[2] + padding);
++                }
++                const size_t expert_size = src->nb[2];
++                for (size_t i = 0; i < selected.size();) {
++                    const int64_t first_id = selected[i++];
++                    int64_t last = first_id;
++                    while (i < selected.size() && selected[i] == last + 1) { last = selected[i++]; }
++                    int64_t next = first_id;
++                    // Reuse device-resident experts during prompt batches as in the ordinary copy path.
++                    for (int64_t e = first_id; e <= last && lctx->moe_cache;) {
++                        const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
++                        if (!n) { ++e; continue; }
++                        if (next < e) {
++                            lctx->model.ram_cache->copy(backend, src, dst, next*expert_size, next*expert_size, (e - next)*expert_size);
++                        }
++                        e += n; next = e;
++                    }
++                    // MMQ needs finite padding even when the last selected expert came from the GPU cache.
++                    const size_t padding = last + 1 < src->ne[2] ? std::min<size_t>(expert_size, 512) : 0;
++                    const size_t size = (last + 1 - next)*expert_size + padding;
++                    if (size) {
++                        lctx->model.ram_cache->copy(backend, src, dst, next*expert_size, next*expert_size, size);
++                    }
 +                }
 +            } else { lctx->model.ram_cache->copy(backend, src, dst, 0, 0, ggml_nbytes(src)); }
 +            return true;
@@ -310,7 +330,7 @@ index ca84fc4..5b4f620 100644
  
      // the ids must be computed before the split starts, so only the first node of the split is considered
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 066e69e..e588c31 100644
+index 066e69e..c027acf 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1,4 +1,5 @@
@@ -324,6 +344,9 @@ index 066e69e..e588c31 100644
          const bool from_mapping = use_mmap || lazy.has(cur);
  
 +        if (ram_cache) {
++            if (cur->type != weight->tensor->type || n_size != ggml_nbytes(weight->tensor)) {
++                throw std::runtime_error("MoE RAM limit cannot stream a transformed tensor");
++            }
 +            // Host weights get stable virtual addresses, but no resident copy until an op reads them.
 +            const auto & mapping = mappings.at(weight->idx);
 +            uint8_t * raw = (uint8_t *) mapping->addr() + weight->offs;
@@ -337,9 +360,6 @@ index 066e69e..e588c31 100644
 +                }
 +            }
 +            if (cur->buffer && ggml_backend_buffer_is_host(cur->buffer)) {
-+                if (cur->type != weight->tensor->type || n_size != ggml_nbytes(weight->tensor)) {
-+                    throw std::runtime_error("MoE RAM limit cannot stream a transformed host tensor");
-+                }
 +                ram_cache->bind(cur, weight->idx, weight->offs);
 +            } else {
 +                ram_cache->load_device_tensor(cur, weight->idx, weight->offs);
@@ -373,10 +393,10 @@ index ed59079..de848c0 100644
      bool check_tensors;
 diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
 new file mode 100644
-index 0000000..cc9c182
+index 0000000..ec74ab2
 --- /dev/null
 +++ b/src/llama-model-ram.cpp
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,478 @@
 +#include "llama-model-ram.h"
 +#include "llama-impl.h"
 +#include "ggml.h"
@@ -389,10 +409,8 @@ index 0000000..cc9c182
 +#include <limits>
 +#include <list>
 +#include <map>
-+#include <set>
 +#include <stdexcept>
 +#include <string>
-+#include <unordered_map>
 +#include <vector>
 +
 +#ifdef _WIN32
@@ -403,6 +421,7 @@ index 0000000..cc9c182
 +#include <fcntl.h>
 +#include <sys/mman.h>
 +#include <sys/stat.h>
++#include <sys/resource.h>
 +#include <unistd.h>
 +#endif
 +
@@ -417,9 +436,10 @@ index 0000000..cc9c182
 +size_t round_up(size_t n, size_t a) { return checked_add(n, a - 1) / a * a; }
 +
 +struct reader {
++    const size_t size;
 +#ifdef _WIN32
 +    HANDLE handle = INVALID_HANDLE_VALUE;
-+    explicit reader(const llama_file & file) {
++    explicit reader(const llama_file & file) : size(file.size()) {
 +        HANDLE old = (HANDLE) _get_osfhandle(file.file_id());
 +        std::vector<wchar_t> path(32768);
 +        DWORD n = GetFinalPathNameByHandleW(old, path.data(), (DWORD) path.size(), FILE_NAME_NORMALIZED);
@@ -441,7 +461,7 @@ index 0000000..cc9c182
 +    }
 +#else
 +    int fd = -1;
-+    explicit reader(const llama_file & file) {
++    explicit reader(const llama_file & file) : size(file.size()) {
 +#if defined(__linux__)
 +        std::string path = "/proc/self/fd/" + std::to_string(file.file_id());
 +        fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
@@ -499,12 +519,14 @@ index 0000000..cc9c182
 +}
 +void decommit(void * ptr, size_t size) {
 +#ifdef _WIN32
-+    VirtualUnlock(ptr, size);
-+    VirtualFree(ptr, size, MEM_DECOMMIT);
++    if (!VirtualFree(ptr, size, MEM_DECOMMIT)) {
++        throw std::runtime_error("MoE RAM cache: cannot release weight pages");
++    }
 +#else
-+    munlock(ptr, size);
-+    madvise(ptr, size, MADV_DONTNEED);
-+    mprotect(ptr, size, PROT_NONE);
++    // Replace the range atomically instead of unlocking pages before discarding them.
++    if (mmap(ptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
++        throw std::runtime_error("MoE RAM cache: cannot release weight pages");
++    }
 +#endif
 +}
 +}
@@ -528,6 +550,8 @@ index 0000000..cc9c182
 +    };
 +    size_t limit, resident = 0, peak = 0;
 +    uint64_t epoch = 0, hits = 0, misses = 0, bytes_read = 0;
++    uint64_t read_calls = 0, evicted_pages = 0, eviction_calls = 0;
++    int64_t read_us = 0, release_us = 0, commit_us = 0, upload_us = 0;
 +    std::vector<std::unique_ptr<reader>> readers;
 +    std::vector<std::unique_ptr<region>> regions;
 +    std::map<uintptr_t, region *> addresses;
@@ -544,6 +568,13 @@ index 0000000..cc9c182
 +#ifdef _WIN32
 +        if (!GetProcessWorkingSetSize(GetCurrentProcess(), &old_min, &old_max)) { throw std::runtime_error("MoE RAM cache: cannot query lock allowance"); }
 +        current_min = old_min;
++#else
++        struct rlimit locked = {};
++        if (getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur != RLIM_INFINITY &&
++            locked.rlim_cur < checked_add(limit, io_size + 2 * alignment)) {
++            LLAMA_LOG_WARN("MoE RAM cache: memlock allowance is %llu bytes; weights plus I/O need %zu bytes. Increase ulimit -l or the service LimitMEMLOCK if locking fails.\n",
++                (unsigned long long) locked.rlim_cur, checked_add(limit, io_size + 2 * alignment));
++        }
 +#endif
 +        // Complete all potentially throwing reader construction before allocating the raw staging buffer.
 +        for (const auto & file : files) { readers.emplace_back(new reader(*file)); }
@@ -566,9 +597,7 @@ index 0000000..cc9c182
 +        }
 +    }
 +    ~impl() {
-+        for (auto & r : regions) {
-+            for (auto & p : r->pages) { if (p.resident) { decommit(r->data + p.index * page_size, page_size); } }
-+        }
++        // Releasing each reservation also releases its locked pages.
 +        regions.clear();
 +#ifdef _WIN32
 +        VirtualUnlock(staging, io_size + 2 * alignment);
@@ -592,7 +621,10 @@ index 0000000..cc9c182
 +        if (size > io_size) { throw std::runtime_error("MoE RAM cache: I/O request exceeds staging capacity"); }
 +        size_t base = offset / alignment * alignment;
 +        size_t prefix = offset - base;
++        const int64_t start = ggml_time_us();
 +        size_t got = readers[file]->read_at(staging, round_up(prefix + size, alignment), base);
++        read_us += ggml_time_us() - start;
++        ++read_calls;
 +        bytes_read += got;
 +        if (got < prefix + size) { throw std::runtime_error("MoE RAM cache: truncated GGUF read"); }
 +        return staging + prefix;
@@ -621,27 +653,33 @@ index 0000000..cc9c182
 +    }
 +    void touch(page & p) {
 +        auto & from = p.hot ? protected_pages : probation;
-+        from.erase(p.position);
++        protected_pages.splice(protected_pages.end(), from, p.position);
 +        p.hot = true;
-+        protected_pages.push_back(&p);
-+        p.position = std::prev(protected_pages.end());
 +        if (protected_pages.size() > limit / page_size / 2) {
 +            page * cold = protected_pages.front();
-+            protected_pages.pop_front();
++            probation.splice(probation.end(), protected_pages, cold->position);
 +            cold->hot = false;
-+            probation.push_back(cold);
-+            cold->position = std::prev(probation.end());
 +        }
 +    }
-+    void evict() {
++    void evict(size_t wanted) {
 +        for (auto * queue : { &probation, &protected_pages }) {
 +            for (auto it = queue->begin(); it != queue->end(); ++it) {
 +                page * p = *it;
 +                if (p->epoch == epoch) { continue; }
-+                decommit(p->owner->data + p->index * page_size, page_size);
-+                p->resident = false;
-+                queue->erase(it);
-+                resident -= page_size;
++                size_t n = 1;
++                auto end = std::next(it);
++                while (end != queue->end() && n * page_size < std::min(wanted, io_size)) {
++                    page * next = *end;
++                    if (next->epoch == epoch || next->owner != p->owner || next->index != p->index + n) { break; }
++                    ++n; ++end;
++                }
++                const int64_t start = ggml_time_us();
++                decommit(p->owner->data + p->index * page_size, n * page_size);
++                release_us += ggml_time_us() - start;
++                evicted_pages += n; ++eviction_calls;
++                for (auto cur = it; cur != end; ++cur) { (*cur)->resident = false; }
++                queue->erase(it, end);
++                resident -= n * page_size;
 +                return;
 +            }
 +        }
@@ -664,7 +702,7 @@ index 0000000..cc9c182
 +        for (page * p : needed) {
 +            if (p->resident) { ++hits; touch(*p); } else { ++misses; missing += page_size; }
 +        }
-+        while (missing > limit - resident) { evict(); }
++        while (missing > limit - resident) { evict(missing - (limit - resident)); }
 +        allowance(resident + missing);
 +        std::sort(needed.begin(), needed.end(), [](page * a, page * b) {
 +            return std::less<region *>()(a->owner, b->owner) || (a->owner == b->owner && a->index < b->index);
@@ -681,14 +719,20 @@ index 0000000..cc9c182
 +            region & r = *first->owner;
 +            size_t offset = first->index * page_size;
 +            size_t bytes = n * page_size;
++            // Allocate queue entries before committing; bad_alloc must not leave uncharged pages.
++            std::list<page *> ready;
++            for (size_t j = 0; j < n; ++j) { ready.push_back(needed[i + j]); }
++            const int64_t start = ggml_time_us();
 +            commit_lock(r.data + offset, bytes);
++            commit_us += ggml_time_us() - start;
 +            try { read(r.file, checked_add(r.offset, offset), r.data + offset, std::min(bytes, r.size - offset)); }
 +            catch (...) { decommit(r.data + offset, bytes); throw; }
-+            for (size_t j = 0; j < n; ++j) {
-+                page * p = needed[i + j];
++            for (auto it = ready.begin(); it != ready.end(); ++it) {
++                page * p = *it;
 +                p->resident = true; p->hot = false;
-+                probation.push_back(p); p->position = std::prev(probation.end());
++                p->position = it;
 +            }
++            probation.splice(probation.end(), ready);
 +            resident += bytes; peak = std::max(peak, resident);
 +            i += n;
 +        }
@@ -704,10 +748,20 @@ index 0000000..cc9c182
 +    LLAMA_LOG_INFO("moe_ram: limit = %.2f MiB, resident = %.2f MiB, peak = %.2f MiB, hits = %llu, misses = %llu, SSD reads = %.2f MiB\n",
 +        p.limit / 1048576.0, p.resident / 1048576.0, p.peak / 1048576.0,
 +        (unsigned long long) p.hits, (unsigned long long) p.misses, p.bytes_read / 1048576.0);
++    LLAMA_LOG_DEBUG("moe_ram: I/O = %.1f ms / %llu reads, commit = %.1f ms, release = %.1f ms / %llu calls / %llu pages, upload = %.1f ms\n",
++        p.read_us/1000.0, (unsigned long long) p.read_calls, p.commit_us/1000.0, p.release_us/1000.0,
++        (unsigned long long) p.eviction_calls, (unsigned long long) p.evicted_pages, p.upload_us/1000.0);
++}
++llama_model_ram_stats llama_model_ram_cache::stats() const {
++    const auto & p = *pimpl;
++    return { p.limit, p.resident, p.peak, p.hits, p.misses, p.bytes_read, p.read_calls, p.evicted_pages, p.eviction_calls };
 +}
 +void llama_model_ram_cache::bind(ggml_tensor * t, uint16_t file, size_t offset) {
 +    auto & p = *pimpl;
 +    const size_t bytes = ggml_nbytes(t);
++    if (file >= p.readers.size() || offset > p.readers[file]->size || bytes > p.readers[file]->size - offset) {
++        throw std::runtime_error("MoE RAM cache: tensor exceeds GGUF file bounds");
++    }
 +    for (auto & r : p.regions) {
 +        if (r->file == file && r->offset == offset && r->size == bytes) { t->data = r->data; return; }
 +    }
@@ -723,19 +777,23 @@ index 0000000..cc9c182
 +    // SELECT branches retain inactive nodes and their inputs may alias live intermediates.
 +    if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) { return false; }
 +    if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) { return false; }
++    if (contains(node)) { return true; }
 +    for (const auto * src : node->src) { if (contains(src)) { return true; } }
 +    return false;
 +}
 +bool llama_model_ram_cache::prepare(ggml_tensor * node) {
 +    auto & p = *pimpl;
 +    try {
++        p.last_error.clear();
++        if (contains(node)) { throw std::runtime_error("MoE RAM cache: managed model weights are read-only"); }
 +        ++p.epoch;
 +        std::vector<impl::page *> needed;
 +        for (int source = 0; source < GGML_MAX_SRC; ++source) {
 +            const ggml_tensor * t = node->src[source];
 +            if (!contains(t)) { continue; }
-+            if (source == 0 && (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS)) {
-+                const ggml_tensor * ids = node->src[node->op == GGML_OP_MUL_MAT_ID ? 2 : 1];
++            const bool expert_bias = source == 1 && node->op == GGML_OP_ADD_ID;
++            if (expert_bias || (source == 0 && (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS))) {
++                const ggml_tensor * ids = node->src[node->op == GGML_OP_GET_ROWS ? 1 : 2];
 +                if (!ids || ids->type != GGML_TYPE_I32 || ids->ne[3] != 1) { throw std::runtime_error("MoE RAM cache: unsupported routing index layout"); }
 +                if (contains(ids)) {
 +                    p.range(needed, ids, 0, ggml_nbytes(ids));
@@ -751,6 +809,9 @@ index 0000000..cc9c182
 +                            if (node->op == GGML_OP_MUL_MAT_ID) {
 +                                if (id < 0 || id >= t->ne[2]) { throw std::runtime_error("MoE RAM cache: invalid expert index"); }
 +                                p.range(needed, t, id*t->nb[2], t->nb[2]);
++                            } else if (expert_bias) {
++                                if (id < 0 || id >= t->ne[1]) { throw std::runtime_error("MoE RAM cache: invalid expert bias index"); }
++                                p.range(needed, t, id*t->nb[1], ggml_row_size(t->type, t->ne[0]));
 +                            } else {
 +                                if (id < 0 || id >= t->ne[1] || i1 >= t->ne[2] || i2 >= t->ne[3]) { throw std::runtime_error(std::string("MoE RAM cache: invalid row index in ") + node->name + " reading " + t->name + " id=" + std::to_string(id) + " rows=" + std::to_string(t->ne[1]) + " i1=" + std::to_string(i1) + "/" + std::to_string(t->ne[2]) + " i2=" + std::to_string(i2) + "/" + std::to_string(t->ne[3])); }
 +                                p.range(needed, t, id*t->nb[1] + i1*t->nb[2] + i2*t->nb[3], ggml_row_size(t->type, t->ne[0]));
@@ -773,6 +834,22 @@ index 0000000..cc9c182
 +        done += n;
 +    }
 +}
++void llama_model_ram_cache::read(const ggml_tensor * src, size_t offset, void * dst, size_t size) {
++    auto & p = *pimpl;
++    if (checked_add(offset, size) > ggml_nbytes(src)) { throw std::runtime_error("MoE RAM cache: invalid host-copy range"); }
++    if (!contains(src)) { ggml_backend_tensor_get(src, dst, offset, size); return; }
++    const auto * r = p.find(src);
++    for (size_t done = 0; done < size;) {
++        const size_t at = checked_add((uintptr_t) src->data - (uintptr_t) r->data, checked_add(offset, done));
++        const size_t n = std::min({ size - done, io_size, p.limit - at % page_size });
++        ++p.epoch;
++        std::vector<impl::page *> needed;
++        p.range(needed, src, offset + done, n);
++        p.ensure(needed);
++        memcpy((uint8_t *) dst + done, (const uint8_t *) src->data + offset + done, n);
++        done += n;
++    }
++}
 +bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size) {
 +    auto & p = *pimpl;
 +    if (!contains(src)) { return false; }
@@ -788,8 +865,10 @@ index 0000000..cc9c182
 +        std::vector<impl::page *> needed;
 +        p.range(needed, src, checked_add(src_offset, done), n);
 +        p.ensure(needed);
++        const int64_t start = ggml_time_us();
 +        ggml_backend_tensor_set(dst, (const uint8_t *) src->data + src_offset + done, dst_offset + done, n);
 +        ggml_backend_synchronize(backend);
++        p.upload_us += ggml_time_us() - start;
 +        done += n;
 +    }
 +    return true;
@@ -798,10 +877,10 @@ index 0000000..cc9c182
 +const char * llama_model_ram_cache::error() const { return pimpl->last_error.c_str(); }
 diff --git a/src/llama-model-ram.h b/src/llama-model-ram.h
 new file mode 100644
-index 0000000..0c8cf7b
+index 0000000..7ad25ee
 --- /dev/null
 +++ b/src/llama-model-ram.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,34 @@
 +#pragma once
 +
 +#include "ggml-backend.h"
@@ -811,6 +890,11 @@ index 0000000..0c8cf7b
 +#include <mutex>
 +
 +// A model-owned, locked host-weight cache. KV and compute buffers are not charged.
++struct llama_model_ram_stats {
++    size_t limit, resident, peak;
++    uint64_t hits, misses, bytes_read, read_calls, evicted_pages, eviction_calls;
++};
++
 +class llama_model_ram_cache {
 +public:
 +    llama_model_ram_cache(size_t limit, const llama_files & files);
@@ -821,15 +905,18 @@ index 0000000..0c8cf7b
 +    bool prepare(ggml_tensor * node);
 +    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size);
 +    void load_device_tensor(ggml_tensor * tensor, uint16_t file, size_t offset);
++    // Caller holds acquire(), as for prepare() and copy().
++    void read(const ggml_tensor * tensor, size_t offset, void * dst, size_t size);
 +    std::unique_lock<std::mutex> acquire();
 +    const char * error() const;
 +    void report() const;
++    llama_model_ram_stats stats() const;
 +private:
 +    struct impl;
 +    std::unique_ptr<impl> pimpl;
 +};
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 65c42f8..2517b37 100644
+index 65c42f8..59915bf 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1,4 +1,5 @@
@@ -866,7 +953,17 @@ index 65c42f8..2517b37 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -3374,6 +3385,7 @@ llama_model_params llama_model_default_params() {
+@@ -1964,6 +1975,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         } else {
+             ggml_backend_buffer_t buf;
++            if (ram_cache && ggml_backend_buft_is_host(buft)) {
++                throw std::runtime_error("MoE RAM limit needs a host backend that can wrap mapped weights; refusing an unbounded allocation");
++            }
+             if (ml.no_alloc) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+@@ -3374,6 +3388,7 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -874,6 +971,76 @@ index 65c42f8..2517b37 100644
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
+@@ -3953,18 +3968,20 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+ }
+ 
+ // read rows [row0, row0 + n_rows) of a 2D tensor as F32
+-static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, int64_t n_rows, float * out) {
++static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, int64_t n_rows, float * out, llama_model_ram_cache * cache) {
+     const size_t   nelements = (size_t) n_rows * tensor->ne[0];
+     const size_t   offset    = (size_t) row0 * tensor->nb[1];
+     const size_t   nbytes    = ggml_row_size(tensor->type, tensor->ne[0]) * n_rows;
+ 
+     if (tensor->type == GGML_TYPE_F32) {
+-        ggml_backend_tensor_get(tensor, out, offset, nbytes);
++        if (cache) { cache->read(tensor, offset, out, nbytes); }
++        else { ggml_backend_tensor_get(tensor, out, offset, nbytes); }
+         return;
+     }
+ 
+     std::vector<uint8_t> buf(nbytes);
+-    ggml_backend_tensor_get(tensor, buf.data(), offset, nbytes);
++    if (cache) { cache->read(tensor, offset, buf.data(), nbytes); }
++    else { ggml_backend_tensor_get(tensor, buf.data(), offset, nbytes); }
+ 
+     const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+     if (tensor->type == GGML_TYPE_F16) {
+@@ -3991,7 +4008,21 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
+         return (uint32_t) nelements;
+     }
+ 
+-    llama_tensor_rows_to_f32(tensor, 0, tensor->ne[1], out);
++    if (!model->ram_cache || !model->ram_cache->contains(tensor)) {
++        llama_tensor_rows_to_f32(tensor, 0, tensor->ne[1], out, nullptr);
++        return (uint32_t) nelements;
++    }
++
++    try {
++        std::unique_lock<std::mutex> guard;
++        if (model->ram_cache) { guard = model->ram_cache->acquire(); }
++        for (int64_t row = 0; row < tensor->ne[1]; ++row) {
++            llama_tensor_rows_to_f32(tensor, row, 1, out + row*tensor->ne[0], model->ram_cache.get());
++        }
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
++    }
+ 
+     return (uint32_t) nelements;
+ }
+@@ -4006,11 +4037,21 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+     }
+ 
+     const ggml_tensor * tensor = model->tok_embd;
++    if (n_tokens > UINT32_MAX / tensor->ne[0]) { return 0; }
+     for (uint32_t i = 0; i < n_tokens; i++) {
+         if (tokens[i] < 0 || tokens[i] >= tensor->ne[1]) {
+             return 0;
+         }
+-        llama_tensor_rows_to_f32(tensor, tokens[i], 1, out + (size_t) i * tensor->ne[0]);
++    }
++    try {
++        std::unique_lock<std::mutex> guard;
++        if (model->ram_cache) { guard = model->ram_cache->acquire(); }
++        for (uint32_t i = 0; i < n_tokens; i++) {
++            llama_tensor_rows_to_f32(tensor, tokens[i], 1, out + (size_t) i * tensor->ne[0], model->ram_cache.get());
++        }
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
+     }
+ 
+     return n_tokens * (uint32_t) tensor->ne[0];
 diff --git a/src/llama-model.h b/src/llama-model.h
 index cdf060d..3d3d825 100644
 --- a/src/llama-model.h
@@ -937,31 +1104,207 @@ index 4d3596b..274b988 100644
                  bytes += n*expert_size;
                  i += n;
              }
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..4100118 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -497,6 +497,10 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
+ }
+ 
+ void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
++    if (model->ram_cache) {
++        LLAMA_LOG_ERROR("%s: exporting a model loaded with a MoE RAM limit is not supported; use the original GGUF\n", __func__);
++        return;
++    }
+     llama_model_saver ms(model);
+     ms.add_kv_from_model();
+     ms.add_tensors_from_model();
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 7631549..0e49cab 100644
+index 7631549..ec3fd4b 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -381,3 +381,5 @@ if (TARGET gguf-model-data)
+@@ -381,3 +381,8 @@ if (TARGET gguf-model-data)
      target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
      target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
  endif()
 +
 +llama_build(test-moe-ram.cpp)
++# Exercise the internal cache without exporting a new library ABI for tests.
++target_sources(test-moe-ram PRIVATE ../src/llama-model-ram.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
++llama_test(test-moe-ram NAME test-moe-ram-cache ARGS --cache ${CMAKE_CURRENT_BINARY_DIR} LABEL "main behavior")
 diff --git a/tests/test-moe-ram.cpp b/tests/test-moe-ram.cpp
 new file mode 100644
-index 0000000..1d00ac8
+index 0000000..fd3d63d
 --- /dev/null
 +++ b/tests/test-moe-ram.cpp
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,311 @@
 +#include "llama.h"
 +#include "common.h"
 +#include "fit.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-model-ram.h"
++#include "ggml-cpp.h"
++#include "llama-cpp.h"
 +#include <algorithm>
 +#include <cmath>
 +#include <cstdio>
 +#include <stdexcept>
 +#include <string>
 +#include <vector>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <cstring>
++#include <future>
++
++static void test_parallel_contexts(const char * path, size_t budget, int gpu_layers, size_t gpu_cache) {
++    if (gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
++        throw std::runtime_error("GPU test requested but no GPU backend loaded");
++    }
++    auto mp = llama_model_default_params();
++    mp.load_mode = LLAMA_LOAD_MODE_MMAP; mp.use_extra_bufts = false; mp.no_host = true;
++    mp.moe_ram_limit = budget; mp.n_gpu_layers = gpu_layers;
++    const llama_model_tensor_buft_override overrides[] = { llm_ffn_exps_cpu_override(), { nullptr, nullptr } };
++    mp.tensor_buft_overrides = overrides;
++    llama_model_ptr model(llama_model_load_from_file(path, mp));
++    if (!model) { throw std::runtime_error("cannot load concurrent fixture"); }
++    auto cp = llama_context_default_params();
++    cp.n_ctx = 256; cp.n_batch = 8; cp.n_ubatch = 8; cp.n_seq_max = 1;
++    cp.n_threads = 2; cp.n_threads_batch = 2; cp.moe_cache_size = gpu_cache;
++    auto decode = [&](llama_context * ctx, llama_token token) {
++        std::vector<float> result;
++        const auto vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++        for (int step = 0; step < 12; ++step) {
++            auto batch = llama_batch_get_one(&token, 1);
++            if (llama_decode(ctx, batch)) { throw std::runtime_error("concurrent decode failed"); }
++            const float * logits = llama_get_logits_ith(ctx, -1);
++            result.insert(result.end(), logits, logits + vocab);
++            token = (token + 13) % vocab;
++        }
++        return result;
++    };
++    std::vector<float> expected[2];
++    for (int i = 0; i < 2; ++i) {
++        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
++        if (!ctx) { throw std::runtime_error("cannot create serial context"); }
++        expected[i] = decode(ctx.get(), 50 + i*40);
++    }
++    llama_context_ptr contexts[] = {
++        llama_context_ptr(llama_init_from_model(model.get(), cp)),
++        llama_context_ptr(llama_init_from_model(model.get(), cp))
++    };
++    if (!contexts[0] || !contexts[1]) { throw std::runtime_error("cannot create concurrent contexts"); }
++    auto first = std::async(std::launch::async, [&] { return decode(contexts[0].get(), 50); });
++    auto second = std::async(std::launch::async, [&] { return decode(contexts[1].get(), 90); });
++    if (first.get() != expected[0] || second.get() != expected[1]) { throw std::runtime_error("concurrent context logits differ"); }
++    printf("PASS concurrent contexts: exact logits with one shared weight cache\n");
++}
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++static void test_cache(const char * directory) {
++    constexpr size_t page = 65536;
++    struct fixture {
++        std::filesystem::path path;
++        ~fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
++    } file { std::filesystem::path(directory) / ("llama-moe-ram-" + std::to_string(std::random_device{}()) + ".bin") };
++    std::vector<uint8_t> raw(2*1024*1024 + 31);
++    for (size_t i = 0; i < raw.size(); ++i) { raw[i] = (uint8_t) (i*17 + i/257); }
++    {
++        std::ofstream output(file.path, std::ios::binary);
++        output.write((const char *) raw.data(), raw.size());
++        require(output.good(), "cannot create cache fixture");
++    }
++    llama_files files;
++    files.emplace_back(new llama_file(file.path.string().c_str(), "rb"));
++    ggml_context_ptr ctx(ggml_init({ 1024*1024, nullptr, true }));
++    auto * weights = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 128, 8);
++    auto * alias = ggml_dup_tensor(ctx.get(), weights);
++    auto * table = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 256, 128, 2, 2);
++    auto * bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 512);
++    auto * ids_storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 16);
++    auto * ids = ggml_view_2d(ctx.get(), ids_storage, 3, 1, 24, 0);
++    ids->nb[0] = 8;
++    auto * indices4 = ggml_view_3d(ctx.get(), ids_storage, 2, 2, 2, 16, 32, 0);
++    auto * dst = ggml_dup_tensor(ctx.get(), weights);
++    auto * tail = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, 127);
++    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++    require(backend != nullptr, "CPU backend missing");
++    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
++    require(buf != nullptr, "cannot allocate test tensors");
++    llama_model_ram_cache cache(4*page, files);
++    cache.bind(weights, 0, 31); cache.bind(alias, 0, 31);
++    cache.bind(table, 0, 31 + 8*page); cache.bind(bias, 0, 31 + 16*page);
++    require(weights->data == alias->data, "tied weights were duplicated");
++    int32_t indices[16] = { 6, 999, 1, 999, 6, 999 };
++    ggml_backend_tensor_set(ids_storage, indices, 0, sizeof(indices));
++    ggml_tensor node = {};
++    node.flags = GGML_TENSOR_FLAG_COMPUTE;
++    node.op = GGML_OP_MUL_MAT_ID; node.src[0] = weights; node.src[2] = ids;
++    require(cache.needs_prepare(&node) && cache.prepare(&node), "strided routing failed");
++    require(!memcmp((uint8_t *) weights->data + 6*page, raw.data() + 31 + 6*page, page), "wrong expert bytes");
++    require(cache.stats().resident == 2*page, "duplicate routing consumed extra pages");
++    const auto before_hit = cache.stats();
++    require(cache.prepare(&node) && cache.stats().bytes_read == before_hit.bytes_read && cache.stats().hits >= 2,
++        "cache hit unexpectedly reread the file");
++    indices[0] = 100;
++    ggml_backend_tensor_set(ids_storage, indices, 0, sizeof(indices));
++    require(!cache.prepare(&node), "invalid expert id accepted");
++    node.flags = 0;
++    require(!cache.needs_prepare(&node), "inactive branch prepared");
++    node.flags = GGML_TENSOR_FLAG_COMPUTE;
++    indices[0] = 0; indices[2] = 300; indices[4] = 0;
++    ggml_backend_tensor_set(ids_storage, indices, 0, sizeof(indices));
++    node.op = GGML_OP_ADD_ID; node.src[0] = nullptr; node.src[1] = bias;
++    require(cache.prepare(&node), "expert bias should read only selected rows");
++    require(!memcmp((uint8_t *) bias->data + 300*1024, raw.data() + 31 + 16*page + 300*1024, 1024), "wrong bias bytes");
++    require(std::strlen(cache.error()) == 0, "stale error after recovery");
++    for (size_t i = 0; i < 16; ++i) { indices[i] = int32_t((i*11)%128); }
++    ggml_backend_tensor_set(ids_storage, indices, 0, sizeof(indices));
++    node.op = GGML_OP_GET_ROWS; node.src[0] = table; node.src[1] = indices4; node.src[2] = nullptr;
++    require(cache.prepare(&node), "4D embedding lookup failed");
++    for (size_t i2 = 0; i2 < 2; ++i2) {
++        for (size_t i1 = 0; i1 < 2; ++i1) {
++            for (size_t i0 = 0; i0 < 2; ++i0) {
++                const auto id = indices[i0 + 4*i1 + 8*i2];
++                const auto at = id*table->nb[1] + i1*table->nb[2] + i2*table->nb[3];
++                require(!memcmp((uint8_t *) table->data + at, raw.data() + 31 + 8*page + at, 1024), "wrong 4D row");
++            }
++        }
++    }
++    node.op = GGML_OP_MUL_MAT; node.src[0] = weights; node.src[1] = nullptr;
++    require(!cache.prepare(&node), "operation larger than budget accepted");
++    std::vector<uint8_t> result(8*page);
++    for (size_t pass = 0; pass < 8; ++pass) {
++        cache.read(weights, 0, result.data(), result.size());
++        require(!memcmp(result.data(), raw.data() + 31, result.size()), "evicted weights reloaded incorrectly");
++    }
++    require(cache.copy(backend.get(), weights, dst, 0, 0, 8*page), "chunked copy failed");
++    ggml_backend_tensor_get(dst, result.data(), 0, result.size());
++    require(!memcmp(result.data(), raw.data() + 31, result.size()), "chunked copy mismatch");
++    auto stats = cache.stats();
++    require(stats.peak <= 4*page && stats.evicted_pages > stats.eviction_calls && stats.eviction_calls > 0,
++        "budget or batched eviction invariant failed");
++    bool rejected = false;
++    try { cache.bind(alias, 1, 0); } catch (const std::exception &) { rejected = true; }
++    require(rejected, "invalid shard accepted");
++    rejected = false;
++    try { cache.read(weights, 8*page - 1, result.data(), 2); } catch (const std::exception &) { rejected = true; }
++    require(rejected, "out of bounds read accepted");
++    cache.bind(tail, 0, raw.size() - 127);
++    cache.read(tail, 0, result.data(), 127);
++    require(!memcmp(result.data(), raw.data() + raw.size() - 127, 127), "unaligned EOF read failed");
++    node.data = weights->data;
++    require(cache.needs_prepare(&node) && !cache.prepare(&node), "write to immutable weights accepted");
++    node.data = nullptr;
++    std::filesystem::resize_file(file.path, 31);
++    rejected = false;
++    try { cache.read(weights, 0, result.data(), 8*page); } catch (const std::exception &) { rejected = true; }
++    require(rejected && cache.stats().peak <= 4*page, "truncated read did not fail within budget");
++    printf("PASS cache: strided routing, tied weights, bias, 4D rows, eviction, recovery, bounds, exact bytes, peak %zu bytes\n", stats.peak);
++}
 +
 +static void test_fixed_context_fit(const char * path) {
 +    auto mp = llama_model_default_params();
@@ -993,7 +1336,7 @@ index 0000000..1d00ac8
 +    printf("PASS fit: context 131072 preserved, %d GPU layers, CPU expert override preserved\n", mp.n_gpu_layers);
 +}
 +
-+static std::vector<float> evaluate(const char * path, size_t budget, int gpu_layers, size_t gpu_cache) {
++static std::vector<float> evaluate(const char * path, size_t budget, int gpu_layers, size_t gpu_cache, bool extended = false) {
 +    auto mp = llama_model_default_params();
 +    mp.n_gpu_layers = gpu_layers;
 +    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
@@ -1006,16 +1349,47 @@ index 0000000..1d00ac8
 +    mp.tensor_buft_overrides = overrides;
 +    llama_model * model = llama_model_load_from_file(path, mp);
 +    if (!model) { throw std::runtime_error("cannot load fixture"); }
++    std::vector<float> result;
++    if (extended) {
++        const auto count = llama_model_get_tok_embd(model, nullptr);
++        std::vector<float> full(count);
++        if (!count || llama_model_get_tok_embd(model, full.data()) != count) { throw std::runtime_error("cannot read token embeddings"); }
++        const llama_token tokens[] = { 258, 0, 61, 258 };
++        const auto width = count / llama_vocab_n_tokens(llama_model_get_vocab(model));
++        std::vector<float> rows(4*width);
++        if (llama_model_get_tok_embd_rows(model, tokens, 4, rows.data()) != rows.size()) { throw std::runtime_error("cannot read embedding rows"); }
++        for (size_t i = 0; i < 4; ++i) {
++            if (!std::equal(rows.begin() + i*width, rows.begin() + (i+1)*width, full.begin() + tokens[i]*width)) {
++                throw std::runtime_error("embedding row mismatch");
++            }
++        }
++        result.insert(result.end(), rows.begin(), rows.end());
++    }
 +    auto cp = llama_context_default_params();
 +    cp.n_ctx = 256; cp.n_batch = 32; cp.n_ubatch = 8; cp.n_seq_max = 1;
 +    cp.n_threads = 2; cp.n_threads_batch = 2;
 +    cp.moe_cache_size = gpu_cache;
++    if (extended) {
++        cp.n_batch = 64; cp.n_ubatch = 64;
++        cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q8_0;
++        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    }
 +    llama_context * ctx = llama_init_from_model(model, cp);
 +    if (!ctx) { llama_model_free(model); throw std::runtime_error("cannot create fixture context"); }
-+    std::vector<float> result;
 +    std::vector<llama_token> prompt = { 50, 51, 52, 90, 91, 92, 66, 67, 68, 70, 71, 72, 100, 101, 102, 103 };
 +    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-+    for (int step = 0; step < 25; ++step) {
++    if (extended) { for (int i = 0; i < 16; ++i) { prompt.push_back(120 + i*7); } }
++    std::vector<uint8_t> saved;
++    for (int step = 0; step < (extended ? 97 : 25); ++step) {
++        if (extended && step == 48) {
++            prompt.clear();
++            for (int i = 0; i < 48; ++i) { prompt.push_back(40 + (i*17)%200); }
++        }
++        if (extended && step == 16) {
++            saved.resize(llama_state_get_size(ctx));
++            if (llama_state_get_data(ctx, saved.data(), saved.size()) != saved.size()) { throw std::runtime_error("state save failed"); }
++            if (llama_state_set_data(ctx, saved.data(), saved.size()) != saved.size()) { throw std::runtime_error("state restore failed"); }
++        }
 +        llama_batch batch = llama_batch_get_one(prompt.data(), (int32_t) prompt.size());
 +        if (llama_decode(ctx, batch) != 0) {
 +            llama_free(ctx); llama_model_free(model);
@@ -1035,14 +1409,23 @@ index 0000000..1d00ac8
 +    ggml_backend_load_all();
 +    llama_backend_init();
 +    try {
++        if (std::string(argv[1]) == "--cache") {
++            require(argc > 2, "cache test needs an explicit temporary directory");
++            test_cache(argv[2]); llama_backend_free(); return 0;
++        }
 +        const size_t budget = (argc > 2 ? std::stoul(argv[2]) : 1) * 1024*1024;
 +        const int gpu_layers = argc > 3 ? std::stoi(argv[3]) : 0;
 +        const size_t gpu_cache = (argc > 4 ? std::stoul(argv[4]) : 0) * 1024*1024;
++        if (argc > 5 && std::string(argv[5]) == "parallel") {
++            test_parallel_contexts(argv[1], budget, gpu_layers, gpu_cache);
++            llama_backend_free(); return 0;
++        }
 +        if (gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
 +            throw std::runtime_error("GPU test requested but no GPU backend loaded");
 +        }
-+        const auto reference = evaluate(argv[1], 0, gpu_layers, gpu_cache);
-+        const auto streamed = evaluate(argv[1], budget, gpu_layers, gpu_cache);
++        const bool extended = argc > 5 && std::string(argv[5]) == "extended";
++        const auto reference = evaluate(argv[1], 0, gpu_layers, gpu_cache, extended);
++        const auto streamed = evaluate(argv[1], budget, gpu_layers, gpu_cache, extended);
 +        if (reference.size() != streamed.size()) { throw std::runtime_error("logit count differs"); }
 +        float max_error = 0;
 +        for (size_t i = 0; i < reference.size(); ++i) {
