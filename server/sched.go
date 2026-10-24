@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -519,6 +520,8 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 	runner.refCount++
+	runner.lastUsed = time.Now()
+	runner.useCount++
 	if runner.expireTimer != nil {
 		runner.expireTimer.Stop()
 		runner.expireTimer = nil
@@ -537,10 +540,16 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
+	loadStarted := time.Now()
 	numParallel := max(int(envconfig.NumParallel()), 1)
+	if value := req.opts.RunnerEnv["OLLAMA_NUM_PARALLEL"]; value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 && n <= 64 {
+			numParallel = n
+		}
+	}
 	completion := req.model.CheckCapabilities(model.CapabilityCompletion) == nil
 
-	// Embedding models should always be loaded with parallel=1
+	// Start conservatively; explicit noncausal GGUF pooling can opt into batching below.
 	if !completion {
 		numParallel = 1
 	}
@@ -574,17 +583,32 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				s.loadedMu.Unlock()
 				return false
 			}
+			if !completion && f.KV().Has("pooling_type") && !f.KV().Bool("attention.causal", true) {
+				numParallel = 8
+				if value := os.Getenv("OLLAMA_EMBEDDING_MAX_SEQUENCES"); value != "" {
+					if n, err := strconv.Atoi(value); err == nil {
+						numParallel = max(1, min(32, n))
+					}
+				}
+			}
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
+			flashAttention := llm.LlamaServerFlashAttentionForOptions(loadGpus, req.opts)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
 			launchOpts.NumBatch = req.opts.NumBatch
 			var batchMemory uint64
 			launchOpts.NumBatch, batchMemory = llm.LlamaServerBatch(f, launchOpts, completion)
 			predictedForLoad := predicted + batchMemory
+			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
+			req.contextShift = resolveContextShift(req.shift, req.model)
+			config := llamaServerConfigForModel(req.model)
+			config.ContextShift = req.contextShift
+			if observed, ok := llm.ObservedServerVRAM(req.model.ModelPath, f, launchOpts, loadGpus, numParallel, config); ok {
+				predictedForLoad = observed
+			}
 
 			// Pre-flight check: estimate whether the model fits in remaining memory.
 			// llama-server auto-detects layers based on available VRAM, so if
@@ -614,11 +638,6 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					"system_limited", systemLimited)
 			}
 
-			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
-			req.contextShift = resolveContextShift(req.shift, req.model)
-
-			config := llamaServerConfigForModel(req.model)
-			config.ContextShift = req.contextShift
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -797,6 +816,9 @@ iGPUScan:
 		}
 		runner.refCount++
 		runner.loading = false
+		runner.loadDuration = time.Since(loadStarted)
+		runner.lastUsed = time.Now()
+		runner.useCount++
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
@@ -831,7 +853,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
-	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
+	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttentionForOptions(gpus, req.opts), gpus)
 	newNumBatch = req.opts.NumBatch
 	return oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch, true
 }
@@ -1376,8 +1398,11 @@ func (s *Scheduler) updateFreeSpace(allGpus []ml.DeviceInfo) {
 
 // TODO consolidate sched_types.go
 type runnerRef struct {
-	refMu    sync.Mutex
-	refCount uint // prevent unloading if > 0
+	lastUsed     time.Time
+	loadDuration time.Duration
+	useCount     uint64
+	refMu        sync.Mutex
+	refCount     uint // prevent unloading if > 0
 
 	llama        llm.LlamaServer
 	pid          int
@@ -1466,6 +1491,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	if loaded == nil ||
 		!reflect.DeepEqual(loaded.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(loaded.ProjectorPaths, req.model.ProjectorPaths) || // have the projectors changed?
+		loaded.DraftPath != req.model.DraftPath || !slices.Equal(loaded.DraftShardPaths, req.model.DraftShardPaths) ||
 		(!loaded.IsMLX() && !reflect.DeepEqual(optsExisting, optsNew)) || // have the runner options changed?
 		runner.llama.Ping(ctx) != nil {
 		return true
@@ -1725,7 +1751,32 @@ func (s *Scheduler) findRunnerToUnload() *runnerRef {
 
 	// In the future we can enhance the algorithm to be smarter about picking the optimal runner to unload
 	// e.g., if we have multiple options, will one make room for the request?
-	sort.Sort(ByDurationAndName(runnerList))
+	now := time.Now()
+	values := make(map[*runnerRef]float64, len(runnerList))
+	durations := make(map[*runnerRef]time.Duration, len(runnerList))
+	names := make(map[*runnerRef]string, len(runnerList))
+	allKnown := true
+	for _, runner := range runnerList {
+		runner.refMu.Lock()
+		values[runner] = runnerEvictionValue(runner, now)
+		durations[runner] = runner.sessionDuration
+		names[runner] = runner.modelPath
+		if names[runner] == "" {
+			names[runner] = runner.modelKey
+		}
+		runner.refMu.Unlock()
+		allKnown = allKnown && values[runner] >= 0
+	}
+	sort.SliceStable(runnerList, func(i, j int) bool {
+		a, b := runnerList[i], runnerList[j]
+		if durations[a] != durations[b] {
+			return uint64(durations[a]) < uint64(durations[b])
+		}
+		if allKnown && values[a] != values[b] {
+			return values[a] < values[b]
+		}
+		return names[a] < names[b]
+	})
 
 	// First try to find a runner that's already idle
 	for _, runner := range runnerList {

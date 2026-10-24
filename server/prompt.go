@@ -33,15 +33,21 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	currMsgIdx := 0
 
 	if truncate {
+		starts := promptTruncationStarts(msgs)
+		lastValid := 0
+		fit := false
 		// Start with all messages and remove from the front until it fits in context
 		for i := 0; i <= lastMsgIdx; i++ {
-			// Collect system messages from the portion we're about to skip
-			system = make([]api.Message, 0)
-			for j := range i {
-				if msgs[j].Role == "system" {
-					system = append(system, msgs[j])
-				}
+			if err := ctx.Err(); err != nil {
+				return "", nil, err
 			}
+			if i > 0 && msgs[i-1].Role == "system" {
+				system = append(system, msgs[i-1])
+			}
+			if !starts[i] {
+				continue
+			}
+			lastValid = i
 
 			p, err := renderPrompt(m, append(system, msgs[i:]...), tools, think)
 			if err != nil {
@@ -62,6 +68,7 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 
 			if ctxLen <= opts.NumCtx {
 				currMsgIdx = i
+				fit = true
 				break
 			}
 
@@ -69,6 +76,15 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 			if i == lastMsgIdx {
 				currMsgIdx = lastMsgIdx
 				break
+			}
+		}
+		if !fit {
+			currMsgIdx = lastValid
+		}
+		system = nil
+		for _, message := range msgs[:currMsgIdx] {
+			if message.Role == "system" {
+				system = append(system, message)
 			}
 		}
 	}
@@ -89,6 +105,45 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	}
 
 	return p, media, nil
+}
+
+// A tool response must retain the assistant call that produced it.
+func promptTruncationStarts(messages []api.Message) []bool {
+	changes := make([]int, len(messages)+1)
+	owners := make(map[string]int)
+	lastOwner := -1
+	for index, message := range messages {
+		if message.Role == "user" {
+			lastOwner = -1
+		}
+		if message.Role == "assistant" && len(message.ToolCalls) > 0 {
+			lastOwner = index
+			for _, call := range message.ToolCalls {
+				if call.ID != "" {
+					owners[call.ID] = index
+				}
+			}
+		}
+		if message.Role == "tool" {
+			owner := lastOwner
+			if message.ToolCallID != "" {
+				if found, exists := owners[message.ToolCallID]; exists {
+					owner = found
+				}
+			}
+			if owner >= 0 && owner < index {
+				changes[owner+1]++
+				changes[index+1]--
+			}
+		}
+	}
+	result := make([]bool, len(messages))
+	active := 0
+	for index := range messages {
+		active += changes[index]
+		result[index] = active == 0
+	}
+	return result
 }
 
 func imageTaggedMessages(m *Model, msgs []api.Message, start int, clearImages bool) ([]api.Message, []llm.MediaData, error) {

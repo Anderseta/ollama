@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -573,6 +574,8 @@ type Metrics struct {
 // add it to the API docs.
 type Options struct {
 	Runner
+	BackendSampling     *bool `json:"backend_sampling,omitempty"`
+	SpeculativeAdaptive *bool `json:"speculative_adaptive,omitempty"`
 
 	// Predict options used at runtime
 	NumKeep          int      `json:"num_keep,omitempty"`
@@ -592,14 +595,17 @@ type Options struct {
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
-	MoeRAMLimitMiB  *int  `json:"moe_ram_limit_mib,omitempty"`
-	NumCtx          int   `json:"num_ctx,omitempty"`
-	NumBatch        int   `json:"num_batch,omitempty"`
-	NumGPU          int   `json:"num_gpu,omitempty"`
-	MainGPU         *int  `json:"main_gpu,omitempty"`
-	UseMMap         *bool `json:"use_mmap,omitempty"`
-	NumThread       int   `json:"num_thread,omitempty"`
-	DraftNumPredict int   `json:"draft_num_predict,omitempty"`
+	SpeculativeType string            `json:"speculative_type,omitempty"`
+	RunnerEnv       map[string]string `json:"runner_env,omitempty"`
+	NumUbatch       int               `json:"num_ubatch,omitempty"`
+	MoeRAMLimitMiB  *int              `json:"moe_ram_limit_mib,omitempty"`
+	NumCtx          int               `json:"num_ctx,omitempty"`
+	NumBatch        int               `json:"num_batch,omitempty"`
+	NumGPU          int               `json:"num_gpu,omitempty"`
+	MainGPU         *int              `json:"main_gpu,omitempty"`
+	UseMMap         *bool             `json:"use_mmap,omitempty"`
+	NumThread       int               `json:"num_thread,omitempty"`
+	DraftNumPredict int               `json:"draft_num_predict,omitempty"`
 }
 
 // SystemOneRequest is the request passed to [Client.SystemOne]. It asks a
@@ -1127,6 +1133,37 @@ func (opts *Options) FromMap(m map[string]any) error {
 	}
 
 	for key, val := range m {
+		if key == "speculative_type" && val != nil {
+			value, ok := val.(string)
+			if !ok || !slices.Contains([]string{"", "auto", "none", "ngram-simple", "ngram-mod", "ngram-cache"}, value) {
+				return fmt.Errorf("unsupported speculative_type")
+			}
+		}
+		if key == "num_ubatch" && val != nil {
+			var n float64
+			switch value := val.(type) {
+			case int64:
+				n = float64(value)
+			case float64:
+				n = value
+			default:
+				return fmt.Errorf("num_ubatch must be an integer")
+			}
+			if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) || n < 0 || n > 2097152 {
+				return fmt.Errorf("num_ubatch must be between 0 and 2097152")
+			}
+		}
+		if key == "runner_env" {
+			if val == nil {
+				continue
+			}
+			env, err := ParseRunnerEnvironment(val)
+			if err != nil {
+				return err
+			}
+			opts.RunnerEnv = env
+			continue
+		}
 		opt, ok := jsonOpts[key]
 		if !ok {
 			slog.Warn("invalid option provided", "option", key)

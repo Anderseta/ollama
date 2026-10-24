@@ -105,7 +105,11 @@ func LlamaServerBatch(f *gguf.Model, opts api.Options, completion bool) (int, ui
 	if !completion && !wholePrompt {
 		return batch, 0
 	}
-	return batch, LlamaServerBatchMemory(batch)
+	physical := batch
+	if opts.NumUbatch > 0 && !wholePrompt {
+		physical = min(physical, opts.NumUbatch)
+	}
+	return batch, LlamaServerBatchMemory(physical)
 }
 
 // LlamaServerBatchMemory is the conservative extra memory allowance for a
@@ -409,6 +413,13 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	if err != nil {
 		return nil, 0, err
 	}
+	if value, exists := launch.opts.RunnerEnv["LLAMA_ARG_NO_WARMUP"]; exists {
+		if value == "1" {
+			params = append(params, "--no-warmup")
+		} else {
+			params = append(params, "--warmup")
+		}
+	}
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
 
@@ -429,7 +440,14 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params, "--cache-type-k", launch.kvCacheType, "--cache-type-v", launch.kvCacheType)
 	}
 
-	params = appendFlashAttentionArgs(params, launch.gpus)
+	mode := "auto"
+	switch LlamaServerFlashAttentionForOptions(launch.gpus, launch.opts) {
+	case ml.FlashAttentionEnabled:
+		mode = "on"
+	case ml.FlashAttentionDisabled:
+		mode = "off"
+	}
+	params = append(params, "--flash-attn", mode)
 
 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
 
@@ -483,7 +501,8 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 // subprocess so discovery and real model runners use the same library search
 // paths and GPU backend selection.
 func SetupLlamaServerCommandEnv(cmd *exec.Cmd, exe string, gpuLibs []string, extraEnvs map[string]string) {
-	cmd.Env = os.Environ()
+	inherited := os.Environ()
+	cmd.Env = make([]string, 0, len(inherited)+len(extraEnvs)+2)
 
 	envUpdates := make(map[string]string, len(extraEnvs)+2)
 	for k, v := range extraEnvs {
@@ -495,20 +514,32 @@ func SetupLlamaServerCommandEnv(cmd *exec.Cmd, exe string, gpuLibs []string, ext
 	envUpdates[pathEnv] = strings.Join(libraryPaths, string(filepath.ListSeparator))
 
 	applied := make(map[string]bool, len(envUpdates))
-	for i := range cmd.Env {
-		key, _, ok := strings.Cut(cmd.Env[i], "=")
+	clearRunnerOverride := func(key, value string) bool {
+		return value == "" && (strings.HasPrefix(key, "LLAMA_ARG_") || strings.HasPrefix(key, "OLLAMA_"))
+	}
+	for _, entry := range inherited {
+		key, _, ok := strings.Cut(entry, "=")
 		if !ok {
+			cmd.Env = append(cmd.Env, entry)
 			continue
 		}
+		matched := false
 		for updateKey, updateVal := range envUpdates {
 			if strings.EqualFold(key, updateKey) {
-				cmd.Env[i] = updateKey + "=" + updateVal
+				if !clearRunnerOverride(updateKey, updateVal) {
+					cmd.Env = append(cmd.Env, updateKey+"="+updateVal)
+				}
 				applied[updateKey] = true
+				matched = true
+				break
 			}
+		}
+		if !matched {
+			cmd.Env = append(cmd.Env, entry)
 		}
 	}
 	for key, val := range envUpdates {
-		if !applied[key] {
+		if !applied[key] && !clearRunnerOverride(key, val) {
 			cmd.Env = append(cmd.Env, key+"="+val)
 		}
 	}
@@ -628,7 +659,13 @@ func appendBatchArgs(params []string, opts api.Options, embedding bool, numParal
 	}
 
 	if opts.NumBatch > 0 {
-		params = append(params, "-b", strconv.Itoa(opts.NumBatch), "-ub", strconv.Itoa(opts.NumBatch))
+		ubatch := opts.NumBatch
+		if opts.NumUbatch > 0 {
+			ubatch = min(ubatch, opts.NumUbatch)
+		}
+		params = append(params, "-b", strconv.Itoa(opts.NumBatch), "-ub", strconv.Itoa(ubatch))
+	} else if opts.NumUbatch > 0 {
+		params = append(params, "-ub", strconv.Itoa(opts.NumUbatch))
 	}
 	return params
 }
@@ -648,6 +685,34 @@ func LlamaServerFlashAttention(gpus []ml.DeviceInfo) ml.FlashAttentionType {
 		return ml.FlashAttentionDisabled
 	}
 	return ml.FlashAttentionAuto
+}
+
+func LlamaServerFlashAttentionForOptions(gpus []ml.DeviceInfo, opts api.Options) ml.FlashAttentionType {
+	if value, exists := opts.RunnerEnv["OLLAMA_FLASH_ATTENTION"]; exists {
+		switch value {
+		case "1":
+			return ml.FlashAttentionEnabled
+		case "0":
+			return ml.FlashAttentionDisabled
+		}
+		if ml.FlashAttentionSupported(gpus) {
+			return ml.FlashAttentionAuto
+		}
+		return ml.FlashAttentionDisabled
+	}
+	if value, exists := opts.RunnerEnv["LLAMA_ARG_FLASH_ATTN"]; exists && value != "" {
+		if value == "on" {
+			return ml.FlashAttentionEnabled
+		}
+		if value == "off" {
+			return ml.FlashAttentionDisabled
+		}
+		if ml.FlashAttentionSupported(gpus) {
+			return ml.FlashAttentionAuto
+		}
+		return ml.FlashAttentionDisabled
+	}
+	return LlamaServerFlashAttention(gpus)
 }
 
 func appendFlashAttentionArgs(params []string, gpus []ml.DeviceInfo) []string {
@@ -746,7 +811,7 @@ func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
 		return launch.extraEnvs
 	}
 
-	if existing, ok := launch.extraEnvs[llamaArgFitTargetEnv]; ok {
+	if existing, ok := launch.extraEnvs[llamaArgFitTargetEnv]; ok && existing != "" {
 		existingTarget, err := strconv.ParseUint(existing, 10, 64)
 		if err != nil {
 			slog.Warn("invalid llama-server fit target", "env", llamaArgFitTargetEnv, "value", existing, "error", err)
@@ -758,7 +823,8 @@ func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
 		return envs
 	}
 
-	if _, ok := os.LookupEnv(llamaArgFitTargetEnv); ok {
+	_, explicit := launch.extraEnvs[llamaArgFitTargetEnv]
+	if _, ok := os.LookupEnv(llamaArgFitTargetEnv); ok && !explicit {
 		// Preserve an inherited user override. SetupLlamaServerCommandEnv
 		// will pass it through unless extraEnvs overrides it.
 		return launch.extraEnvs
@@ -841,6 +907,13 @@ const (
 )
 
 func appendDraftArgs(params []string, draftType, draftModelPath string, opts api.Options) []string {
+	if opts.SpeculativeType != "" && opts.SpeculativeType != "auto" {
+		draftType = opts.SpeculativeType
+		draftModelPath = ""
+		if draftType == "none" {
+			return append(params, "--spec-type", "none")
+		}
+	}
 	if draftType == "" && draftModelPath == "" {
 		return params
 	}
@@ -902,10 +975,26 @@ func NewLlamaServerRunner(
 	kvCacheType string,
 	config LlamaServerConfig,
 ) (LlamaServer, error) {
+	if opts.RunnerEnv != nil {
+		validated, err := api.ParseRunnerEnvironment(opts.RunnerEnv)
+		if err != nil {
+			return nil, err
+		}
+		opts.RunnerEnv = validated
+	}
 	// Check if this is an embedding model
 	arch := f.KV().Architecture()
 	isEmbedding := f.KV().Has("pooling_type")
 	decisionType := f.KV().String("decision.type")
+	if opts.NumUbatch > 0 && (isEmbedding || f.KV().Uint("decision.block_count") > 0) {
+		physical := embeddingBatchSize(opts, numParallel)
+		if !isEmbedding {
+			physical, _ = LlamaServerBatch(f, opts, true)
+		}
+		if opts.NumUbatch < physical {
+			return nil, fmt.Errorf("num_ubatch must be at least %d for this whole-prompt model", physical)
+		}
+	}
 
 	// Older Ollama-format GGUFs store vision tensors (v.*, mm.*) inline in
 	// the main model file rather than in a separate projector layer. When
@@ -973,6 +1062,12 @@ func NewLlamaServerRunner(
 		serverEnvs[k] = v
 	}
 	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
+	for key, value := range opts.RunnerEnv {
+		serverEnvs[key] = value
+	}
+	if value, exists := opts.RunnerEnv["OLLAMA_KV_CACHE_TYPE"]; exists {
+		kvCacheType = value
+	}
 
 	launch := llamaServerLaunchConfig{
 		modelPath:    splitModel.modelPath,
@@ -1113,6 +1208,7 @@ func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, 
 	if err := s.removeSplitDirs(); err != nil {
 		slog.Debug("split GGUF alias cleanup deferred until runner shutdown", "error", err)
 	}
+	s.rememberPlacement()
 
 	// Verify that buffer size parsing captured GPU allocations.
 	// If parsing failed (e.g., llama-server log format changed), warn so the
@@ -1450,27 +1546,29 @@ func (s *llamaServerRunner) lastErrMsg() string {
 
 // llamaServerCompletionRequest is the request format for llama-server's POST /completion endpoint.
 type llamaServerCompletionRequest struct {
-	Prompt          any             `json:"prompt"`
-	Stream          bool            `json:"stream"`
-	CachePrompt     bool            `json:"cache_prompt"`
-	NPredict        int             `json:"n_predict,omitempty"`
-	NKeep           int             `json:"n_keep,omitempty"`
-	Temperature     float32         `json:"temperature"`
-	TopK            int             `json:"top_k"`
-	TopP            float32         `json:"top_p"`
-	MinP            float32         `json:"min_p"`
-	Stop            []string        `json:"stop,omitempty"`
-	RepeatPenalty   float32         `json:"repeat_penalty"`
-	RepeatLastN     int             `json:"repeat_last_n"`
-	FreqPenalty     float32         `json:"frequency_penalty"`
-	PresPenalty     float32         `json:"presence_penalty"`
-	TypicalP        float32         `json:"typical_p,omitempty"`
-	Seed            int             `json:"seed"`
-	Grammar         string          `json:"grammar,omitempty"`
-	JsonSchema      json.RawMessage `json:"json_schema,omitempty"`
-	NProbs          int             `json:"n_probs,omitempty"`
-	PreservedTokens []string        `json:"preserved_tokens,omitempty"`
-	TimingsPerToken bool            `json:"timings_per_token,omitempty"`
+	BackendSampling     *bool           `json:"backend_sampling,omitempty"`
+	SpeculativeAdaptive *bool           `json:"speculative_adaptive,omitempty"`
+	Prompt              any             `json:"prompt"`
+	Stream              bool            `json:"stream"`
+	CachePrompt         bool            `json:"cache_prompt"`
+	NPredict            int             `json:"n_predict,omitempty"`
+	NKeep               int             `json:"n_keep,omitempty"`
+	Temperature         float32         `json:"temperature"`
+	TopK                int             `json:"top_k"`
+	TopP                float32         `json:"top_p"`
+	MinP                float32         `json:"min_p"`
+	Stop                []string        `json:"stop,omitempty"`
+	RepeatPenalty       float32         `json:"repeat_penalty"`
+	RepeatLastN         int             `json:"repeat_last_n"`
+	FreqPenalty         float32         `json:"frequency_penalty"`
+	PresPenalty         float32         `json:"presence_penalty"`
+	TypicalP            float32         `json:"typical_p,omitempty"`
+	Seed                int             `json:"seed"`
+	Grammar             string          `json:"grammar,omitempty"`
+	JsonSchema          json.RawMessage `json:"json_schema,omitempty"`
+	NProbs              int             `json:"n_probs,omitempty"`
+	PreservedTokens     []string        `json:"preserved_tokens,omitempty"`
+	TimingsPerToken     bool            `json:"timings_per_token,omitempty"`
 }
 
 // schemaGrammars caches the grammars llama-server derives from JSON schemas,
@@ -1698,23 +1796,25 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 
 	// Build the llama-server request
 	lsReq := llamaServerCompletionRequest{
-		Prompt:          prompt,
-		Stream:          true,
-		CachePrompt:     true,
-		NPredict:        req.Options.NumPredict,
-		NKeep:           req.Options.NumKeep,
-		Temperature:     req.Options.Temperature,
-		TopK:            req.Options.TopK,
-		TopP:            req.Options.TopP,
-		MinP:            req.Options.MinP,
-		Stop:            req.Options.Stop,
-		RepeatPenalty:   req.Options.RepeatPenalty,
-		RepeatLastN:     req.Options.RepeatLastN,
-		FreqPenalty:     req.Options.FrequencyPenalty,
-		PresPenalty:     req.Options.PresencePenalty,
-		TypicalP:        req.Options.TypicalP,
-		Seed:            req.Options.Seed,
-		PreservedTokens: llamaServerPreservedTokens(req.PreservedTokens, req.ToolCallTag),
+		BackendSampling:     req.Options.BackendSampling,
+		SpeculativeAdaptive: req.Options.SpeculativeAdaptive,
+		Prompt:              prompt,
+		Stream:              true,
+		CachePrompt:         true,
+		NPredict:            req.Options.NumPredict,
+		NKeep:               req.Options.NumKeep,
+		Temperature:         req.Options.Temperature,
+		TopK:                req.Options.TopK,
+		TopP:                req.Options.TopP,
+		MinP:                req.Options.MinP,
+		Stop:                req.Options.Stop,
+		RepeatPenalty:       req.Options.RepeatPenalty,
+		RepeatLastN:         req.Options.RepeatLastN,
+		FreqPenalty:         req.Options.FrequencyPenalty,
+		PresPenalty:         req.Options.PresencePenalty,
+		TypicalP:            req.Options.TypicalP,
+		Seed:                req.Options.Seed,
+		PreservedTokens:     llamaServerPreservedTokens(req.PreservedTokens, req.ToolCallTag),
 	}
 
 	if req.Logprobs {
@@ -2325,6 +2425,12 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 	}
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools
+	}
+	if req.Options.BackendSampling != nil {
+		body["backend_sampling"] = *req.Options.BackendSampling
+	}
+	if req.Options.SpeculativeAdaptive != nil {
+		body["speculative_adaptive"] = *req.Options.SpeculativeAdaptive
 	}
 	if req.Logprobs {
 		body["logprobs"] = true

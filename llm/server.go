@@ -85,6 +85,12 @@ type LlamaServerConfig struct {
 	DraftModelShardPaths []string
 }
 
+type EmbeddingBatchRunner interface {
+	EmbeddingBatchLimits() (items, tokens int)
+	TokenizeBatch(context.Context, []string) ([][]int, error)
+	EmbeddingBatch(context.Context, []string) ([][]float32, int, error)
+}
+
 // IsLlamaCPP reports whether the server is backed by the llama.cpp
 // llama-server runner implementation.
 func IsLlamaCPP(s LlamaServer) bool {

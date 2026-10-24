@@ -16,6 +16,9 @@ func appendMoeRAMLimitArgs(args []string, opts api.Options, experts uint64) ([]s
 	if raw == "" {
 		raw = envconfig.Var("LLAMA_ARG_MOE_RAM_LIMIT_MIB")
 	}
+	if value, exists := opts.RunnerEnv["LLAMA_ARG_MOE_RAM_LIMIT_MIB"]; exists {
+		raw = value
+	}
 	if opts.MoeRAMLimitMiB != nil {
 		raw = strconv.Itoa(*opts.MoeRAMLimitMiB)
 	}

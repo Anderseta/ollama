@@ -1,0 +1,459 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -601,6 +601,10 @@
+     }
+ 
+     return gsmpl->chain;
++}
++
++struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl) {
++    return gsmpl && gsmpl->params.backend_sampling && !gsmpl->grmr && !gsmpl->rbudget ? gsmpl->chain : nullptr;
+ }
+ 
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -54,6 +54,7 @@
+ 
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
++struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl);
+ 
+ // extended sampling implementation:
+ //
+diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
+--- a/tests/test-server-component.cpp
++++ b/tests/test-server-component.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../tools/server/server-common.h"
+ #include "../tools/server/server-decision.h"
++#include "../tools/server/server-task.h"
+ 
+ #include <cstdlib>
+ #include <regex>
+@@ -354,7 +355,7 @@
+         server_pipe<int> p;
+         std::thread producer([&]() {
+             for (int i = 0; i < n; i++) {
+-                p.write(int(i));
++                p.write(std::move(i));
+             }
+             p.close_write();
+         });
+@@ -464,6 +465,65 @@
+     }
+ }
+ 
++static void test_prompt_cache_selection(testing & t) {
++    server_prompt_cache cache(8, 20000);
++    llama_tokens incoming(10000, 1);
++    llama_tokens live(1000, 9);
++    std::fill_n(live.begin(), 100, 1);
++    server_prompt prompt;
++    prompt.tokens = server_tokens(live, false);
++
++    for (const auto & lengths : {std::pair<int, int>{5000, 3000}, {10000, 5000}}) {
++        llama_tokens tokens(lengths.first, 2);
++        std::fill_n(tokens.begin(), lengths.second, 1);
++        server_prompt_cache_state state;
++        state.prompt.tokens = server_tokens(tokens, false);
++        state.data.main.resize(1000);
++        cache.states.push_back(std::move(state));
++    }
++    cache.observe_prompt(1000, 1000000);
++    cache.restore_us_per_byte = 0.001;
++    const server_tokens next(incoming, false);
++    for (int i = 0; i < 2; ++i) {
++        auto best = cache.find_best(prompt, next);
++        t.assert_true("candidate found", best != cache.states.end());
++        if (best != cache.states.end()) {
++            t.assert_equal("best useful prefix", 5000, best->prompt.tokens.get_common_prefix(next));
++        }
++        cache.states.reverse();
++    }
++    cache.restore_us_per_byte = 1e9;
++    t.assert_true("expensive restore skipped", cache.find_best(prompt, next) == cache.states.end());
++    t.assert_true("empty request skipped", cache.find_best(prompt, server_tokens({}, false)) == cache.states.end());
++    server_prompt_cache unmeasured(8, 20000);
++    unmeasured.observe_prompt(1, 1);
++    t.assert_equal("tiny timing ignored", 0.0, unmeasured.prompt_us_per_token);
++}
++
++static void test_adaptive_speculation(testing & t) {
++    server_speculation_control control;
++    control.enabled = true;
++    int64_t now = 1;
++    auto step = [&](int proposed, int produced, int duration) {
++        control.begin(now);
++        control.proposed = proposed;
++        now += duration;
++        control.observe(now, produced);
++        ++now;
++    };
++    for (int i = 0; i < 8; ++i) { step(0, 1, 1000); }
++    t.assert_equal("baseline before drafting", 1, control.cap);
++    for (int i = 0; i < 4; ++i) { step(1, 2, 1000); }
++    t.assert_equal("profitable draft grows", 2, control.cap);
++    for (int i = 0; i < 4; ++i) { step(2, 1, 2000); }
++    t.assert_equal("slow draft shrinks", 1, control.cap);
++    for (int i = 0; i < 4; ++i) { step(1, 1, 2000); }
++    t.assert_equal("unprofitable drafting stops", 0, control.cap);
++    t.assert_equal("probe cooldown", 32, control.cooldown);
++    for (int i = 0; i < 32; ++i) { step(0, 1, 1000); }
++    t.assert_equal("eventual recheck", 1, control.cap);
++}
++
+ int main(int argc, char ** argv) {
+     testing t;
+ 
+@@ -484,6 +544,8 @@
+     t.test("server_pipe",   test_server_pipe);
+     t.test("decision_escape", test_decision_escape);
+     t.test("rerank_template", test_rerank_template);
++    t.test("prompt_cache_selection", test_prompt_cache_selection);
++    t.test("adaptive_speculation", test_adaptive_speculation);
+ 
+     return t.summary();
+ }
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1587,6 +1587,7 @@
+                 {"object", "embedding"}
+             };
+         }
++        embedding_obj["tokens_evaluated"] = json_value(elem, "tokens_evaluated", 0);
+         data.push_back(embedding_obj);
+ 
+         n_tokens += json_value(elem, "tokens_evaluated", 0);
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -400,6 +400,59 @@
+ //
+ // stats and metrics
+ //
++
++struct server_speculation_control {
++    bool enabled = false;
++    int cap = 0;
++    int normal_samples = 0;
++    int cooldown = 0;
++    int samples = 0;
++    int proposed = 0;
++    int64_t started = 0;
++    double normal_us = 0;
++    double window_us = 0;
++    uint64_t window_tokens = 0;
++
++    void begin(int64_t now) {
++        if (enabled && started == 0) {
++            started = now;
++        }
++    }
++
++    void observe(int64_t now, uint64_t produced) {
++        if (!enabled || started <= 0 || now <= started || produced == 0) {
++            return;
++        }
++        const double duration = double(now - started);
++        started = 0;
++        if (proposed == 0) {
++            const double sample = duration / produced;
++            normal_us = normal_us > 0 ? 0.75*normal_us + 0.25*sample : sample;
++            normal_samples = std::min(normal_samples + 1, 8);
++            if (cooldown > 0) {
++                --cooldown;
++            }
++            if (normal_samples == 8 && cooldown == 0) {
++                cap = 1;
++            }
++        } else {
++            window_us += duration;
++            window_tokens += produced;
++            if (++samples >= 4) {
++                if (normal_us <= 0 || window_us / window_tokens >= normal_us*0.95) {
++                    cap /= 2;
++                    cooldown = cap == 0 ? 32 : 0;
++                } else {
++                    cap = std::min(cap + 1, 8);
++                }
++                samples = 0;
++                window_us = 0;
++                window_tokens = 0;
++            }
++        }
++        proposed = 0;
++    }
++};
+ 
+ // shared between server_slot and server_task_result_*
+ struct server_slot_stats {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -299,6 +299,7 @@
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
++    server_speculation_control spec_control;
+     std::mt19937 spec_synth_rng;
+ 
+     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
+@@ -579,6 +580,9 @@
+ 
+         if (n_remaining() > 0) {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
++        }
++        if (spec_control.enabled) {
++            n_draft_max = std::min(n_draft_max, spec_control.cap);
+         }
+ 
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+@@ -1859,12 +1863,14 @@
+             // cache prompts only for the tasks that reuse them
+             update_cache = update_cache && !task.is_stateless();
+ 
+-            if (update_cache) {
++            if (prompt_cache && !task.is_stateless()) {
+                 SRV_TRC("%s", "updating prompt cache\n");
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+-                ret->prompt_save(*prompt_cache);
++                if (update_cache) {
++                    ret->prompt_save(*prompt_cache);
++                }
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+@@ -1996,6 +2002,8 @@
+         }
+ 
+         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
++        slot.spec_control = {};
++        slot.spec_control.enabled = task.params.speculative_adaptive;
+ 
+         if (task.type == SERVER_TASK_TYPE_TTS) {
+             GGML_ASSERT(has_cap_tts()); // should already checked in route handler
+@@ -2033,7 +2041,7 @@
+ 
+             // TODO: tmp until backend sampling is fully implemented
+             if (use_backend_sampling) {
+-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
++                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get_backend(slot.smpl.get()));
+             } else {
+                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+             }
+@@ -3745,6 +3753,7 @@
+             }
+ 
+             generating.push_back(&slot);
++            if (slot.spec_control.enabled) { slot.spec_control.begin(ggml_time_us()); }
+ 
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+@@ -3755,6 +3764,7 @@
+                 const int n_draft_max = slot.get_n_draft_max();
+ 
+                 if (n_draft_max > 0) {
++                    slot.spec_control.proposed = 1;
+                     GGML_ASSERT(slot.can_speculate());
+ 
+                     // stale candidates: a replay never reads them, a new draft refills them
+@@ -4775,6 +4785,12 @@
+ 
+             slot.stats.n_gen += 1;
+ 
++            if (slot.stats.n_gen > 1) {
++                slot.spec_control.observe(t_now, 1);
++            } else {
++                slot.spec_control.started = 0;
++            }
++
+             if (slot.stats.n_gen == 1) {
+                 slot.stats.update_prompt_last();
+                 slot.t_print_last = t_now;
+@@ -4918,6 +4934,7 @@
+             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+ 
+             slot.sampled = ids.back(); // last accepted token
++            if (slot.spec_control.enabled) { slot.spec_control.observe(ggml_time_us(), ids.size()); }
+             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+ 
+             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+@@ -5055,6 +5072,9 @@
+     }
+ 
+     void metrics_on_prediction(const server_slot & slot) {
++        if (prompt_cache) {
++            prompt_cache->observe_prompt(slot.stats.n_prompt_processed, slot.stats.t_prompt_ms()*1000.0);
++        }
+         const uint64_t t_us    = slot.stats.t_gen_us();
+         const uint64_t n       = slot.stats.n_gen;
+         const uint64_t n_steps = slot.stats.n_gen_steps();
+@@ -6250,6 +6270,29 @@
+         auto res = create_response();
+         const json body = json::parse(req.body);
+         json tokens_response = json::array();
++        if (body.contains("contents")) {
++            const auto & contents = body.at("contents");
++            if (!contents.is_array() || contents.empty() || contents.size() > 64) {
++                res->error(format_error_response("contents must contain 1 to 64 strings", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++            size_t bytes = 0;
++            for (const auto & content : contents) {
++                if (!content.is_string()) {
++                    res->error(format_error_response("contents must contain strings", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                const auto text = content.get<std::string>();
++                if (text.size() > 16*1024*1024 - bytes) {
++                    res->error(format_error_response("contents must be strings totaling at most 16 MiB", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                bytes += text.size();
++                tokens_response.push_back(tokenize_mixed(ctx_server.vocab, content, json_value(body, "add_special", false), json_value(body, "parse_special", true)));
++            }
++            res->ok(json{{"tokens_batch", std::move(tokens_response)}});
++            return res;
++        }
+         if (body.count("content") != 0) {
+             const bool add_special = json_value(body, "add_special", false);
+             const bool parse_special = json_value(body, "parse_special", true);
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -186,6 +186,8 @@
+ 
+     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
+         ->set_desc("Use backend sampling instead of llama.cpp sampling"));
++    add((new field_bool("speculative_adaptive", params.speculative_adaptive))
++        ->set_desc("Measure normal decoding and reduce draft work when verification is slower"));
+ 
+     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
+         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -11,6 +11,7 @@
+ #include "server-common.h"
+ 
+ #include <sstream>
++#include <cmath>
+ 
+ //
+ // task_params
+@@ -1825,8 +1826,39 @@
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++void server_prompt_cache::observe_prompt(uint64_t tokens, double duration_us) {
++    if (tokens < 16 || duration_us <= 0 || !std::isfinite(duration_us)) {
++        return;
++    }
++    const double sample = duration_us / tokens;
++    prompt_us_per_token = prompt_us_per_token > 0 ? 0.75*prompt_us_per_token + 0.25*sample : sample;
++}
++
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_prompt & prompt, const server_tokens & tokens_new) {
++    if (tokens_new.empty()) {
++        return states.end();
++    }
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
++    if (size_t(lcp_best) == tokens_new.size()) {
++        return states.end();
++    }
++
++    if (prompt_us_per_token > 0 && restore_us_per_byte > 0) {
++        auto best = states.end();
++        double saving_best = 0;
++        for (auto it = states.begin(); it != states.end(); ++it) {
++            const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
++            if (lcp <= lcp_best) {
++                continue;
++            }
++            const double saving = (lcp - lcp_best)*prompt_us_per_token - 1.1*it->size()*restore_us_per_byte;
++            if (saving > saving_best || (saving == saving_best && best != states.end() && it->size() < best->size())) {
++                best = it;
++                saving_best = saving;
++            }
++        }
++        return best;
++    }
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+     float f_sim_best  = float(lcp_best) / tokens_new.size();
+@@ -1857,8 +1889,14 @@
+         }
+     }
+ 
++    return it_best;
++}
++
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++    auto it_best = find_best(prompt, tokens_new);
+     if (it_best != states.end()) {
+-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++        const size_t restore_bytes = it_best->data.size();
++        const int64_t restore_start = ggml_time_us();
+ 
+         {
+             auto & data = it_best->data.main;
+@@ -1871,8 +1909,6 @@
+                 return false;
+             }
+ 
+-            data.clear();
+-            data.shrink_to_fit();
+         }
+ 
+         {
+@@ -1889,12 +1925,16 @@
+                     return false;
+                 }
+ 
+-                data.clear();
+-                data.shrink_to_fit();
+             }
+         }
+ 
+         prompt = std::move(it_best->prompt);
++
++        const int64_t restore_us = ggml_time_us() - restore_start;
++        if (restore_bytes > 0 && restore_us > 0) {
++            const double sample = double(restore_us) / restore_bytes;
++            restore_us_per_byte = restore_us_per_byte > 0 ? 0.75*restore_us_per_byte + 0.25*sample : sample;
++        }
+ 
+         states.erase(it_best);
+     }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -86,6 +86,7 @@
+ 
+     bool timings_per_token   = false;
+     bool post_sampling_probs = false;
++    bool speculative_adaptive = false;
+ 
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+@@ -712,6 +713,12 @@
+ 
+     size_t n_tokens() const;
+ 
++    double prompt_us_per_token = 0;
++    double restore_us_per_byte = 0;
++
++    void observe_prompt(uint64_t tokens, double duration_us);
++    std::list<server_prompt_cache_state>::iterator find_best(const server_prompt & prompt, const server_tokens & tokens);
++
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);

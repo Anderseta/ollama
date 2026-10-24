@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -165,7 +166,7 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 		opts.NumBatch = llm.DefaultEmbeddingNumBatch
 	}
 
-	if model != nil && model.DraftPath == "" && !draftNumPredictSet {
+	if model != nil && model.DraftPath == "" && !draftNumPredictSet && (opts.SpeculativeType == "" || opts.SpeculativeType == "none") {
 		opts.DraftNumPredict = 0
 	}
 
@@ -1116,10 +1117,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	// media blobs it carries. Items without media go through the plain
 	// text embed path; items with media go through the runner's media-aware
 	// embed.
-	type embedInput struct {
-		text  string
-		media [][]byte
-	}
+	type embedInput = embeddingInput
 
 	var input []embedInput
 
@@ -1214,7 +1212,20 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
+	ctx, cancelEmbeddings := context.WithCancel(c.Request.Context())
+	defer cancelEmbeddings()
+	var tokenCache sync.Map
+	rememberTokens := func(text string, tokens []int) { tokenCache.Store(text, tokens) }
+	cachedTokenize := func(text string) ([]int, error) {
+		if value, exists := tokenCache.Load(text); exists {
+			return value.([]int), nil
+		}
+		tokens, err := r.Tokenize(ctx, text)
+		if err == nil {
+			rememberTokens(text, tokens)
+		}
+		return tokens, err
+	}
 
 	adjustTokenLimit := func(tokens []int, limit int) int {
 		if bos := m.metadata.Int("tokenizer.ggml.bos_token_id"); len(tokens) > 0 && tokens[0] != int(bos) && m.metadata.Bool("add_bos_token", true) {
@@ -1227,7 +1238,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	}
 
 	inputTokensAndContext := func(text string) ([]int, int, error) {
-		tokens, err := r.Tokenize(ctx, text)
+		tokens, err := cachedTokenize(text)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1333,12 +1344,45 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return r.Embedding(ctx, truncated, item.media)
 	}
 
-	var g errgroup.Group
+	prepareBatchText := truncateInput
+	if req.Truncate != nil && !*req.Truncate {
+		prepareBatchText = func(text string) (string, bool, error) {
+			tokens, limit, err := inputTokensAndContext(text)
+			if err != nil {
+				return "", false, err
+			}
+			if len(tokens) > limit {
+				return "", false, api.StatusError{StatusCode: 400, ErrorMessage: "the input length exceeds the context length"}
+			}
+			return text, false, nil
+		}
+	}
+	batched, batchTokens, usedBatch, batchErr := prepareEmbeddingBatch(ctx, r, input, rememberTokens, cachedTokenize, prepareBatchText, embedWithRetry)
+	if batchErr != nil {
+		s.sched.expireRunnersForRuntimeOOM(m, batchErr)
+		var status api.StatusError
+		if errors.As(batchErr, &status) {
+			c.AbortWithStatusJSON(status.StatusCode, gin.H{"error": strings.TrimSpace(status.ErrorMessage)})
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": batchErr.Error()})
+		return
+	}
+	g, groupContext := errgroup.WithContext(ctx)
+	ctx = groupContext
+	g.SetLimit(16)
 	embeddings := make([][]float32, len(input))
-	var totalTokens uint64
+	totalTokens := uint64(batchTokens)
 	for i, item := range input {
 		g.Go(func() error {
-			embedding, tokenCount, err := embedWithRetry(item)
+			var embedding []float32
+			var tokenCount int
+			var err error
+			if usedBatch {
+				embedding = batched[i]
+			} else {
+				embedding, tokenCount, err = embedWithRetry(item)
+			}
 			if err != nil {
 				return err
 			}
@@ -2372,7 +2416,9 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.HEAD("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
-	r.GET("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
+	r.GET("/api/version", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch"}})
+	})
 	r.GET("/api/status", s.StatusHandler)
 	// Codex uses this existing Ollama listener for both native and Ollama
 	// models. The proxy selects the upstream per request.
