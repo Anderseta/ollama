@@ -405,6 +405,10 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	if err != nil {
 		return nil, 0, err
 	}
+	params, err = appendWarmupArgs(params)
+	if err != nil {
+		return nil, 0, err
+	}
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
 

@@ -67,3 +67,30 @@ func TestMoeRAMMemoryAccounting(t *testing.T) {
 		t.Fatalf("memory accounting lost weight cache or non-weight buffers: total=%d vram=%d", total, vram)
 	}
 }
+
+func TestMoeRAMWarmupConfiguration(t *testing.T) {
+	for _, tt := range []struct {
+		raw           string
+		flag, failure bool
+	}{
+		{"", false, false}, {"1", true, false}, {"true", true, false},
+		{"0", false, false}, {"false", false, false}, {"invalid", false, true},
+	} {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Setenv("LLAMA_ARG_NO_WARMUP", tt.raw)
+			got, err := appendWarmupArgs(nil)
+			if (err != nil) != tt.failure {
+				t.Fatalf("error=%v failure=%v", err, tt.failure)
+			}
+			if tt.failure {
+				return
+			}
+			if len(got) != 0 && (len(got) != 1 || got[0] != "--no-warmup") {
+				t.Fatalf("unexpected flags %v", got)
+			}
+			if (len(got) > 0) != tt.flag {
+				t.Fatalf("flags=%v expected no-warmup=%v", got, tt.flag)
+			}
+		})
+	}
+}

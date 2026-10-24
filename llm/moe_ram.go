@@ -32,3 +32,18 @@ func appendMoeRAMLimitArgs(args []string, opts api.Options, experts uint64) ([]s
 	}
 	return append(args, "--moe-ram-limit-mib", strconv.FormatUint(value, 10)), nil
 }
+
+func appendWarmupArgs(args []string) ([]string, error) {
+	raw := envconfig.Var("LLAMA_ARG_NO_WARMUP")
+	if raw == "" {
+		return args, nil
+	}
+	disabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil, fmt.Errorf("LLAMA_ARG_NO_WARMUP must be a boolean: %w", err)
+	}
+	if disabled {
+		args = append(args, "--no-warmup")
+	}
+	return args, nil
+}

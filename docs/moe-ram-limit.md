@@ -27,6 +27,11 @@ Units are MiB; 10240 MiB = 10 GiB. Zero restores ordinary loading. Fractions,
 negative values, invalid units, and values above 2097151 MiB are rejected.
 The native runner accepts `--moe-ram-limit-mib` too.
 
+`LLAMA_ARG_NO_WARMUP=1` forwards the native `--no-warmup` flag. The native
+warmup argument has no environment binding, so merely passing that environment
+variable to an unmodified runner has no effect. Skipping the optional dummy run
+avoids reading and caching experts unrelated to the first user prompt.
+
 ## Mechanism and scope
 
 * Raw host GGUF tensors receive stable virtual address reservations. Reserving
