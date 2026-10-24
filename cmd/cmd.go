@@ -2262,7 +2262,25 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	return nil
 }
 
-func RunServer(_ *cobra.Command, _ []string) error {
+func RunServer(cmd *cobra.Command, _ []string) error {
+	if cmd.Flags().Changed("moe-ram-limit-mib") {
+		limit, err := cmd.Flags().GetInt("moe-ram-limit-mib")
+		if err != nil {
+			return err
+		}
+		if limit < 0 || limit > 2097151 {
+			return fmt.Errorf("moe-ram-limit-mib must be between 0 and 2097151")
+		}
+		if err := os.Setenv("OLLAMA_MOE_RAM_LIMIT_MIB", strconv.Itoa(limit)); err != nil {
+			return err
+		}
+	}
+	if value := os.Getenv("OLLAMA_MOE_RAM_LIMIT_MIB"); value != "" {
+		n, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || n > 2097151 {
+			return fmt.Errorf("OLLAMA_MOE_RAM_LIMIT_MIB must be an integer between 0 and 2097151")
+		}
+	}
 	if err := initializeKeypair(); err != nil {
 		return err
 	}
@@ -2651,6 +2669,8 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(0),
 		RunE:    RunServer,
 	}
+
+	serveCmd.Flags().Int("moe-ram-limit-mib", 0, "Maximum RAM for resident MoE model weights in MiB; excludes KV and buffers (0 disables)")
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",

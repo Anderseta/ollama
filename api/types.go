@@ -592,6 +592,7 @@ type Options struct {
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
+	MoeRAMLimitMiB  *int  `json:"moe_ram_limit_mib,omitempty"`
 	NumCtx          int   `json:"num_ctx,omitempty"`
 	NumBatch        int   `json:"num_batch,omitempty"`
 	NumGPU          int   `json:"num_gpu,omitempty"`
@@ -1136,6 +1137,20 @@ func (opts *Options) FromMap(m map[string]any) error {
 		if field.IsValid() && field.CanSet() {
 			if val == nil {
 				continue
+			}
+			if key == "moe_ram_limit_mib" {
+				var limit float64
+				switch n := val.(type) {
+				case int64:
+					limit = float64(n)
+				case float64:
+					limit = n
+				default:
+					return fmt.Errorf("option %q must be an integer between 0 and 2097151", key)
+				}
+				if math.IsNaN(limit) || math.IsInf(limit, 0) || limit != math.Trunc(limit) || limit < 0 || limit > 2097151 {
+					return fmt.Errorf("option %q must be an integer between 0 and 2097151", key)
+				}
 			}
 
 			switch field.Kind() {

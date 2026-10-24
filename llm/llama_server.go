@@ -148,6 +148,7 @@ type llamaServerRunner struct {
 	memGPU             uint64 // actual GPU buffer size parsed from llama-server logs (bytes)
 	memModelFileBacked uint64 // model weight bytes whose buffers mirror the on-disk file (mmap views + direct device copies); excludes repacked copies like CPU_REPACK
 	memCPUMappedModel  uint64 // model weight bytes in mmap-backed CPU buffers (e.g. CPU_Mapped), parsed from llama-server logs
+	moeRAMWeightLimit  uint64 // bounded locked host-weight cache; zero preserves normal mmap accounting
 	gpuLayers          uint64 // model layers loaded on GPU, parsed from llama-server logs
 	gpuLayerOverflow   int    // number of GPU-selected layers partially overflowed to CPU
 	status             *StatusWriter
@@ -193,6 +194,7 @@ type llamaServerLaunchConfig struct {
 	draftType            string
 	projectors           []string
 	mmprojMemory         uint64
+	modelExperts         uint64
 	modelLayers          uint64
 	adapters             []string
 	opts                 api.Options
@@ -398,6 +400,10 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params, "-np", "16", "--kv-unified", "--cache-ram", "0")
 	} else {
 		params = append(params, "-np", strconv.Itoa(launch.numParallel))
+	}
+	params, err = appendMoeRAMLimitArgs(params, launch.opts, launch.modelExperts)
+	if err != nil {
+		return nil, 0, err
 	}
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
@@ -967,6 +973,7 @@ func NewLlamaServerRunner(
 	launch := llamaServerLaunchConfig{
 		modelPath:    splitModel.modelPath,
 		modelArch:    arch,
+		modelExperts: f.KV().Uint(arch + ".expert_count"),
 		draftType:    draftType,
 		projectors:   slices.Clone(splitModel.projectors),
 		mmprojMemory: mmprojMemory,
@@ -1168,6 +1175,7 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	s.memGPU = 0
 	s.memModelFileBacked = 0
 	s.memCPUMappedModel = 0
+	s.moeRAMWeightLimit = 0
 	s.gpuLayers = 0
 	s.gpuLayerOverflow = 0
 	for k := range s.vramByDevice {
@@ -2804,6 +2812,7 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 	memGPU := s.memGPU
 	memModelFileBacked := s.memModelFileBacked
 	memCPUMappedModel := s.memCPUMappedModel
+	moeRAMWeightLimit := s.moeRAMWeightLimit
 	totalLayers := s.totalLayers
 	gpuLayers := s.gpuLayers
 	gpuLayerOverflow := s.gpuLayerOverflow
@@ -2819,12 +2828,17 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 		// repacked copies such as CPU_REPACK are separate real allocations and
 		// must be left intact. Weights cannot exceed the model file on disk, so
 		// trim that overlap from the mmap-backed (reclaimable page cache) portion.
-		if memCPUMappedModel > 0 {
+		if moeRAMWeightLimit > 0 && memCPUMappedModel > 0 {
+			// Managed host tensors reserve addresses across the GGUF files, but only
+			// the locked cache consumes weight RAM. KV and other allocations stay counted.
+			total -= min(total, memCPUMappedModel)
+			total += min(memCPUMappedModel, moeRAMWeightLimit)
+		} else if memCPUMappedModel > 0 {
 			if modelSize := modelFileSize(s.modelPath, s.metadata); modelSize > 0 && memModelFileBacked > modelSize {
 				total -= min(memCPUMappedModel, memModelFileBacked-modelSize)
 			}
 		}
-		if totalLayers > 0 && gpuLayers >= totalLayers && gpuLayerOverflow == 0 {
+		if totalLayers > 0 && gpuLayers >= totalLayers && gpuLayerOverflow == 0 && moeRAMWeightLimit == 0 {
 			total = vram
 		}
 		return total, vram
@@ -2938,6 +2952,11 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 		func() {
 			w.runner.memoryMu.Lock()
 			defer w.runner.memoryMu.Unlock()
+			if match := moeRAMWeightLimitRegex.FindSubmatch(b); match != nil {
+				if limit, err := strconv.ParseUint(string(match[1]), 10, 64); err == nil {
+					w.runner.moeRAMWeightLimit = limit
+				}
+			}
 
 			if match := deviceFreeRegex.FindSubmatch(b); match != nil {
 				devName := string(match[1])
