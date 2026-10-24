@@ -69,6 +69,14 @@ avoids reading and caching experts unrelated to the first user prompt.
   newly loaded page as if it had been reused. Cache hits skip I/O planning.
   Failed reads drain outstanding I/O before releasing buffers, and incomplete
   GPU fills invalidate their new mappings rather than exposing old device bytes.
+* Expert uploads for prompt batches above 32 routed positions use a reusable
+  4 MiB pinned host buffer per GPU when the backend provides it. Copies are
+  queued in bounded chunks and complete before the buffer is reused or source
+  pages can be evicted. The complete selected source set must fit the host-weight
+  quota; otherwise uploads keep the existing bounded streaming path. Backends
+  without pinned host memory retain the previous prefetched, synchronous path.
+  This fixed transfer buffer is outside the weight quota. Single-token generation
+  and the GPU expert-cache fill policy retain their previous copy path.
 * Token embedding export/lookup helpers also use the cache, including accesses
   made outside graph execution. Their original bulk path stays unchanged for
   unmanaged tensors. Managed weights are read-only; in-place graph updates and
@@ -127,6 +135,7 @@ The standalone cache test needs no model download:
 
 ```sh
 test-moe-ram --cache /explicit/test/directory
+test-moe-ram --cache-gpu /explicit/test/directory
 test-moe-ram small-moe.gguf 2 0 0 extended
 test-moe-ram small-moe.gguf 2 99 1 parallel
 ```
@@ -144,6 +153,14 @@ logits, quantized expert banks, larger prompt batches and concurrent contexts.
 The Windows I/O optimization does not change model weights, quantization,
 routing, context size or arithmetic. It adds no second on-disk model index:
 GGUF tensor offsets are already indexed at load time.
+
+The final transfer review also checks duplicate and unaligned batched copies,
+reuse of the pinned buffer across more than 4 MiB of transfers, invalid source
+and destination ranges, immutable destinations, oversized-batch fallback, and
+CUDA with pinned memory disabled. Prompt and decode logits remain compared
+against ordinary loading, including the 32/48-token boundary, split GGUF files
+and concurrent contexts. Generic batching was not retained for generation:
+the measured benefit was in prompt processing, not in every copy workload.
 
 Additional tiny fixtures can be generated using the native tree's `gguf-py` and
 NumPy, with an explicit output directory; they are not trained language models:

@@ -228,7 +228,7 @@ index 97250c2..39ee851 100644
      llama-sampler.cpp
      llama-vocab.cpp
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ca84fc4..7bbef97 100644
+index ca84fc4..25c3c80 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,6 @@
@@ -269,7 +269,7 @@ index ca84fc4..7bbef97 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
      }
-@@ -2783,6 +2805,64 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+@@ -2783,6 +2805,75 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
          return true;
      }
  
@@ -320,7 +320,18 @@ index ca84fc4..7bbef97 100644
 +                        ranges.push_back({ src, next*expert_size, size });
 +                    }
 +                }
-+                lctx->model.ram_cache->prefetch(ranges);
++                // Pinned staging helps prompt batches; keep the smaller-copy path for generation.
++                const bool batch_upload = ids->ne[1] > 32 / std::max<int64_t>(1, ids->ne[2]);
++                if (batch_upload) {
++                    std::vector<llama_model_ram_copy> copies;
++                    copies.reserve(ranges.size());
++                    for (const auto & range : ranges) {
++                        copies.push_back({ src, dst, range.offset, range.offset, range.size });
++                    }
++                    if (lctx->model.ram_cache->copy_batch(backend, copies)) { return true; }
++                } else {
++                    lctx->model.ram_cache->prefetch(ranges);
++                }
 +                for (const auto & range : ranges) {
 +                    lctx->model.ram_cache->copy(backend, src, dst, range.offset, range.offset, range.size);
 +                }
@@ -398,13 +409,14 @@ index ed59079..de848c0 100644
      bool check_tensors;
 diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
 new file mode 100644
-index 0000000..9abe2a7
+index 0000000..35bde84
 --- /dev/null
 +++ b/src/llama-model-ram.cpp
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,687 @@
 +#include "llama-model-ram.h"
 +#include "llama-impl.h"
 +#include "ggml.h"
++#include "ggml-cpp.h"
 +
 +#include <algorithm>
 +#include <array>
@@ -639,6 +651,7 @@ index 0000000..9abe2a7
 +    std::string last_error;
 +    uint8_t * staging = nullptr;
 +    std::array<read_request, io_depth> requests;
++    std::map<ggml_backend_dev_t, ggml_backend_buffer_ptr> upload_buffers;
 +    bool poisoned = false;
 +#ifdef _WIN32
 +    SIZE_T old_min = 0, old_max = 0, current_min = 0;
@@ -697,6 +710,27 @@ index 0000000..9abe2a7
 +        if (it == addresses.begin()) { return nullptr; }
 +        region * r = (--it)->second;
 +        return ptr - (uintptr_t) r->data < r->size ? r : nullptr;
++    }
++    uint8_t * upload_buffer(ggml_backend_t backend) {
++        const auto device = ggml_backend_get_device(backend);
++        auto it = upload_buffers.find(device);
++        if (it == upload_buffers.end()) {
++            it = upload_buffers.emplace(device, nullptr).first;
++            ggml_backend_dev_props props = {};
++            ggml_backend_dev_get_props(device, &props);
++            if (props.caps.host_buffer && props.caps.async) {
++                const auto type = ggml_backend_dev_host_buffer_type(device);
++                if (type && ggml_backend_buft_is_host(type)) {
++                    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(type, io_size));
++                    // A backend may silently fall back to pageable CPU memory.
++                    if (buffer && ggml_backend_buffer_get_type(buffer.get()) == type) {
++                        it->second = std::move(buffer);
++                        LLAMA_LOG_INFO("moe_ram: %s pinned upload buffer = %zu bytes\n", ggml_backend_dev_name(device), io_size);
++                    }
++                }
++            }
++        }
++        return it->second ? (uint8_t *) ggml_backend_buffer_get_base(it->second.get()) : nullptr;
 +    }
 +    const uint8_t * staged_read(uint16_t file, size_t offset, size_t size) {
 +        if (file >= readers.size()) { throw std::runtime_error("MoE RAM cache: invalid GGUF shard"); }
@@ -993,6 +1027,54 @@ index 0000000..9abe2a7
 +    p.ensure(needed, true);
 +    return true;
 +}
++bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector<llama_model_ram_copy> & copies) {
++    if (!backend) { throw std::runtime_error("MoE RAM cache: missing upload backend"); }
++    auto & p = *pimpl;
++    ++p.epoch;
++    std::vector<impl::page *> needed;
++    for (const auto & copy : copies) {
++        if (!copy.src || !copy.dst || contains(copy.dst) ||
++            checked_add(copy.src_offset, copy.size) > ggml_nbytes(copy.src) ||
++            checked_add(copy.dst_offset, copy.size) > ggml_nbytes(copy.dst)) {
++            throw std::runtime_error("MoE RAM cache: invalid batched device-copy range");
++        }
++        if (!contains(copy.src)) { return false; }
++        p.range(needed, copy.src, copy.src_offset, copy.size);
++        if (needed.size() > p.limit/page_size) { return false; }
++    }
++    if (needed.empty()) { return true; }
++    uint8_t * upload = p.upload_buffer(backend);
++    if (!upload) {
++        p.ensure(needed, true);
++        for (const auto & item : copies) {
++            copy(backend, item.src, item.dst, item.src_offset, item.dst_offset, item.size);
++        }
++        return true;
++    }
++    p.ensure(needed);
++    const int64_t start = ggml_time_us();
++    // No cache mutation until all transfers finish; the caller holds acquire().
++    struct upload_guard {
++        ggml_backend_t backend;
++        ~upload_guard() { if (backend) { ggml_backend_synchronize(backend); } }
++    } guard { backend };
++    size_t used = 0;
++    for (const auto & copy : copies) {
++        for (size_t done = 0; done < copy.size;) {
++            const size_t n = std::min(copy.size - done, io_chunk);
++            const uint8_t * data = (const uint8_t *) copy.src->data + copy.src_offset + done;
++            if (n > io_size - used) { ggml_backend_synchronize(backend); used = 0; }
++            memcpy(upload + used, data, n);
++            ggml_backend_tensor_set_async(backend, copy.dst, upload + used, copy.dst_offset + done, n);
++            used += n;
++            done += n;
++        }
++    }
++    ggml_backend_synchronize(backend);
++    guard.backend = nullptr;
++    p.upload_us += ggml_time_us() - start;
++    return true;
++}
 +bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size) {
 +    auto & p = *pimpl;
 +    if (!contains(src)) { return false; }
@@ -1020,10 +1102,10 @@ index 0000000..9abe2a7
 +const char * llama_model_ram_cache::error() const { return pimpl->last_error.c_str(); }
 diff --git a/src/llama-model-ram.h b/src/llama-model-ram.h
 new file mode 100644
-index 0000000..56e90fe
+index 0000000..bf23bde
 --- /dev/null
 +++ b/src/llama-model-ram.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,48 @@
 +#pragma once
 +
 +#include "ggml-backend.h"
@@ -1036,6 +1118,12 @@ index 0000000..56e90fe
 +struct llama_model_ram_range {
 +    const ggml_tensor * tensor;
 +    size_t offset, size;
++};
++
++struct llama_model_ram_copy {
++    const ggml_tensor * src;
++    ggml_tensor * dst;
++    size_t src_offset, dst_offset, size;
 +};
 +
 +// A model-owned, locked host-weight cache. KV and compute buffers are not charged.
@@ -1053,6 +1141,7 @@ index 0000000..56e90fe
 +    bool needs_prepare(const ggml_tensor * node) const;
 +    bool prepare(ggml_tensor * node);
 +    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size);
++    bool copy_batch(ggml_backend_t backend, const std::vector<llama_model_ram_copy> & copies);
 +    bool prefetch(const std::vector<llama_model_ram_range> & ranges);
 +    void load_device_tensor(ggml_tensor * tensor, uint16_t file, size_t offset);
 +    // Caller holds acquire(), as for prepare() and copy().
@@ -1333,10 +1422,10 @@ index 7631549..ec3fd4b 100644
 +llama_test(test-moe-ram NAME test-moe-ram-cache ARGS --cache ${CMAKE_CURRENT_BINARY_DIR} LABEL "main behavior")
 diff --git a/tests/test-moe-ram.cpp b/tests/test-moe-ram.cpp
 new file mode 100644
-index 0000000..94aebd7
+index 0000000..e1e26af
 --- /dev/null
 +++ b/tests/test-moe-ram.cpp
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,365 @@
 +#include "llama.h"
 +#include "common.h"
 +#include "fit.h"
@@ -1403,7 +1492,7 @@ index 0000000..94aebd7
 +    if (!condition) { throw std::runtime_error(message); }
 +}
 +
-+static void test_cache(const char * directory) {
++static void test_cache(const char * directory, bool gpu = false) {
 +    constexpr size_t page = 65536;
 +    struct fixture {
 +        std::filesystem::path path;
@@ -1429,14 +1518,15 @@ index 0000000..94aebd7
 +    auto * indices4 = ggml_view_3d(ctx.get(), ids_storage, 2, 2, 2, 16, 32, 0);
 +    auto * dst = ggml_dup_tensor(ctx.get(), weights);
 +    auto * tail = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, 127);
-+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
-+    require(backend != nullptr, "CPU backend missing");
++    ggml_backend_ptr backend(ggml_backend_init_by_type(gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++    require(backend != nullptr, "test backend missing");
 +    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
 +    require(buf != nullptr, "cannot allocate test tensors");
 +    llama_model_ram_cache cache(4*page, files);
 +    cache.bind(weights, 0, 31); cache.bind(alias, 0, 31);
 +    cache.bind(table, 0, 31 + 8*page); cache.bind(bias, 0, 31 + 16*page);
 +    require(weights->data == alias->data, "tied weights were duplicated");
++    require(cache.copy_batch(backend.get(), {}), "empty copy batch failed");
 +    require(cache.prefetch({ { weights, 6*page, page }, { weights, page, page }, { alias, 6*page, page } }),
 +        "queued prefetch of duplicate ranges failed");
 +    const auto after_prefetch = cache.stats();
@@ -1491,10 +1581,43 @@ index 0000000..94aebd7
 +    require(cache.copy(backend.get(), weights, dst, 0, 0, 8*page), "chunked copy failed");
 +    ggml_backend_tensor_get(dst, result.data(), 0, result.size());
 +    require(!memcmp(result.data(), raw.data() + 31, result.size()), "chunked copy mismatch");
++    require(cache.copy_batch(backend.get(), {
++        { weights, dst, 6*page + 17, 2*page + 3, page - 31 },
++        { alias, dst, page, 4*page, page },
++        { weights, dst, page, 5*page, page },
++    }), "batched copy failed");
++    ggml_backend_tensor_get(dst, result.data(), 0, result.size());
++    require(!memcmp(result.data() + 2*page + 3, raw.data() + 31 + 6*page + 17, page - 31) &&
++            !memcmp(result.data() + 4*page, raw.data() + 31 + page, page) &&
++            !memcmp(result.data() + 5*page, raw.data() + 31 + page, page), "batched copy mismatch");
++    std::vector<llama_model_ram_copy> repeated;
++    for (size_t i = 0; i < 96; ++i) { repeated.push_back({ weights, dst, (i%2)*page, 0, page }); }
++    require(cache.copy_batch(backend.get(), repeated), "reused upload buffer failed");
++    ggml_backend_tensor_get(dst, result.data(), 0, page);
++    require(!memcmp(result.data(), raw.data() + 31 + page, page), "upload buffer reused before completion");
++    const auto before_batch_fallback = cache.stats();
++    require(!cache.copy_batch(backend.get(), { { weights, dst, 0, 0, 8*page } }) &&
++        cache.stats().bytes_read == before_batch_fallback.bytes_read, "oversized batch performed I/O");
 +    auto stats = cache.stats();
 +    require(stats.peak <= 4*page && stats.evicted_pages > stats.eviction_calls && stats.eviction_calls > 0,
 +        "budget or batched eviction invariant failed");
 +    bool rejected = false;
++    try { cache.copy_batch(backend.get(), { { weights, dst, 0, 8*page - 1, 2 } }); }
++    catch (const std::exception &) { rejected = true; }
++    require(rejected, "out of bounds batch destination accepted");
++    rejected = false;
++    try { cache.copy_batch(backend.get(), { { weights, dst, 8*page - 1, 0, 2 } }); }
++    catch (const std::exception &) { rejected = true; }
++    require(rejected, "out of bounds batch source accepted");
++    rejected = false;
++    try { cache.copy_batch(backend.get(), { { weights, dst, SIZE_MAX, 0, 2 } }); }
++    catch (const std::exception &) { rejected = true; }
++    require(rejected, "overflowing batch range accepted");
++    rejected = false;
++    try { cache.copy_batch(backend.get(), { { weights, alias, 0, 0, page } }); }
++    catch (const std::exception &) { rejected = true; }
++    require(rejected, "batch wrote immutable weights");
++    rejected = false;
 +    try { cache.bind(alias, 1, 0); } catch (const std::exception &) { rejected = true; }
 +    require(rejected, "invalid shard accepted");
 +    rejected = false;
@@ -1513,6 +1636,15 @@ index 0000000..94aebd7
 +    rejected = false;
 +    try { cache.prefetch({ { weights, 0, 4*page } }); } catch (const std::exception &) { rejected = true; }
 +    require(rejected && cache.stats().peak <= 4*page, "truncated read did not fail within budget");
++    std::fill(result.begin(), result.end(), 0x4d);
++    ggml_backend_tensor_set(dst, result.data(), 0, 4*page);
++    rejected = false;
++    try { cache.copy_batch(backend.get(), { { weights, dst, 0, 0, 4*page } }); }
++    catch (const std::exception &) { rejected = true; }
++    require(rejected, "truncated batch accepted");
++    ggml_backend_tensor_get(dst, result.data(), 0, 4*page);
++    require(std::all_of(result.begin(), result.begin() + 4*page, [](uint8_t b) { return b == 0x4d; }),
++        "failed batch modified the destination");
 +    printf("PASS cache: strided routing, tied weights, bias, 4D rows, eviction, recovery, bounds, exact bytes, peak %zu bytes\n", stats.peak);
 +}
 +
@@ -1619,9 +1751,9 @@ index 0000000..94aebd7
 +    ggml_backend_load_all();
 +    llama_backend_init();
 +    try {
-+        if (std::string(argv[1]) == "--cache") {
++        if (std::string(argv[1]) == "--cache" || std::string(argv[1]) == "--cache-gpu") {
 +            require(argc > 2, "cache test needs an explicit temporary directory");
-+            test_cache(argv[2]); llama_backend_free(); return 0;
++            test_cache(argv[2], std::string(argv[1]) == "--cache-gpu"); llama_backend_free(); return 0;
 +        }
 +        const size_t budget = (argc > 2 ? std::stoul(argv[2]) : 1) * 1024*1024;
 +        const int gpu_layers = argc > 3 ? std::stoi(argv[3]) : 0;
