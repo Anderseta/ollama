@@ -43,7 +43,7 @@ diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
              }
              p.close_write();
          });
-@@ -464,6 +465,65 @@
+@@ -464,6 +465,71 @@
      }
  }
  
@@ -85,6 +85,7 @@ diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
 +static void test_adaptive_speculation(testing & t) {
 +    server_speculation_control control;
 +    control.enabled = true;
++    control.ceiling = 48;
 +    int64_t now = 1;
 +    auto step = [&](int proposed, int produced, int duration) {
 +        control.begin(now);
@@ -94,22 +95,27 @@ diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
 +        ++now;
 +    };
 +    for (int i = 0; i < 8; ++i) { step(0, 1, 1000); }
-+    t.assert_equal("baseline before drafting", 1, control.cap);
-+    for (int i = 0; i < 4; ++i) { step(1, 2, 1000); }
-+    t.assert_equal("profitable draft grows", 2, control.cap);
-+    for (int i = 0; i < 4; ++i) { step(2, 1, 2000); }
-+    t.assert_equal("slow draft shrinks", 1, control.cap);
-+    for (int i = 0; i < 4; ++i) { step(1, 1, 2000); }
++    t.assert_equal("probe native span despite fixed overhead", 48, control.cap);
++    for (int i = 0; i < 4; ++i) { step(48, 49, 1000); }
++    t.assert_equal("native ceiling respected", 48, control.cap);
++    for (int i = 0; i < 4; ++i) { step(48, 1, 2000); }
++    t.assert_equal("slow draft shrinks", 24, control.cap);
++    for (int i = 0; i < 4; ++i) { step(24, 25, 1000); }
++    t.assert_equal("profitable draft grows", 25, control.cap);
++    for (int expected : {12, 6, 3, 1, 0}) {
++        for (int i = 0; i < 4; ++i) { step(control.cap, 1, 2000); }
++        t.assert_equal("successive backoff", expected, control.cap);
++    }
 +    t.assert_equal("unprofitable drafting stops", 0, control.cap);
 +    t.assert_equal("probe cooldown", 32, control.cooldown);
 +    for (int i = 0; i < 32; ++i) { step(0, 1, 1000); }
-+    t.assert_equal("eventual recheck", 1, control.cap);
++    t.assert_equal("eventual full-span recheck", 48, control.cap);
 +}
 +
  int main(int argc, char ** argv) {
      testing t;
  
-@@ -484,6 +544,8 @@
+@@ -484,6 +550,8 @@
      t.test("server_pipe",   test_server_pipe);
      t.test("decision_escape", test_decision_escape);
      t.test("rerank_template", test_rerank_template);
@@ -132,7 +138,7 @@ diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
-@@ -400,6 +400,59 @@
+@@ -400,6 +400,60 @@
  //
  // stats and metrics
  //
@@ -140,6 +146,7 @@ diff --git a/tools/server/server-common.h b/tools/server/server-common.h
 +struct server_speculation_control {
 +    bool enabled = false;
 +    int cap = 0;
++    int ceiling = 8;
 +    int normal_samples = 0;
 +    int cooldown = 0;
 +    int samples = 0;
@@ -169,7 +176,7 @@ diff --git a/tools/server/server-common.h b/tools/server/server-common.h
 +                --cooldown;
 +            }
 +            if (normal_samples == 8 && cooldown == 0) {
-+                cap = 1;
++                cap = ceiling;
 +            }
 +        } else {
 +            window_us += duration;
@@ -179,7 +186,7 @@ diff --git a/tools/server/server-common.h b/tools/server/server-common.h
 +                    cap /= 2;
 +                    cooldown = cap == 0 ? 32 : 0;
 +                } else {
-+                    cap = std::min(cap + 1, 8);
++                    if (cap < ceiling) { ++cap; }
 +                }
 +                samples = 0;
 +                window_us = 0;
@@ -230,16 +237,20 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  
                  if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                      ret->prompt_clear();
-@@ -1996,6 +2002,8 @@
+@@ -1996,6 +2002,12 @@
          }
  
          SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 +        slot.spec_control = {};
 +        slot.spec_control.enabled = task.params.speculative_adaptive;
++        if (slot.spec_control.enabled && slot.can_speculate()) {
++            // Short probes can lose solely to fixed recurrent-checkpoint costs.
++            slot.spec_control.ceiling = std::max(1, common_speculative_n_max(slot.spec));
++        }
  
          if (task.type == SERVER_TASK_TYPE_TTS) {
              GGML_ASSERT(has_cap_tts()); // should already checked in route handler
-@@ -2033,7 +2041,7 @@
+@@ -2033,7 +2045,7 @@
  
              // TODO: tmp until backend sampling is fully implemented
              if (use_backend_sampling) {
@@ -248,7 +259,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
              } else {
                  llama_set_sampler(ctx_tgt, slot.id, nullptr);
              }
-@@ -3745,6 +3753,7 @@
+@@ -3745,6 +3757,7 @@
              }
  
              generating.push_back(&slot);
@@ -256,7 +267,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
  
              if (spec) {
                  common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
-@@ -3755,6 +3764,7 @@
+@@ -3755,6 +3768,7 @@
                  const int n_draft_max = slot.get_n_draft_max();
  
                  if (n_draft_max > 0) {
@@ -264,7 +275,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
                      GGML_ASSERT(slot.can_speculate());
  
                      // stale candidates: a replay never reads them, a new draft refills them
-@@ -4775,6 +4785,12 @@
+@@ -4775,6 +4789,12 @@
  
              slot.stats.n_gen += 1;
  
@@ -277,7 +288,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
              if (slot.stats.n_gen == 1) {
                  slot.stats.update_prompt_last();
                  slot.t_print_last = t_now;
-@@ -4918,6 +4934,7 @@
+@@ -4918,6 +4938,7 @@
              slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
  
              slot.sampled = ids.back(); // last accepted token
@@ -285,7 +296,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
              SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
  
              slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
-@@ -5055,6 +5072,9 @@
+@@ -5055,6 +5076,9 @@
      }
  
      void metrics_on_prediction(const server_slot & slot) {
@@ -295,7 +306,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
          const uint64_t t_us    = slot.stats.t_gen_us();
          const uint64_t n       = slot.stats.n_gen;
          const uint64_t n_steps = slot.stats.n_gen_steps();
-@@ -6250,6 +6270,29 @@
+@@ -6250,6 +6274,29 @@
          auto res = create_response();
          const json body = json::parse(req.body);
          json tokens_response = json::array();

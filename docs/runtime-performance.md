@@ -84,6 +84,8 @@ These are exposed in Wildgoose profiles and remain disabled/omitted by default:
   ordinary generation and total proposal/verification cost, cautiously probes,
   reduces ineffective drafts and retries after a cooldown. It cannot make every
   prompt faster and does not enable missing MTP weights.
+  Probes use the initialized technique's native span: tiny drafts can lose solely
+  to fixed recurrent-checkpoint costs and incorrectly hide profitable long drafts.
 
 Greedy-output equality, embedding cosine/ranking comparisons and grammar checks
 are useful regressions, not proof of unchanged quality on every possible input.
