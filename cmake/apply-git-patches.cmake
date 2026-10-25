@@ -32,9 +32,99 @@ foreach(PATCH_FILE IN LISTS _patches)
 endforeach()
 
 list(SORT _patch_entries)
+
+# Later patches can edit the context of earlier patches. In that case the
+# earlier patch cannot be reverse-checked directly against the final tree.
+# Probe an applied prefix on private copies, undoing it in reverse order. This
+# leaves the fetched source and its Git index untouched during detection.
+set(_applied_prefix 0)
+list(LENGTH _patch_entries _patch_count)
+if(_patch_count GREATER 1)
+    list(GET _patch_entries 0 _first_entry)
+    string(REGEX REPLACE "^[^|]*\\|" "" _first_patch "${_first_entry}")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env ${_git_apply_env}
+            ${GIT_EXECUTABLE} apply --check "${_first_patch}"
+        RESULT_VARIABLE _clean_check OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _clean_check EQUAL 0)
+        set(_probe_paths)
+        set(_probe_supported TRUE)
+        foreach(_entry IN LISTS _patch_entries)
+            string(REGEX REPLACE "^[^|]*\\|" "" _patch "${_entry}")
+            execute_process(COMMAND ${GIT_EXECUTABLE} apply --numstat "${_patch}"
+                RESULT_VARIABLE _stat_result OUTPUT_VARIABLE _stat)
+            if(NOT _stat_result EQUAL 0)
+                set(_probe_supported FALSE)
+                break()
+            endif()
+            string(REPLACE "\n" ";" _stat_lines "${_stat}")
+            foreach(_line IN LISTS _stat_lines)
+                if(_line STREQUAL "")
+                    continue()
+                endif()
+                string(REGEX REPLACE "^[^\t]*\t[^\t]*\t" "" _path "${_line}")
+                # Unusual quoted paths/renames use the conservative legacy
+                # checks below rather than interpreting Git's path quoting.
+                if(NOT _path MATCHES "^[A-Za-z0-9_./-]+$" OR
+                   _path MATCHES "(^|/)\\.\\.(/|$)" OR _path MATCHES "^/")
+                    set(_probe_supported FALSE)
+                    break()
+                endif()
+                list(APPEND _probe_paths "${_path}")
+            endforeach()
+        endforeach()
+        if(_probe_supported)
+            list(REMOVE_DUPLICATES _probe_paths)
+            string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef _probe_id)
+            set(_probe_root "${_patch_workdir}/.ollama-patch-check-${_probe_id}")
+            set(_prefix ${_patch_count})
+            while(_prefix GREATER 0)
+                file(MAKE_DIRECTORY "${_probe_root}")
+                foreach(_path IN LISTS _probe_paths)
+                    if(EXISTS "${_patch_workdir}/${_path}")
+                        get_filename_component(_parent "${_probe_root}/${_path}" DIRECTORY)
+                        file(MAKE_DIRECTORY "${_parent}")
+                        configure_file("${_patch_workdir}/${_path}" "${_probe_root}/${_path}" COPYONLY)
+                    endif()
+                endforeach()
+                math(EXPR _last "${_prefix} - 1")
+                set(_prefix_ok TRUE)
+                foreach(_idx RANGE ${_last} 0 -1)
+                    list(GET _patch_entries ${_idx} _entry)
+                    string(REGEX REPLACE "^[^|]*\\|" "" _patch "${_entry}")
+                    execute_process(COMMAND ${CMAKE_COMMAND} -E env
+                        "GIT_CEILING_DIRECTORIES=${_patch_workdir}"
+                        ${GIT_EXECUTABLE} apply --reverse "${_patch}"
+                        WORKING_DIRECTORY "${_probe_root}"
+                        RESULT_VARIABLE _undo OUTPUT_QUIET ERROR_QUIET)
+                    if(NOT _undo EQUAL 0)
+                        set(_prefix_ok FALSE)
+                        break()
+                    endif()
+                endforeach()
+                # The random absolute probe path is constructed only under
+                # this source directory and never contains user input.
+                file(REMOVE_RECURSE "${_probe_root}")
+                if(_prefix_ok)
+                    set(_applied_prefix ${_prefix})
+                    break()
+                endif()
+                math(EXPR _prefix "${_prefix} - 1")
+            endwhile()
+        endif()
+    endif()
+endif()
+
+set(_patch_index 0)
 foreach(_patch_entry IN LISTS _patch_entries)
+    math(EXPR _patch_index "${_patch_index} + 1")
     string(REGEX REPLACE "^[^|]*\\|" "" PATCH_FILE "${_patch_entry}")
     file(RELATIVE_PATH _patch_rel "${PATCH_DIR}" "${PATCH_FILE}")
+
+    if(_patch_index LESS_EQUAL _applied_prefix)
+        message(STATUS "${PATCH_LABEL}: ${_patch_rel} already applied (verified patch prefix), skipping")
+        continue()
+    endif()
 
     # If the patch can be REVERSED cleanly, it's already applied. Skip.
     execute_process(
