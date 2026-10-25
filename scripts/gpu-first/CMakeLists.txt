@@ -67,6 +67,18 @@ validation_target(test-moe-budget ggml)
 validation_target(test-moe-partition ggml)
 validation_target(test-cuda-upload ggml)
 validation_target(test-cuda-host-op ggml)
+validation_target(test-cuda-dense ggml)
+validation_target(test-dense-embedding llama)
+target_include_directories(test-dense-embedding PRIVATE "${WILDLLAMA_NATIVE}/src")
+validation_target(test-cuda-kv-growth ggml)
+validation_target(test-kv-growth llama)
+validation_target(test-llama-context llama-common
+    "${WILDLLAMA_NATIVE}/tests/llama-context/cases-kv.cpp"
+    "${WILDLLAMA_NATIVE}/tests/llama-context/cases-rs.cpp"
+    "${WILDLLAMA_NATIVE}/tests/llama-context/test-case.cpp"
+    "${WILDLLAMA_NATIVE}/tests/llama-context/test-log.cpp"
+    "${WILDLLAMA_NATIVE}/tests/llama-context/test-runner.cpp"
+    "${WILDLLAMA_NATIVE}/tests/llama-context/test-util.cpp")
 validation_target(test-prepare-async ggml)
 target_include_directories(test-prepare-async PRIVATE "${WILDLLAMA_NATIVE}/ggml/src")
 validation_target(test-moe-ram-pool llama ${RAM_TEST_INTERNALS})
@@ -85,6 +97,11 @@ add_test(NAME moe-partition COMMAND test-moe-partition)
 add_test(NAME prepare-async COMMAND test-prepare-async)
 add_test(NAME cuda-memory-budget COMMAND test-cuda-memory-budget)
 set_tests_properties(cuda-memory-budget PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+add_test(NAME cuda-dense COMMAND test-cuda-dense)
+add_test(NAME dense-embedding COMMAND test-dense-embedding "${CMAKE_BINARY_DIR}/dense-embedding-fixtures")
+set_tests_properties(dense-embedding PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+add_test(NAME cuda-kv-growth COMMAND test-cuda-kv-growth)
+set_tests_properties(cuda-dense cuda-kv-growth PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
 # One CUDA build also supplies the base runner libraries. The normal project
 # installs these in a separate CPU build; reuse the identical shared targets.

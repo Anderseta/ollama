@@ -39,6 +39,9 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
   reusable host slots, CUDA upload scheduling, shared route plans and dynamic
   prompt windows. See `docs/moe-residency-pipeline.md` for activation, memory
   scopes and experimental limitations.
+- `007-dense-runtime.patch` - optional physical KV growth, explicit safe state
+  I/O, gated CUDA dense projections/normalization and exact native template token
+  counts. See `docs/dense-runtime.md` for controls and validation limits.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under

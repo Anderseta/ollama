@@ -1,0 +1,2863 @@
+diff --git a/ggml/include/ggml-cuda-kv-growth.h b/ggml/include/ggml-cuda-kv-growth.h
+new file mode 100644
+index 0000000..ce45e0e
+--- /dev/null
++++ b/ggml/include/ggml-cuda-kv-growth.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include "ggml-backend.h"
++#include <stdint.h>
++
++// Optional CUDA VMM storage. Logical buffer size/address stay fixed; only mapped
++// physical pages consume the existing CUDA allocation quota. Never host-paged.
++struct ggml_backend_cuda_kv_growth_api {
++    uint32_t version;
++    size_t (*granularity)(ggml_backend_buffer_type_t);
++    ggml_backend_buffer_t (*reserve)(ggml_backend_buffer_type_t, size_t);
++    bool (*commit)(ggml_backend_buffer_t, size_t, size_t);
++    size_t (*committed)(ggml_backend_buffer_t);
++    // Zero mapped bytes without allocating missing pages (whose logical value
++    // is already zero). False for conventional storage or nonzero lazy fill.
++    bool (*clear_existing)(ggml_backend_buffer_t, size_t, size_t);
++};
+diff --git a/ggml/src/ggml-cuda/dense-reuse.h b/ggml/src/ggml-cuda/dense-reuse.h
+new file mode 100644
+index 0000000..f94107b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/dense-reuse.h
+@@ -0,0 +1,104 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <unordered_map>
++#include <vector>
++
++// Independent of the MoE runtime. Set before backend initialization for an ablation.
++inline bool ggml_cuda_dense_opt_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_CUDA_DENSE_OPT");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++enum class ggml_cuda_dense_event { quantize, reuse, norm_silu };
++
++inline void ggml_cuda_dense_trace(ggml_cuda_dense_event event, const ggml_tensor * tensor) {
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_CUDA_DENSE_TRACE");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    if (!enabled) { return; }
++    static std::atomic<unsigned> counts[3]{};
++    const auto index = static_cast<unsigned>(event);
++    if (counts[index].load(std::memory_order_relaxed) >= 4) { return; }
++    const auto count = counts[index].fetch_add(1, std::memory_order_relaxed) + 1;
++    if (count <= 4) {
++        static const char * names[] = {"shared-input-quantize", "shared-input-reuse", "norm-gamma-silu"};
++        std::fprintf(stderr, "cuda_dense: %s count=%u tensor=%s shape=[%lld,%lld,%lld,%lld]\n",
++            names[index], count, tensor->name,
++            (long long) tensor->ne[0], (long long) tensor->ne[1],
++            (long long) tensor->ne[2], (long long) tensor->ne[3]);
++    }
++}
++
++struct ggml_cuda_dense_input_plan {
++    const ggml_tensor * input;
++    int first;
++    int last;
++    unsigned consumers;
++};
++
++inline bool ggml_cuda_dense_no_write(const ggml_tensor * node) {
++    return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
++           node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_PERMUTE;
++}
++
++inline bool ggml_cuda_dense_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a->data || !b->data) { return true; }
++    const auto x = reinterpret_cast<uintptr_t>(a->data), y = reinterpret_cast<uintptr_t>(b->data);
++    const size_t nx = ggml_nbytes(a), ny = ggml_nbytes(b);
++    if (x > std::numeric_limits<uintptr_t>::max() - nx ||
++        y > std::numeric_limits<uintptr_t>::max() - ny) { return true; }
++    return x < y + ny && y < x + nx;
++}
++
++// Tensor identity is a value version within this graph, unlike an allocator address.
++// Reject intervening writes, including in-place operations, before sharing a value.
++inline std::vector<ggml_cuda_dense_input_plan> ggml_cuda_dense_plan_inputs(const ggml_cgraph * graph) {
++    std::vector<ggml_cuda_dense_input_plan> plans;
++    std::unordered_map<const ggml_tensor *, size_t> inputs;
++    // These public accessors predate const-correct graph views.
++    auto * view = const_cast<ggml_cgraph *>(graph);
++    for (int i = 0; i < ggml_graph_n_nodes(view); ++i) {
++        const auto * node = ggml_graph_node(view, i);
++        if (node->op == GGML_OP_CUSTOM || node->op == GGML_OP_MAP_CUSTOM1 ||
++            node->op == GGML_OP_MAP_CUSTOM2 || node->op == GGML_OP_MAP_CUSTOM3 ||
++            node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) { return {}; }
++        if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1]) { continue; }
++        const auto * weight = node->src[0];
++        const auto * input = node->src[1];
++        if (weight->type != GGML_TYPE_Q8_0 || input->type != GGML_TYPE_F32 ||
++            weight->ne[0] != input->ne[0] || weight->ne[2] != 1 || weight->ne[3] != 1 ||
++            input->ne[0] <= 0 || input->ne[1] <= 0 || input->ne[1] > 8 ||
++            input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) { continue; }
++        const auto inserted = inputs.emplace(input, plans.size());
++        if (inserted.second) {
++            plans.push_back({input, i, i, 1});
++        } else {
++            auto & plan = plans[inserted.first->second];
++            plan.last = i;
++            ++plan.consumers;
++        }
++    }
++    std::vector<ggml_cuda_dense_input_plan> safe;
++    for (const auto & plan : plans) {
++        if (plan.consumers < 2) { continue; }
++        bool immutable = true;
++        for (int i = plan.first; immutable && i <= plan.last; ++i) {
++            const auto * node = ggml_graph_node(view, i);
++            immutable = ggml_cuda_dense_no_write(node) || !ggml_cuda_dense_overlap(plan.input, node);
++        }
++        if (immutable) { safe.push_back(plan); }
++    }
++    return safe;
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7cef587..37ace6b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1,6 +1,7 @@
+ #include "ggml-cuda.h"
+ #include "ggml-cuda-upload.h"
+ #include "ggml-cuda-host-op.h"
++#include "ggml-cuda-kv-growth.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
+@@ -35,6 +36,7 @@
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/dense-reuse.h"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -978,10 +980,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+ // cuda buffer
+ 
++#include "ggml-cuda/kv-growth.cuh"
++
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
+     std::string name;
++    std::unique_ptr<ggml_cuda_kv_vmm> kv_vmm;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+@@ -989,10 +994,20 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
+-        CUDA_CHECK(ggml_cuda_device_free(dev_ptr, device));
++        if (kv_vmm) { kv_vmm.reset(); }
++        else { CUDA_CHECK(ggml_cuda_device_free(dev_ptr, device)); }
+     }
+ };
+ 
++static void ggml_cuda_kv_ensure(ggml_backend_cuda_buffer_context * ctx, const ggml_tensor * tensor, size_t offset, size_t size) {
++    if (!ctx->kv_vmm) { return; }
++    const uintptr_t base = reinterpret_cast<uintptr_t>(ctx->dev_ptr), ptr = reinterpret_cast<uintptr_t>(tensor->data);
++    if (ptr < base || ptr-base > ctx->kv_vmm->capacity || offset > ctx->kv_vmm->capacity-(ptr-base) ||
++        !ctx->kv_vmm->ensure(ptr-base+offset,size)) {
++        throw std::runtime_error("CUDA KV growth: physical allocation denied or tensor range invalid");
++    }
++}
++
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+     delete ctx;
+@@ -1021,6 +1036,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+ 
+         if (padded_size > original_size) {
++            ggml_cuda_kv_ensure(ctx, tensor, original_size, padded_size-original_size);
+             ggml_cuda_set_device(ctx->device);
+             CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+             CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -1032,6 +1048,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    ggml_cuda_kv_ensure(ctx,tensor,offset,size);
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -1040,6 +1057,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    ggml_cuda_kv_ensure(ctx,tensor,offset,size);
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -1048,6 +1066,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    ggml_cuda_kv_ensure(ctx,tensor,offset,size);
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -1057,6 +1076,10 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    if (ctx->kv_vmm) for (size_t i=0;i<n_copies;++i) {
++        if (stride_tensor && i > (SIZE_MAX-offset)/stride_tensor) { throw std::runtime_error("CUDA KV growth: 2D range overflow"); }
++        ggml_cuda_kv_ensure(ctx,tensor,offset+i*stride_tensor,size);
++    }
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+@@ -1067,6 +1090,10 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
++    if (ctx->kv_vmm) for (size_t i=0;i<n_copies;++i) {
++        if (stride_tensor && i > (SIZE_MAX-offset)/stride_tensor) { throw std::runtime_error("CUDA KV growth: 2D range overflow"); }
++        ggml_cuda_kv_ensure(ctx,tensor,offset+i*stride_tensor,size);
++    }
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+@@ -1077,6 +1104,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+     if (ggml_backend_buffer_is_cuda(src->buffer)) {
+         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
+         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
++        ggml_cuda_kv_ensure(src_ctx,src,0,ggml_nbytes(src));
++        ggml_cuda_kv_ensure(dst_ctx,dst,0,ggml_nbytes(dst));
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+@@ -1101,6 +1130,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
++    if (ctx->kv_vmm) { ctx->kv_vmm->clear(value); return; }
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -1155,6 +1185,67 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+ }
+ 
++static size_t ggml_cuda_kv_granularity(ggml_backend_buffer_type_t buft) {
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (!buft || !ggml_backend_buft_is_cuda(buft)) { return 0; }
++    const int device=static_cast<ggml_backend_cuda_buffer_type_context *>(buft->context)->device;
++    if (!ggml_cuda_info().devices[device].vmm) { return 0; }
++    CUmemAllocationProp prop = {};
++    prop.type=CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type=CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id=ggml_cuda_get_physical_device(device);
++    size_t granularity=0;
++    if (cuMemGetAllocationGranularity(&granularity,&prop,CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) { return 0; }
++    return granularity;
++#else
++    GGML_UNUSED(buft); return 0;
++#endif
++}
++
++static ggml_backend_buffer_t ggml_cuda_kv_reserve(ggml_backend_buffer_type_t buft, size_t size) {
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    const size_t granularity=ggml_cuda_kv_granularity(buft);
++    if (!granularity || !size || size>SIZE_MAX-(granularity-1)) { return nullptr; }
++    const int device=static_cast<ggml_backend_cuda_buffer_type_context *>(buft->context)->device;
++    ggml_cuda_set_device(device);
++    try {
++        auto storage=std::unique_ptr<ggml_cuda_kv_vmm>(new ggml_cuda_kv_vmm(device,GGML_PAD(size,granularity),granularity));
++        CUdeviceptr address=0;
++        if (cuMemAddressReserve(&address,storage->capacity,granularity,0,0) != CUDA_SUCCESS) { return nullptr; }
++        storage->address=address;
++        auto ctx=std::unique_ptr<ggml_backend_cuda_buffer_context>(new ggml_backend_cuda_buffer_context(device,reinterpret_cast<void *>(address)));
++        ctx->kv_vmm=std::move(storage);
++        auto * buffer=ggml_backend_buffer_init(buft,ggml_backend_cuda_buffer_interface,ctx.get(),size);
++        ctx.release();
++        return buffer;
++    } catch (const std::bad_alloc &) { return nullptr; }
++#else
++    GGML_UNUSED(buft); GGML_UNUSED(size); return nullptr;
++#endif
++}
++
++static bool ggml_cuda_kv_commit(ggml_backend_buffer_t buffer,size_t offset,size_t size) {
++    if (!buffer || !ggml_backend_buffer_is_cuda(buffer) || offset>buffer->size || size>buffer->size-offset) { return false; }
++    auto * ctx=static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
++    return !ctx->kv_vmm || ctx->kv_vmm->ensure(offset,size);
++}
++
++static size_t ggml_cuda_kv_committed(ggml_backend_buffer_t buffer) {
++    if (!buffer || !ggml_backend_buffer_is_cuda(buffer)) { return SIZE_MAX; }
++    auto * ctx=static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
++    return ctx->kv_vmm ? ctx->kv_vmm->committed() : buffer->size;
++}
++
++static bool ggml_cuda_kv_clear_existing(ggml_backend_buffer_t buffer,size_t offset,size_t size) {
++    if (!buffer || !ggml_backend_buffer_is_cuda(buffer) || offset>buffer->size || size>buffer->size-offset) { return false; }
++    auto * ctx=static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
++    return ctx->kv_vmm && ctx->kv_vmm->clear_existing(offset,size);
++}
++
++static const ggml_backend_cuda_kv_growth_api ggml_cuda_kv_growth_api = {
++    1,ggml_cuda_kv_granularity,ggml_cuda_kv_reserve,ggml_cuda_kv_commit,ggml_cuda_kv_committed,ggml_cuda_kv_clear_existing
++};
++
+ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+     return 128;
+ 
+@@ -3895,6 +3986,34 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+ }
+ 
+ 
++static bool ggml_cuda_match_norm_silu(const ggml_cgraph * graph, int i) {
++    if (!ggml_cuda_dense_opt_enabled() || i + 3 >= graph->n_nodes ||
++        !ggml_can_fuse_subgraph(graph, i,
++            { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) { return false; }
++    const auto * norm = graph->nodes[i];
++    const auto * gamma = graph->nodes[i + 1];
++    const auto * silu = graph->nodes[i + 2];
++    const auto * output = graph->nodes[i + 3];
++    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
++        (gamma->src[0] != norm && gamma->src[1] != norm) ||
++        !((output->src[0] == gamma && output->src[1] == silu) ||
++          (output->src[1] == gamma && output->src[0] == silu))) { return false; }
++    const auto * input = norm->src[0];
++    const auto * weight = gamma->src[0] == norm ? gamma->src[1] : gamma->src[0];
++    const auto * gate = silu->src[0];
++    if (input->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
++        norm->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
++        silu->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(input, gamma) || !ggml_are_same_shape(input, gate) ||
++        !ggml_are_same_shape(input, output) || !ggml_is_contiguous_rows(input) ||
++        !ggml_is_contiguous(weight) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(output) ||
++        weight->ne[0] != input->ne[0] || weight->ne[1] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) { return false; }
++    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
++        if (input->ne[dim] <= 0 || input->ne[dim] > INT_MAX) { return false; }
++    }
++    return true;
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -3909,6 +4028,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());
+     };
+ 
++    if (is_equal({ GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, ops) &&
++        ggml_cuda_match_norm_silu(cgraph, node_idx)) {
++        const int output = node_idx + 3;
++        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 4, &output, 1);
++    }
++
+     std::initializer_list<enum ggml_op> mul_mat_bias_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_ADD,    GGML_OP_MUL_MAT,    GGML_OP_ADD,    GGML_OP_GLU };
+     std::initializer_list<enum ggml_op> mul_mat_id_bias_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
+ 
+@@ -4182,6 +4307,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++static std::atomic<uint64_t> ggml_cuda_norm_silu_fusions{0};
++
++// Private test hook: counts host submissions/captures, not graph replays.
++static uint64_t ggml_backend_cuda_test_norm_silu_fusions() {
++    return ggml_cuda_norm_silu_fusions.load(std::memory_order_relaxed);
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -4920,6 +5052,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
++        ggml_cuda_op_rms_norm_silu_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
++        ggml_cuda_norm_silu_fusions.fetch_add(1, std::memory_order_relaxed);
++        ggml_cuda_dense_trace(ggml_cuda_dense_event::norm_silu, node);
++        return 3;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+@@ -5085,6 +5224,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            ggml_cuda_mmvq_reuse_scope quantized_inputs(*cuda_ctx, cgraph, should_launch_concurrent_events);
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+ #ifdef USE_CUDA_GRAPH
+@@ -5139,6 +5280,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    quantized_inputs.advance(i + nodes_to_skip);
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -5172,6 +5314,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+                 GGML_ASSERT(ok);
+ 
++                quantized_inputs.advance(i);
++
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+@@ -5461,6 +5605,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
+         // TODO: consolidate fusion paths in graph_optimize and graph_compute
+         ggml_cuda_set_device(cuda_ctx->device);
++        for (int i = 0; i + 3 < cgraph->n_nodes; ++i) {
++            if (ggml_cuda_match_norm_silu(cgraph, i)) {
++                add_alloc_deps(i, i + 3);
++                i += 3;
++            }
++        }
+         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
+             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+                 continue;
+@@ -6777,6 +6927,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_cuda_test_norm_silu_fusions") == 0) {
++        return (void *) ggml_backend_cuda_test_norm_silu_fusions;
++    }
+     GGML_UNUSED(reg);
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     if (strcmp(name, "ggml_backend_cuda_host_op_api") == 0) {
+@@ -6786,6 +6939,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+         return const_cast<ggml_backend_cuda_upload_api *>(&ggml_cuda_upload_api);
+     }
+ #endif
++    if (strcmp(name, "ggml_backend_cuda_kv_growth_api") == 0) {
++        return const_cast<ggml_backend_cuda_kv_growth_api *>(&ggml_cuda_kv_growth_api);
++    }
+     if (strcmp(name, "ggml_backend_cuda_set_memory_limit") == 0) {
+         return (void *)ggml_backend_cuda_set_memory_limit;
+     }
+diff --git a/ggml/src/ggml-cuda/kv-growth.cuh b/ggml/src/ggml-cuda/kv-growth.cuh
+new file mode 100644
+index 0000000..ab3cceb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/kv-growth.cuh
+@@ -0,0 +1,105 @@
++#pragma once
++
++// Included after the shared CUDA allocation policy, before device buffers.
++struct ggml_cuda_kv_vmm {
++    int device;
++    size_t capacity, granularity;
++    uintptr_t address = 0;
++    struct mapping { size_t offset, size; bool tracked; };
++    std::vector<mapping> mappings;
++    std::vector<uint8_t> pages;
++    std::mutex mutex;
++    uint8_t fill = 0;
++
++    ggml_cuda_kv_vmm(int device, size_t capacity, size_t granularity) :
++        device(device), capacity(capacity), granularity(granularity), pages(capacity/granularity, 0) {}
++
++    ~ggml_cuda_kv_vmm() {
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (!address) { return; }
++        ggml_cuda_set_device(device);
++        size_t tracked = 0, untracked = 0;
++        for (const auto & m : mappings) {
++            CU_CHECK(cuMemUnmap(address+m.offset, m.size));
++            if (m.tracked) { tracked += m.size; } else { ++untracked; }
++        }
++        CU_CHECK(cuMemAddressFree(address, capacity));
++        ggml_cuda_memory_release_vmm(ggml_cuda_get_physical_device(device), tracked, untracked);
++#endif
++    }
++
++    bool ensure(size_t offset, size_t size) {
++        if (offset > capacity || size > capacity-offset) { return false; }
++        if (!size) { return true; }
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        std::lock_guard<std::mutex> lock(mutex);
++        const size_t first = offset/granularity, end = (offset+size+granularity-1)/granularity;
++        size_t runs = 0;
++        for (size_t i=first; i<end;) {
++            if (pages[i]) { ++i; continue; }
++            ++runs; while (i<end && !pages[i]) { ++i; }
++        }
++        try { mappings.reserve(mappings.size()+runs); } catch (...) { return false; }
++        ggml_cuda_set_device(device);
++        for (size_t i=first; i<end;) {
++            if (pages[i]) { ++i; continue; }
++            const size_t start = i;
++            while (i<end && !pages[i]) { ++i; }
++            const size_t bytes = (i-start)*granularity;
++            ggml_cuda_memory_reservation reservation(device, bytes);
++            if (!reservation.valid) { return false; }
++            CUmemAllocationProp prop = {};
++            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++            prop.location.id = ggml_cuda_get_physical_device(device);
++            CUmemGenericAllocationHandle handle = 0;
++            if (cuMemCreate(&handle, bytes, &prop, 0) != CUDA_SUCCESS) { return false; }
++            const CUdeviceptr ptr = address+start*granularity;
++            if (cuMemMap(ptr, bytes, 0, handle, 0) != CUDA_SUCCESS) { cuMemRelease(handle); return false; }
++            CUmemAccessDesc access = {};
++            access.location = prop.location; access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++            if (cuMemSetAccess(ptr, bytes, &access, 1) != CUDA_SUCCESS) {
++                cuMemUnmap(ptr,bytes); cuMemRelease(handle); return false;
++            }
++            const cudaError_t zero = cudaMemsetAsync(reinterpret_cast<void *>(ptr), fill, bytes, cudaStreamPerThread);
++            const cudaError_t synced = cudaStreamSynchronize(cudaStreamPerThread);
++            if (zero != cudaSuccess || synced != cudaSuccess) {
++                cuMemUnmap(ptr,bytes); cuMemRelease(handle); (void)cudaGetLastError(); return false;
++            }
++            CU_CHECK(cuMemRelease(handle)); // the mapping retains the physical allocation
++            reservation.commit();
++            mappings.push_back({start*granularity,bytes,reservation.tracked});
++            std::fill(pages.begin()+start,pages.begin()+i,uint8_t(1));
++        }
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    void clear(uint8_t value) {
++        std::lock_guard<std::mutex> lock(mutex);
++        fill = value;
++        ggml_cuda_set_device(device);
++        for (const auto & m : mappings) {
++            CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(address+m.offset), value, m.size, cudaStreamPerThread));
++        }
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    }
++    bool clear_existing(size_t offset,size_t size) {
++        if (offset>capacity || size>capacity-offset) { return false; }
++        std::lock_guard<std::mutex> lock(mutex);
++        if (fill!=0) { return false; }
++        ggml_cuda_set_device(device);
++        for (const auto & m : mappings) {
++            const size_t start=std::max(offset,m.offset), end=std::min(offset+size,m.offset+m.size);
++            if (start<end) { CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(address+start),0,end-start,cudaStreamPerThread)); }
++        }
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        return true;
++    }
++    size_t committed() {
++        std::lock_guard<std::mutex> lock(mutex);
++        size_t bytes=0; for (const auto & m : mappings) { bytes+=m.size; } return bytes;
++    }
++};
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 9c2ba05..b74b959 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2,10 +2,87 @@
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
++#include "dense-reuse.h"
+ 
+ #include <cstdint>
+ #include <type_traits>
+ 
++struct ggml_cuda_mmvq_reuse_scope::state {
++    struct input { char * quantized = nullptr; int last; };
++    struct allocation {
++        const ggml_tensor * input;
++        int last;
++        size_t bytes;
++        std::unique_ptr<ggml_cuda_pool_alloc<char>> storage;
++    };
++    ggml_backend_cuda_context * context;
++    state * previous;
++    std::unordered_map<const ggml_tensor *, input> inputs;
++    std::vector<allocation> allocations;
++    size_t bytes = 0;
++};
++
++// This points to an execution scope, not a persistent pointer/value cache. A nested
++// backend evaluation restores its caller, and each new capture starts empty.
++static thread_local ggml_cuda_mmvq_reuse_scope::state * mmvq_reuse_active = nullptr;
++
++ggml_cuda_mmvq_reuse_scope::ggml_cuda_mmvq_reuse_scope(
++        ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, bool concurrent) : data(nullptr) {
++    if (!ggml_cuda_dense_opt_enabled() || concurrent || ctx.curr_stream_no != 0) { return; }
++    const auto plans = ggml_cuda_dense_plan_inputs(graph);
++    if (plans.empty()) { return; }
++    auto scope = std::make_unique<state>();
++    scope->context = &ctx;
++    scope->previous = mmvq_reuse_active;
++    for (const auto & plan : plans) { scope->inputs.emplace(plan.input, state::input{nullptr, plan.last}); }
++    data = scope.release();
++    mmvq_reuse_active = data;
++}
++
++ggml_cuda_mmvq_reuse_scope::~ggml_cuda_mmvq_reuse_scope() {
++    if (!data) { return; }
++    GGML_ASSERT(mmvq_reuse_active == data);
++    mmvq_reuse_active = data->previous;
++    // ggml_cuda_pool_vmm requires exact reverse allocation order. Temporary
++    // allocations made inside individual operations have already been returned.
++    for (auto it = data->allocations.rbegin(); it != data->allocations.rend(); ++it) { it->storage.reset(); }
++    delete data;
++}
++
++void ggml_cuda_mmvq_reuse_scope::advance(int last_node) {
++    if (!data) { return; }
++    // Return completed intervals as soon as LIFO permits. The final consumer's
++    // kernels precede any reuse on this same stream, including graph capture.
++    while (!data->allocations.empty() && data->allocations.back().last <= last_node) {
++        const auto & allocation = data->allocations.back();
++        data->bytes -= allocation.bytes;
++        data->inputs.at(allocation.input).quantized = nullptr;
++        data->allocations.pop_back();
++    }
++}
++
++static char * mmvq_reuse_input(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
++                               size_t bytes, bool & fresh) {
++    auto * scope = mmvq_reuse_active;
++    if (!scope || scope->context != &ctx || ctx.curr_stream_no != 0) { return nullptr; }
++    const auto found = scope->inputs.find(input);
++    if (found == scope->inputs.end()) { return nullptr; }
++    if (found->second.quantized) {
++        fresh = false;
++        ggml_cuda_dense_trace(ggml_cuda_dense_event::reuse, input);
++        return found->second.quantized;
++    }
++    constexpr size_t budget = 4 * 1024 * 1024;
++    if (bytes > budget - scope->bytes) { return nullptr; }
++    auto allocation = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), bytes);
++    char * result = allocation->get();
++    scope->allocations.push_back({input, found->second.last, bytes, std::move(allocation)});
++    scope->bytes += bytes;
++    found->second.quantized = result;
++    ggml_cuda_dense_trace(ggml_cuda_dense_event::quantize, input);
++    return result;
++}
++
+ // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+ // has little exposed latency left to hide and the extra requests cost more than they save.
+ // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+@@ -1564,12 +1641,17 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t quantized_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++    bool quantize = true;
++    char * quantized = !ids && src0->type == GGML_TYPE_Q8_0 ?
++        mmvq_reuse_input(ctx, src1, quantized_bytes, quantize) : nullptr;
++    if (!quantized) { quantized = src1_q8_1.alloc(quantized_bytes); }
++    if (quantize) {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, quantized, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1595,7 +1677,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, quantized, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 5605bf7..4e41bda 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -11,6 +11,18 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
++// Scope shared quantized activations to one direct evaluation/capture. Never a replay.
++// The implementation retains workspaces in allocation order and releases them LIFO.
++struct ggml_cuda_mmvq_reuse_scope {
++    struct state;
++    state * data;
++    ggml_cuda_mmvq_reuse_scope(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, bool concurrent);
++    ~ggml_cuda_mmvq_reuse_scope();
++    void advance(int last_node);
++    ggml_cuda_mmvq_reuse_scope(const ggml_cuda_mmvq_reuse_scope &) = delete;
++    ggml_cuda_mmvq_reuse_scope & operator=(const ggml_cuda_mmvq_reuse_scope &) = delete;
++};
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 3f0ea6f..47b0b72 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -81,7 +82,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
+-template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false>
++template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_silu = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+@@ -107,7 +108,8 @@ static __global__ void rms_norm_f32(const float * x,
+                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+-                                    const float   scale_out            = 1.0f) {
++                                    const float   scale_out            = 1.0f,
++                                    const float * gate                 = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int nrows = gridDim.x;
+     const int row   = blockIdx.x;
+@@ -125,6 +127,7 @@ static __global__ void rms_norm_f32(const float * x,
+         for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+             const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+             float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
++            const float * gatec = do_silu ? gate + ((sample*nchannels + channel)*nrows + row)*ncols : nullptr;
+ 
+             [[maybe_unused]] const float * mulc = nullptr;
+             if constexpr (do_multiply) {
+@@ -188,6 +191,13 @@ static __global__ void rms_norm_f32(const float * x,
+                             r.z *= scale_out;
+                             r.w *= scale_out;
+                         }
++                        if constexpr (do_silu) {
++                            const float4 z = reinterpret_cast<const float4 *>(gatec)[i];
++                            r.x *= ggml_cuda_op_silu_single(z.x);
++                            r.y *= ggml_cuda_op_silu_single(z.y);
++                            r.z *= ggml_cuda_op_silu_single(z.z);
++                            r.w *= ggml_cuda_op_silu_single(z.w);
++                        }
+                         dst4[i] = r;
+                     }
+                 }
+@@ -206,7 +216,11 @@ static __global__ void rms_norm_f32(const float * x,
+                 const float scale = rsqrtf(mean + eps);
+ 
+                 for (int col = tid; col < ncols; col += block_size) {
+-                    if constexpr (do_multiply && do_add) {
++                    if constexpr (do_silu) {
++                        const int mul_col = fastmodulo(col, mul_ncols_packed);
++                        const float normalized = scale * xc[col] * mulc[mul_col];
++                        dstc[col] = normalized * ggml_cuda_op_silu_single(gatec[col]);
++                    } else if constexpr (do_multiply && do_add) {
+                         const int mul_col = fastmodulo(col, mul_ncols_packed);
+                         const int add_col = fastmodulo(col, add_ncols_packed);
+                         dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
+@@ -387,15 +401,15 @@ static void group_norm_f32_cuda(
+     do { \
+         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+-        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale>, launch_params, \
++        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, do_silu>, launch_params, \
+             x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
+             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+             add, add_stride_row, add_stride_channel, add_stride_sample, \
+-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
++            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, gate); \
+     } while (0)
+ 
+-template <bool do_multiply, bool do_add, bool do_scale>
++template <bool do_multiply, bool do_add, bool do_scale, bool do_silu = false>
+ static void rms_norm_f32_dispatch(
+         const dim3     blocks_num,
+         const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
+@@ -404,7 +418,7 @@ static void rms_norm_f32_dispatch(
+         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
+-        cudaStream_t   stream, const float scale_out = 1.0f) {
++        cudaStream_t   stream, const float scale_out = 1.0f, const float * gate = nullptr) {
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+ 
+@@ -423,6 +437,7 @@ static void rms_norm_f32_dispatch(
+         vec = vec && add_ncols_packed.z == (uint32_t) ncols
+             && ggml_cuda_is_aligned(add_t, 16);
+     }
++    if constexpr (do_silu) { vec = vec && ((uintptr_t) gate & 15) == 0; }
+ 
+     const int n4 = ncols / 4;
+     if (vec) {
+@@ -774,6 +789,26 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                           eps, stream);
+ }
+ 
++void ggml_cuda_op_rms_norm_silu_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
++                                      ggml_tensor * gamma, ggml_tensor * silu, ggml_tensor * output) {
++    const auto * input = norm->src[0];
++    const auto * weight = gamma->src[0] == norm ? gamma->src[1] : gamma->src[0];
++    const auto * gate = silu->src[0];
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(eps));
++    const auto one = init_fastdiv_values(1);
++    const auto zero = make_uint3(0, 0, 0);
++    const dim3 blocks(input->ne[1], MIN(input->ne[2], UINT16_MAX), MIN(input->ne[3], UINT16_MAX));
++    // Reuse the original RMSNorm dispatch and reduction order; the two final
++    // multiplies retain the original F32 ordering and SiLU implementation.
++    rms_norm_f32_dispatch<true, false, false, true>(
++        blocks, input, (float *) output->data, input->ne[0], input->ne[2], input->ne[3],
++        input->nb[1]/sizeof(float), input->nb[2]/sizeof(float), input->nb[3]/sizeof(float), eps,
++        weight, weight->nb[1]/sizeof(float), weight->nb[2]/sizeof(float), weight->nb[3]/sizeof(float),
++        init_fastdiv_values(weight->ne[0]), one, one, one,
++        nullptr, 0, 0, 0, zero, zero, zero, zero, ctx.stream(), 1.0f, (const float *) gate->data);
++}
++
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * grad  = dst->src[0]; // gradients
+     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 95618df..21160d4 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -8,6 +8,9 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
+ 
++void ggml_cuda_op_rms_norm_silu_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
++                                      ggml_tensor * gamma, ggml_tensor * silu, ggml_tensor * output);
++
+ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
+ 
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d9b93c8..0fedcfd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3227,16 +3227,30 @@ private:
+     size_t size_written = 0;
+ };
+ 
+-class llama_io_write_host : public llama_io_write_i {
++// Buffer I/O batches tensor transfers, but destruction must never apply them:
++// parsing may already have failed and cleared the destination memory. Commit
++// explicitly while the caller's error handling is still active.
++class llama_io_write_buffer_i : public llama_io_write_i {
++public:
++    virtual void commit() = 0;
++};
++
++class llama_io_read_buffer_i : public llama_io_read_i {
++public:
++    virtual void commit() = 0;
++};
++
++class llama_io_write_host : public llama_io_write_buffer_i {
+ public:
+     llama_io_write_host(
+             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+ 
+-    ~llama_io_write_host() {
++    void commit() override {
+         // TODO: add backend support to batch tensor_get? or some other way to speed this up
+         for (const auto & winfo : winfos) {
+             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+         }
++        winfos.clear();
+     }
+ 
+     void write(const void * src, size_t size) override {
+@@ -3254,7 +3268,7 @@ public:
+             throw std::runtime_error("unexpectedly reached end of buffer");
+         }
+ 
+-        // save the write for later during destruction
++        // save the write for explicit commit after serialization succeeds
+         winfos.push_back({tensor, ptr, size, offset});
+ 
+         ptr += size;
+@@ -3280,15 +3294,16 @@ private:
+     std::vector<write_info> winfos;
+ };
+ 
+-class llama_io_read_host : public llama_io_read_i {
++class llama_io_read_host : public llama_io_read_buffer_i {
+ public:
+     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+ 
+-    ~llama_io_read_host() {
++    void commit() override {
+         // flush the reads
+         for (const auto & rinfo : rinfos) {
+             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+         }
++        rinfos.clear();
+     }
+ 
+     void read(void * dst, size_t size) override {
+@@ -3306,7 +3321,7 @@ public:
+             throw std::runtime_error("unexpectedly reached end of buffer");
+         }
+ 
+-        // save for later during destruction
++        // apply only after the entire snapshot has been validated
+         rinfos.push_back({tensor, ptr, size, offset});
+ 
+         ptr += size;
+@@ -3386,12 +3401,12 @@ private:
+     std::vector<uint8_t> temp_buffer;
+ };
+ 
+-class llama_io_write_device : public llama_io_write_i {
++class llama_io_write_device : public llama_io_write_buffer_i {
+ public:
+     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
+     }
+ 
+-    ~llama_io_write_device() {
++    void commit() override {
+         llama_memory_buffers mbufs_new;
+ 
+         for (const auto & winfo : winfos) {
+@@ -3409,6 +3424,9 @@ public:
+             };
+ 
+             mbuf.ctx.reset(ggml_init(params));
++            if (!mbuf.ctx) {
++                throw std::runtime_error("cannot allocate device state metadata");
++            }
+ 
+             mbuf.org.reserve(mbuf.n_tensors);
+             mbuf.cpy.reserve(mbuf.n_tensors);
+@@ -3456,6 +3474,9 @@ public:
+                     mbuf_cur = std::move(mbuf);
+ 
+                     mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
++                    if (!mbuf_cur.buf) {
++                        throw std::runtime_error("cannot allocate device state buffer");
++                    }
+ 
+                     LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+                 } else {
+@@ -3469,8 +3490,10 @@ public:
+                     ggml_tallocr talloc = ggml_tallocr_new(buf.get());
+ 
+                     for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+-                        ggml_backend_view_init(mbuf_cur.org[i]);
+-                        ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]);
++                        if (ggml_backend_view_init(mbuf_cur.org[i]) != GGML_STATUS_SUCCESS ||
++                            ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]) != GGML_STATUS_SUCCESS) {
++                            throw std::runtime_error("cannot initialize device state tensors");
++                        }
+                     }
+ 
+                     mbuf_cur.buf = std::move(buf);
+@@ -3481,6 +3504,7 @@ public:
+                 ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+             }
+         }
++        winfos.clear();
+     }
+ 
+     void write(const void * src, size_t size) override {
+@@ -3494,7 +3518,7 @@ public:
+     }
+ 
+     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+-        // save the write for later during destruction
++        // save the write for explicit commit after serialization succeeds
+         winfos.push_back({tensor, ptr, size, offset});
+     }
+ 
+@@ -3518,12 +3542,15 @@ private:
+     llama_memory_buffers & mbufs;
+ };
+ 
+-class llama_io_read_device : public llama_io_read_i {
++class llama_io_read_device : public llama_io_read_buffer_i {
+ public:
+     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
+     }
+ 
+-    ~llama_io_read_device() {
++    void commit() override {
++        if (buf_size != 0) {
++            throw std::runtime_error("device state metadata size mismatch");
++        }
+         llama_memory_buffers mbufs_new;
+ 
+         for (const auto & rinfo : rinfos) {
+@@ -3541,6 +3568,9 @@ public:
+             };
+ 
+             mbuf.ctx.reset(ggml_init(params));
++            if (!mbuf.ctx) {
++                throw std::runtime_error("cannot allocate device restore metadata");
++            }
+ 
+             mbuf.org.reserve(mbuf.n_tensors);
+         }
+@@ -3554,16 +3584,22 @@ public:
+ 
+             mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+ 
+-            ggml_backend_view_init(mbuf.org.back());
++            if (ggml_backend_view_init(mbuf.org.back()) != GGML_STATUS_SUCCESS) {
++                throw std::runtime_error("cannot initialize device restore tensor");
++            }
++        }
++
++        // Validate every source buffer before modifying any destination group.
++        for (const auto & [buft, mbuf] : mbufs_new) {
++            const auto found = mbufs.find(buft);
++            if (found == mbufs.end() || !found->second.buf || found->second.total_size != mbuf.total_size) {
++                throw std::runtime_error("device state memory buffer mismatch");
++            }
+         }
+ 
+         for (auto & [buft, mbuf] : mbufs_new) {
+             const auto & mbuf_cur = mbufs.at(buft);
+ 
+-            if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
+-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+-            }
+-
+             if (mbuf_cur.n_tensors == mbuf.n_tensors) {
+                 // an equal tensor count does not imply the same chunking, e.g. save ranges [2,1] vs restore runs [1,2]
+                 bool same_chunking = true;
+@@ -3594,7 +3630,10 @@ public:
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+-            ggml_context * ctx_scratch = ggml_init(params_scratch);
++            ggml_context_ptr ctx_scratch(ggml_init(params_scratch));
++            if (!ctx_scratch) {
++                throw std::runtime_error("cannot allocate device state copy metadata");
++            }
+ 
+             size_t src_pos  = 0;
+             size_t dst_pos  = 0;
+@@ -3618,9 +3657,9 @@ public:
+                 const size_t   el   = ggml_element_size(src_t);
+                 const int64_t n_el = (int64_t) (n_copy / el);
+ 
+-                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
++                auto * src_v = ggml_view_1d(ctx_scratch.get(), src_t, n_el, src_off);
+                 ggml_backend_view_init(src_v);
+-                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
++                auto * dst_v = ggml_view_1d(ctx_scratch.get(), dst_t, n_el, dst_off);
+                 ggml_backend_view_init(dst_v);
+ 
+                 ggml_backend_tensor_copy(src_v, dst_v);
+@@ -3647,10 +3686,9 @@ public:
+                 GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
+             }
+ 
+-            ggml_free(ctx_scratch);
+         }
+ 
+-        GGML_ASSERT(buf_size == 0);
++        rinfos.clear();
+     }
+ 
+     void read(void * dst, size_t size) override {
+@@ -3664,7 +3702,7 @@ public:
+     }
+ 
+     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+-        // save for later during destruction
++        // apply only after the entire snapshot has been validated
+         rinfos.push_back({tensor, ptr, size, offset});
+     }
+ 
+@@ -3706,7 +3744,9 @@ size_t llama_context::state_get_size() {
+ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+     llama_io_write_host io(dst, size);
+     try {
+-        return state_write_data(io);
++        const size_t written = state_write_data(io);
++        io.commit();
++        return written;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+         return 0;
+@@ -3715,11 +3755,16 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+ 
+ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+     llama_io_read_host io(src, size);
++    bool committing = false;
+     try {
+-        return state_read_data(io);
++        const size_t read = state_read_data(io);
++        committing = true;
++        io.commit();
++        return read;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+         io.discard();
++        if (committing && memory) { memory->clear(true); }
+         return 0;
+     }
+ }
+@@ -3740,47 +3785,57 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+ }
+ 
+ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+-    std::unique_ptr<llama_io_write_i> io;
++    std::unique_ptr<llama_io_write_buffer_i> io;
+     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+     } else {
+         io = std::make_unique<llama_io_write_host>(dst, size);
+     }
+ 
++    bool committing = false;
+     try {
+         io->write(&io_magic, sizeof(io_magic));
+         io->write(&seq_id, sizeof(seq_id));
+ 
+-        return state_seq_write_data(*io, seq_id, flags);
++        const size_t written = state_seq_write_data(*io, seq_id, flags);
++        committing = true;
++        io->commit();
++        return written;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
++        // A failed device transfer can leave the replacement snapshot partial.
++        // Do not expose it to a later restore as a valid saved state.
++        if (committing && (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) { mem_storage.erase(seq_id); }
+         return 0;
+     }
+ }
+ 
+ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+-    std::unique_ptr<llama_io_read_i> io;
+-    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+-        // create a temporary io to read the magic and the src seq_id
+-        io = std::make_unique<llama_io_read_host>(src, size);
+-
+-        uint32_t magic_read;
+-        io->read(&magic_read, sizeof(magic_read));
+-        if (io_magic != magic_read) {
+-            throw std::runtime_error("wrong sequence state magic");
+-        }
++    std::unique_ptr<llama_io_read_buffer_i> io;
++    bool committing = false;
++    try {
++        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
++            // Validate the source header before selecting its device snapshot.
++            io = std::make_unique<llama_io_read_host>(src, size);
++
++            uint32_t magic_read;
++            io->read(&magic_read, sizeof(magic_read));
++            if (io_magic != magic_read) {
++                throw std::runtime_error("wrong sequence state magic");
++            }
+ 
+-        llama_seq_id seq_id_read;
+-        io->read(&seq_id_read, sizeof(seq_id_read));
++            llama_seq_id seq_id_read;
++            io->read(&seq_id_read, sizeof(seq_id_read));
+ 
+-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
++            if (mem_storage.find(seq_id_read) == mem_storage.end()) {
++                throw std::runtime_error("device sequence state is no longer available");
++            }
+ 
+-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+-    } else {
+-        io = std::make_unique<llama_io_read_host>(src, size);
+-    }
++            io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
++        } else {
++            io = std::make_unique<llama_io_read_host>(src, size);
++        }
+ 
+-    try {
+         uint32_t magic_read;
+         io->read(&magic_read, sizeof(magic_read));
+         if (io_magic != magic_read) {
+@@ -3790,10 +3845,14 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+         llama_seq_id seq_id_read;
+         io->read(&seq_id_read, sizeof(seq_id_read));
+ 
+-        return state_seq_read_data(*io, seq_id, flags);
++        const size_t read = state_seq_read_data(*io, seq_id, flags);
++        committing = true;
++        io->commit();
++        return read;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+-        io->discard();
++        if (io) { io->discard(); }
++        if (committing && memory) { memory->seq_rm(seq_id, -1, -1); }
+         return 0;
+     }
+ }
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 6f0e3f7..0d600ad 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-io.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
++#include "llama-kv-growth.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -99,6 +100,13 @@ llama_kv_cache::llama_kv_cache(
+ 
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
++    growth_initial_tokens=llama_kv_growth_initial();
++    if (growth_initial_tokens && (v_trans || n_stream!=1 || n_seq_max!=1 || n_swa || other)) {
++        LLAMA_LOG_WARN("KV growth: this cache layout uses conventional fully allocated storage\n");
++        growth_initial_tokens=0;
++    }
++    growth_initial_tokens=std::min(growth_initial_tokens,kv_size);
++
+     const uint32_t n_layer = hparams.n_layer_all;
+ 
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+@@ -282,17 +290,33 @@ llama_kv_cache::llama_kv_cache(
+                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+             }
+         } else {
+-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
++            const auto * growth=growth_initial_tokens ? llama_kv_growth_api(buft) : nullptr;
++            if (growth && llama_kv_growth_estimate(ctx.get(),buft,growth,growth_initial_tokens)>=
++                    ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(),buft)) {
++                // VMM granularity/padding can outweigh savings for tiny caches.
++                // Prefer conventional storage instead of increasing VRAM use.
++                growth=nullptr;
++            }
++            buf = growth ? llama_kv_growth_alloc(ctx.get(),buft,growth,growth_initial_tokens) :
++                           ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+         }
+         if (!buf) {
+             throw std::runtime_error("failed to allocate buffer for kv cache");
+         }
+ 
+-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
++        const auto * growth=growth_initial_tokens && !hparams.no_alloc ? llama_kv_growth_api(buft) : nullptr;
++        const size_t physical=growth ? growth->committed(buf) : ggml_backend_buffer_get_size(buf);
++        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), physical/1048576.0);
++        if (growth && physical<ggml_backend_buffer_get_size(buf)) {
++            LLAMA_LOG_INFO("KV growth: %u initial cells, %u logical cells, %.2f MiB virtual capacity\n",growth_initial_tokens,kv_size,ggml_backend_buffer_get_size(buf)/1048576.0);
++        } else if (growth_initial_tokens && !hparams.no_alloc) {
++            LLAMA_LOG_INFO("KV growth: conventional storage retained when sparse pages would not save physical memory\n");
++        }
+ 
+         ggml_backend_buffer_clear(buf, 0);
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+     }
++    growth_committed_tokens=growth_initial_tokens;
+ 
+     {
+         const size_t memory_size_k = size_k_bytes();
+@@ -711,10 +735,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+ 
+         if (hparams.no_alloc) {
+             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
++            const auto * growth=growth_initial_tokens ? llama_kv_growth_api(buft) : nullptr;
++            ret[buft] += growth ? std::min(llama_kv_growth_estimate(ctx.get(),buft,growth,growth_initial_tokens),
++                                         ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(),buft)) :
++                                 ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+         } else {
+             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
+-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
++            const auto * growth=growth_initial_tokens ? llama_kv_growth_api(buft) : nullptr;
++            ret[buft] += growth ? growth->committed(buf.get()) : ggml_backend_buffer_get_size(buf.get());
+         }
+     }
+ 
+@@ -1117,6 +1145,37 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+     return res;
+ }
+ 
++bool llama_kv_cache::grow_to(uint32_t tokens) {
++    if (!growth_initial_tokens || tokens<=growth_committed_tokens) { return true; }
++    tokens=std::min(tokens,get_size());
++    for (auto & entry : ctxs_bufs) {
++        auto & ctx=entry.first; auto & buf=entry.second;
++        const auto * api=llama_kv_growth_api(ggml_backend_buffer_get_type(buf.get()));
++        if (!api) { continue; }
++        auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf.get()));
++        for (auto * tensor=ggml_get_first_tensor(ctx.get());tensor;tensor=ggml_get_next_tensor(ctx.get(),tensor)) {
++            if (tensor->view_src) { continue; }
++            if (!api->commit(buf.get(),static_cast<uint8_t *>(tensor->data)-base,tensor->nb[1]*tokens)) {
++                LLAMA_LOG_ERROR("KV growth: cannot commit %u cells within available CUDA memory/quota; logical context remains %u\n",tokens,get_size());
++                return false;
++            }
++        }
++    }
++    growth_committed_tokens=tokens;
++    return true;
++}
++
++bool llama_kv_cache::grow_for(const slot_info & sinfo) {
++    if (!growth_initial_tokens) { return true; }
++    uint32_t needed=growth_initial_tokens;
++    for (const auto & cells : v_cells) { needed=std::max(needed,cells.used_max_p1()); }
++    for (const auto & indices : sinfo.idxs) {
++        for (const uint32_t index : indices) { needed=std::max(needed,index+1); }
++    }
++    const uint32_t padding=std::max(n_pad,256u);
++    return grow_to(std::min(get_size(),uint32_t(GGML_PAD(needed,padding))));
++}
++
+ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+@@ -1547,11 +1606,13 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+ 
+     int32_t * data = (int32_t *) dst->data;
+ 
++    const uint32_t count=uint32_t(dst->ne[0]/n_stream);
++    GGML_ASSERT(dst->ne[0]%n_stream==0 && count<=get_size());
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         const auto & cells = v_cells[s];
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
+-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
++        for (uint32_t i = 0; i < count; ++i) {
++            data[s*count + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+         }
+     }
+ }
+@@ -2030,7 +2091,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
+ 
+     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
+ 
+-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
++    const uint32_t shift_size=growth_initial_tokens ? growth_committed_tokens : get_size();
++    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) shift_size*n_stream);
+     ggml_set_input(inp->k_shift);
+ 
+     inp->k_rot = build_input_k_rot(ctx);
+@@ -2058,7 +2120,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
+ 
+         ggml_tensor * k =
+             ggml_view_3d(ctx, layer.k,
+-                n_rot, n_head_kv, get_size()*n_stream,
++                n_rot, n_head_kv, shift_size*n_stream,
+                 ggml_row_size(layer.k->type, n_embd_head_k),
+                 ggml_row_size(layer.k->type, n_embd_k_gqa),
+                 ggml_row_size(layer.k->type, n_embd_nope));
+@@ -2207,6 +2269,9 @@ const slot_info_vec_t *   sinfos_in) {
+         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+ 
+         try {
++            // Deferred readers must not first allocate physical memory in their
++            // destructor. Commit the full destination prefix before queuing I/O.
++            res = res && grow_for(sinfo);
+             res = res && state_read_data(io, strm, cell_count, sinfo);
+         } catch (...) {
+             res = false;
+@@ -2763,10 +2828,10 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+ 
+         if (is_contiguous) {
+-            llama_clear_tensor_data(k, sinfo.head() * k_size_row, cell_count * k_size_row);
++            llama_kv_growth_clear(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+         } else {
+             for (uint32_t i = 0; i < cell_count; ++i) {
+-                llama_clear_tensor_data(k, sinfo.idxs[0][i] * k_size_row, k_size_row);
++                llama_kv_growth_clear(k, sinfo.idxs[0][i] * k_size_row, k_size_row);
+             }
+         }
+     }
+@@ -2785,10 +2850,10 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+ 
+             if (is_contiguous) {
+-                llama_clear_tensor_data(v, sinfo.head() * v_size_row, cell_count * v_size_row);
++                llama_kv_growth_clear(v, sinfo.head() * v_size_row, cell_count * v_size_row);
+             } else {
+                 for (uint32_t i = 0; i < cell_count; ++i) {
+-                    llama_clear_tensor_data(v, sinfo.idxs[0][i] * v_size_row, v_size_row);
++                    llama_kv_growth_clear(v, sinfo.idxs[0][i] * v_size_row, v_size_row);
+                 }
+             }
+         } else {
+@@ -2798,12 +2863,12 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+                 const uint32_t h = sinfo.head();
+ 
+                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+-                    llama_clear_tensor_data(v, (h + j * cells.size()) * v_size_el, cell_count * v_size_el);
++                    llama_kv_growth_clear(v, (h + j * cells.size()) * v_size_el, cell_count * v_size_el);
+                 }
+             } else {
+                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                     for (uint32_t i = 0; i < cell_count; ++i) {
+-                        llama_clear_tensor_data(v, (sinfo.idxs[0][i] + j * cells.size()) * v_size_el, v_size_el);
++                        llama_kv_growth_clear(v, (sinfo.idxs[0][i] + j * cells.size()) * v_size_el, v_size_el);
+                     }
+                 }
+             }
+@@ -2872,6 +2937,9 @@ bool llama_kv_cache_context::apply() {
+         return true;
+     }
+ 
++    // Commit before changing cells or submitting kernels. A denied expansion
++    // leaves the prior sequence metadata/data intact and returns a normal error.
++    if (!kv->grow_for(sinfos[i_cur])) { return false; }
+     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+     n_kv = kv->get_n_kv(sinfos[i_cur]);
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9bfb8f2..7c4a0de 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -217,6 +217,7 @@ public:
+ 
+     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
+     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
++    bool grow_for(const slot_info & sinfo);
+ 
+     //
+     // input API
+@@ -297,6 +298,9 @@ private:
+ 
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
++    uint32_t growth_initial_tokens = 0;
++    uint32_t growth_committed_tokens = 0;
++    bool grow_to(uint32_t tokens);
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+diff --git a/src/llama-kv-growth.h b/src/llama-kv-growth.h
+new file mode 100644
+index 0000000..4608fb0
+--- /dev/null
++++ b/src/llama-kv-growth.h
+@@ -0,0 +1,99 @@
++#pragma once
++#include "ggml-cuda-kv-growth.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "llama-impl.h"
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#include <algorithm>
++#include <stdexcept>
++#include <utility>
++#include <vector>
++
++inline uint32_t llama_kv_growth_initial() {
++    const char * raw=std::getenv("WILDLLAMA_KV_CACHE_INITIAL_TOKENS");
++    if (!raw || !*raw || !std::strcmp(raw,"0")) { return 0; }
++    char * end=nullptr; errno=0;
++    const unsigned long long value=std::strtoull(raw,&end,10);
++    if (errno || !end || *end || *raw=='-' || value<256 || value>2097152) {
++        throw std::runtime_error("kv_cache_initial_tokens must be 0 or 256..2097152");
++    }
++    return uint32_t(value);
++}
++
++inline const ggml_backend_cuda_kv_growth_api * llama_kv_growth_api(ggml_backend_buffer_type_t buft) {
++    auto * dev=ggml_backend_buft_get_device(buft);
++    if (!dev) { return nullptr; }
++    auto * reg=ggml_backend_dev_backend_reg(dev);
++    const auto * api=static_cast<const ggml_backend_cuda_kv_growth_api *>(
++        ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_kv_growth_api"));
++    return api && api->version==1 && api->granularity(buft) ? api : nullptr;
++}
++
++inline ggml_backend_buffer_t llama_kv_growth_alloc(ggml_context * ctx,ggml_backend_buffer_type_t buft,
++        const ggml_backend_cuda_kv_growth_api * api,uint32_t initial) {
++    const size_t total=ggml_backend_alloc_ctx_tensors_from_buft_size(ctx,buft);
++    ggml_backend_buffer_ptr buffer(api->reserve(buft,total));
++    if (!buffer) { throw std::runtime_error("KV growth: cannot reserve CUDA virtual addresses"); }
++    auto allocator=ggml_tallocr_new(buffer.get());
++    for (auto * t=ggml_get_first_tensor(ctx);t;t=ggml_get_next_tensor(ctx,t)) {
++        if (!t->data) {
++            const auto result=t->view_src ? ggml_backend_view_init(t) : ggml_tallocr_alloc(&allocator,t);
++            if (result!=GGML_STATUS_SUCCESS) { throw std::runtime_error("KV growth: tensor layout allocation failed"); }
++        } else if (t->view_src && !t->buffer && ggml_backend_view_init(t)!=GGML_STATUS_SUCCESS) {
++            throw std::runtime_error("KV growth: tensor view initialization failed");
++        }
++    }
++    auto * base=static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer.get()));
++    for (auto * t=ggml_get_first_tensor(ctx);t;t=ggml_get_next_tensor(ctx,t)) {
++        if (t->view_src) { continue; }
++        if (t->ne[2]!=1 || t->ne[3]!=1 || initial>uint64_t(t->ne[1]) ||
++            !api->commit(buffer.get(),static_cast<uint8_t *>(t->data)-base,t->nb[1]*initial)) {
++            throw std::runtime_error("KV growth: initial physical allocation denied");
++        }
++    }
++    return buffer.release();
++}
++
++inline size_t llama_kv_growth_estimate(ggml_context * ctx,ggml_backend_buffer_type_t buft,
++        const ggml_backend_cuda_kv_growth_api * api,uint32_t initial) {
++    const size_t alignment=ggml_backend_buft_get_alignment(buft),gran=api->granularity(buft);
++    std::vector<std::pair<size_t,size_t>> ranges;
++    size_t offset=0,total=0;
++    auto add=[&](size_t start,size_t size) {
++        if (!size) { return; }
++        if (start>SIZE_MAX-size || start+size>SIZE_MAX-(gran-1)) { throw std::runtime_error("KV growth estimate overflow"); }
++        ranges.emplace_back(start/gran*gran,GGML_PAD(start+size,gran));
++    };
++    for (auto * t=ggml_get_first_tensor(ctx);t;t=ggml_get_next_tensor(ctx,t)) {
++        if (t->view_src) { continue; }
++        const size_t allocated=ggml_backend_buft_get_alloc_size(buft,t), actual=ggml_nbytes(t);
++        add(offset,t->nb[1]*initial);
++        // CUDA initializes quantized tensor tail padding even before use.
++        // Include those scattered pages, not only the initial KV prefixes.
++        if (allocated>actual) { add(offset+actual,allocated-actual); }
++        offset+=GGML_PAD(allocated,alignment);
++    }
++    std::sort(ranges.begin(),ranges.end());
++    size_t previous_end=0;
++    for (const auto & range:ranges) {
++        if (range.second>previous_end) { total+=range.second-std::max(previous_end,range.first); }
++        previous_end=std::max(previous_end,range.second);
++    }
++    return total;
++}
++
++inline void llama_kv_growth_clear(ggml_tensor * tensor,size_t offset,size_t size) {
++    auto * buffer=tensor->buffer;
++    if (buffer) {
++        const auto * api=llama_kv_growth_api(ggml_backend_buffer_get_type(buffer));
++        if (api && api->clear_existing) {
++            const uintptr_t base=reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
++            const uintptr_t address=reinterpret_cast<uintptr_t>(tensor->data);
++            if (address>=base && address-base<=SIZE_MAX-offset && api->clear_existing(buffer,address-base+offset,size)) { return; }
++        }
++    }
++    llama_clear_tensor_data(tensor,offset,size);
++}
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9e1696d..753b182 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -10,6 +10,7 @@
+ #include "llama-model-loader.h"
+ 
+ #include "llama-kv-cache.h"
++#include "llama-kv-growth.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-kv-cache-dsa-iswa.h"
+@@ -1607,7 +1608,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const int n_layer_all = hparams.n_layer_all;
+     const int n_gpu_layers = this->n_gpu_layers();
+ 
+-    if (params.gpu_exclusive || params.gpu_vram_limit_mib) {
++    const bool growing_cuda_kv=llama_kv_growth_initial()>0 && devices.size()==1 &&
++        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices.front().dev)),"CUDA")==0;
++    if (params.gpu_exclusive || params.gpu_vram_limit_mib || growing_cuda_kv) {
+         if (devices.size() != 1) {
+             throw std::runtime_error("GPU-exclusive/VRAM budgets currently require exactly one CUDA device");
+         }
+@@ -2448,12 +2451,22 @@ void llama_model_base::load_tensors_hadamard() {
+ 
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = nullptr;
++    const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
++    if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && params.gpu_exclusive && hparams.n_expert == 0 &&
++        n_gpu_layers() > hparams.n_layer_all && !pimpl->dev_layer.empty()) {
++        // Strict CUDA also executes GET_ROWS on device. Keeping this dense
++        // lookup table on CPU would upload the entire vocabulary every batch.
++        // Use the first decoder device instead of a table-sized compute copy.
++        // The loader still honors explicit tensor overrides and deduplicates a
++        // tied output in the same buffer context. MoE row streaming is unchanged.
++        buft_list_input = pimpl->dev_layer.front().buft_list;
++    }
+     if (tn.bid != -1) {
+         // blocks that are not model layers (e.g. the blocks of a head) go with the output
+         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
+     }
+     return ml.create_tensor(
+-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
++        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
+         tn, ne, flags);
+ }
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8a4e434..6c34600 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,4 +1,7 @@
+ #include "models.h"
++
++#include <cstdlib>
++#include <cstring>
+ #include "llama-memory-recurrent.h"
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+@@ -257,6 +260,13 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
+         ggml_tensor * weights,
+         ggml_tensor * gate,
+         int           layer) {
++    const char * dense_opt = std::getenv("GGML_CUDA_DENSE_OPT");
++    if (dense_opt && std::strcmp(dense_opt, "1") == 0) {
++        // Visit the independent Z projection (including LoRA/views) first.
++        // Otherwise its ancestors separate RMSNorm/gamma from SiLU/MUL in
++        // the final graph, preventing the CUDA gated-normalization fusion.
++        ggml_build_forward_expand(gf, gate);
++    }
+     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+ 
+diff --git a/tests/llama-context/cases-kv.cpp b/tests/llama-context/cases-kv.cpp
+index 27e6493..d68d1af 100644
+--- a/tests/llama-context/cases-kv.cpp
++++ b/tests/llama-context/cases-kv.cpp
+@@ -718,6 +718,59 @@ struct case_state_restore_fragmented : ctx_test {
+     }
+ };
+ 
++// A late metadata failure must not publish a partial device snapshot while
++// unwinding. The last complete device snapshot must still be restorable.
++struct case_state_snapshot_failure : ctx_test {
++    const char * name() const override { return "snapshot_failure"; }
++
++    const char * description() const override {
++        return "failed device saves preserve the prior snapshot and short restore headers fail safely";
++    }
++
++    case_result run(model_run & mr) const override {
++        ctx_opts opts;
++        opts.n_ctx = 256;
++        opts.n_seq_max = 1;
++        auto ctx = mr.ctx(opts);
++        if (!ctx) { return case_result::fail(); }
++        llama_memory_t mem = llama_get_memory(ctx.get());
++        if (!mem) { return case_result::pass(); }
++        const llama_tokens tokens(mr.tokens.begin(), mr.tokens.begin() + std::min<size_t>(24, mr.tokens.size()));
++        if (!decode_tokens(ctx.get(), tokens, 0)) { return case_result::fail(); }
++
++        std::vector<uint8_t> reference, device;
++        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, reference) ||
++            !get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, device)) {
++            return case_result::fail();
++        }
++        CTX_REQUIRE(device.size() > 2*sizeof(uint32_t), "device snapshot has no metadata to truncate");
++        std::vector<uint8_t> short_save(device.size() - 1);
++        CTX_REQUIRE(llama_state_seq_get_data_ext(ctx.get(), short_save.data(), short_save.size(), 0,
++                        LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == 0,
++                "truncated device save unexpectedly succeeded");
++
++        const uint8_t short_header[] = {0};
++        const llama_pos previous_pos = llama_memory_seq_pos_max(mem, 0);
++        CTX_REQUIRE(llama_state_seq_set_data_ext(ctx.get(), short_header, sizeof(short_header), 0,
++                        LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == 0,
++                "short device restore header unexpectedly succeeded");
++        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == previous_pos,
++                "invalid header modified the current sequence before parsing it");
++
++        CTX_REQUIRE(llama_memory_seq_rm(mem, 0, -1, -1), "cannot clear sequence before snapshot recovery");
++        if (!set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, device)) {
++            TLOG_ERR("failed to recover the earlier complete device snapshot\n");
++            return case_result::fail();
++        }
++        std::vector<uint8_t> restored;
++        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, restored)) {
++            return case_result::fail();
++        }
++        CTX_REQUIRE(blobs_equal(reference, restored), "failed save or invalid restore changed the prior snapshot");
++        return case_result::pass();
++    }
++};
++
+ std::vector<ctx_test_ptr> make_kv_cases() {
+     std::vector<ctx_test_ptr> cases;
+ 
+@@ -731,6 +784,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
+     cases.push_back(std::make_unique<case_state_roundtrip>());
+     cases.push_back(std::make_unique<case_state_partial_size>());
+     cases.push_back(std::make_unique<case_state_restore_failure>());
++    cases.push_back(std::make_unique<case_state_snapshot_failure>());
+     cases.push_back(std::make_unique<case_state_rotation>());
+     cases.push_back(std::make_unique<case_state_restore_fragmented>());
+ 
+diff --git a/tests/test-cuda-dense.cpp b/tests/test-cuda-dense.cpp
+new file mode 100644
+index 0000000..ab0ef93
+--- /dev/null
++++ b/tests/test-cuda-dense.cpp
+@@ -0,0 +1,309 @@
++#include "ggml-cpp.h"
++#include "../ggml/src/ggml-cuda/dense-reuse.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static ggml_context_ptr context() {
++    return ggml_context_ptr(ggml_init({128 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, true}));
++}
++
++static bool explicit_dense_opt() {
++    const char * value = std::getenv("GGML_CUDA_DENSE_OPT");
++    return value && std::strcmp(value, "1") == 0;
++}
++
++static bool has_gated_norm_pattern(ggml_cgraph * graph) {
++    for (int i = 0; i + 3 < ggml_graph_n_nodes(graph); ++i) {
++        if (ggml_graph_node(graph, i)->op == GGML_OP_RMS_NORM &&
++            ggml_graph_node(graph, i + 1)->op == GGML_OP_MUL &&
++            ggml_graph_node(graph, i + 2)->op == GGML_OP_UNARY &&
++            ggml_graph_node(graph, i + 3)->op == GGML_OP_MUL) { return true; }
++    }
++    return false;
++}
++
++static void test_gate_order() {
++    auto ctx = context();
++    auto * input = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 128, 3, 1, 1);
++    auto * projection_input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 384, 1);
++    auto * weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 384, 384);
++    auto * gamma = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128);
++    auto * gate = ggml_reshape_4d(ctx.get(), ggml_mul_mat(ctx.get(), weight, projection_input), 128, 3, 1, 1);
++    auto * graph = ggml_new_graph(ctx.get());
++    if (explicit_dense_opt()) { ggml_build_forward_expand(graph, gate); }
++    auto * norm = ggml_rms_norm(ctx.get(), input, 1e-6f);
++    auto * weighted = ggml_mul(ctx.get(), norm, gamma);
++    auto * output = ggml_mul(ctx.get(), weighted, ggml_silu(ctx.get(), gate));
++    ggml_build_forward_expand(graph, output);
++    require(has_gated_norm_pattern(graph) == explicit_dense_opt(),
++            "Qwen-like gate producer order does not match the selected graph mode");
++}
++
++static void test_plan() {
++    auto ctx = context();
++    auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 1);
++    std::array<float, 256> data{};
++    input->data = data.data();
++    std::array<ggml_tensor *, 4> weights, outputs;
++    std::array<std::array<float, 128>, 4> result{};
++    auto * graph = ggml_new_graph(ctx.get());
++    for (size_t i = 0; i < weights.size(); ++i) {
++        weights[i] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, 256, 128);
++        outputs[i] = ggml_mul_mat(ctx.get(), weights[i], input);
++        outputs[i]->data = result[i].data();
++        ggml_build_forward_expand(graph, outputs[i]);
++    }
++    auto plans = ggml_cuda_dense_plan_inputs(graph);
++    require(plans.size() == 1 && plans[0].input == input && plans[0].consumers == 4,
++            "shared projection input not found");
++    outputs[1]->data = input->data;
++    require(ggml_cuda_dense_plan_inputs(graph).empty(), "overwritten input was shared");
++    outputs[1]->data = result[1].data();
++    input->ne[1] = 9;
++    require(ggml_cuda_dense_plan_inputs(graph).empty(), "prefill outside MMVQ was shared");
++    input->ne[1] = 1;
++    input->ne[2] = 2;
++    require(ggml_cuda_dense_plan_inputs(graph).empty(), "broadcast sequences were shared");
++    input->ne[2] = 1;
++    for (auto * weight : weights) { weight->type = GGML_TYPE_Q4_0; }
++    require(ggml_cuda_dense_plan_inputs(graph).empty(), "incompatible quantization was shared");
++    for (auto * weight : weights) { weight->type = GGML_TYPE_Q8_0; }
++
++    auto * changed = ggml_scale_inplace(ctx.get(), input, 2.0f);
++    changed->data = input->data;
++    auto * mutation = ggml_new_graph(ctx.get());
++    ggml_build_forward_expand(mutation, outputs[0]);
++    ggml_build_forward_expand(mutation, changed);
++    for (size_t i = 1; i < outputs.size(); ++i) { ggml_build_forward_expand(mutation, outputs[i]); }
++    require(ggml_cuda_dense_plan_inputs(mutation).empty(), "in-place mutation was not detected");
++
++    auto * alias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 1);
++    alias->data = input->data;
++    outputs[1]->src[1] = alias;
++    plans = ggml_cuda_dense_plan_inputs(graph);
++    require(plans.size() == 1 && plans[0].input == input && plans[0].consumers == 3,
++            "different input versions were merged by address");
++    outputs[1]->src[1] = input;
++    auto * custom = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
++    custom->op = GGML_OP_CUSTOM;
++    ggml_build_forward_expand(graph, custom);
++    require(ggml_cuda_dense_plan_inputs(graph).empty(), "custom side effects were ignored");
++}
++
++struct fixture {
++    ggml_backend_t backend;
++    ggml_backend_ptr cpu_fallback;
++    ggml_context_ptr inputs = context();
++    ggml_context_ptr compute = context();
++    ggml_backend_buffer_ptr buffer;
++    ggml_backend_sched_ptr scheduler;
++    ggml_cgraph * graph;
++    std::vector<ggml_tensor *> output;
++    ggml_tensor * input = nullptr;
++    ggml_tensor * gate = nullptr;
++    explicit fixture(ggml_backend_t backend) : backend(backend), graph(ggml_new_graph(compute.get())) {}
++
++    void allocate() {
++        buffer.reset(ggml_backend_alloc_ctx_tensors(inputs.get(), backend));
++        require(buffer != nullptr, "input allocation failed");
++        ggml_backend_buffer_clear(buffer.get(), 0);
++        std::vector<ggml_backend_t> backends = {backend};
++        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            // The scheduler requires its last backend to be CPU even when all
++            // arithmetic is explicitly assigned to CUDA and fallback is forbidden.
++            cpu_fallback.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++            require(cpu_fallback != nullptr, "cannot initialize scheduler CPU sentinel");
++            backends.push_back(cpu_fallback.get());
++        }
++        scheduler.reset(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), 128, false, true));
++        require(scheduler != nullptr, "scheduler initialization failed");
++        if (cpu_fallback) { ggml_backend_sched_set_gpu_exclusive(scheduler.get(), true); }
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            auto * node = ggml_graph_node(graph, i);
++            if (!ggml_cuda_dense_no_write(node)) { ggml_backend_sched_set_tensor_backend(scheduler.get(), node, backend); }
++        }
++        require(ggml_backend_sched_alloc_graph(scheduler.get(), graph), "graph allocation failed");
++        check_placement();
++    }
++
++    void check_placement() {
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            auto * node = ggml_graph_node(graph, i);
++            if (!ggml_cuda_dense_no_write(node)) {
++                require(ggml_backend_sched_get_tensor_backend(scheduler.get(), node) == backend,
++                        "arithmetic operation escaped the selected backend");
++            }
++        }
++    }
++
++    void add_output(ggml_tensor * tensor) {
++        ggml_set_output(tensor);
++        output.push_back(tensor);
++        ggml_build_forward_expand(graph, tensor);
++    }
++
++    std::vector<std::vector<float>> run(int iteration) {
++        std::vector<float> values(ggml_nelements(input));
++        for (size_t i = 0; i < values.size(); ++i) {
++            values[i] = std::sin(float(i) * 0.13f + iteration * 0.37f) * (iteration + 1);
++        }
++        ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
++        if (gate) {
++            for (size_t i = 0; i < values.size(); ++i) { values[i] = std::cos(float(i) * 0.07f + iteration) * 5.0f; }
++            ggml_backend_tensor_set(gate, values.data(), 0, ggml_nbytes(gate));
++        }
++        require(ggml_backend_sched_graph_compute(scheduler.get(), graph) == GGML_STATUS_SUCCESS, "graph compute failed");
++        check_placement();
++        if (cpu_fallback) {
++            const auto stats = ggml_backend_sched_get_gpu_stats(scheduler.get());
++            require(stats.cpu_heavy_ops_submitted == 0, "CUDA test submitted arithmetic to the CPU sentinel");
++        }
++        std::vector<std::vector<float>> result;
++        for (const auto * tensor : output) {
++            result.emplace_back(ggml_nelements(tensor));
++            ggml_backend_tensor_get(tensor, result.back().data(), 0, ggml_nbytes(tensor));
++        }
++        return result;
++    }
++};
++
++static void projections(fixture & f, int tokens, int sequences, bool lora) {
++    constexpr int width = 256;
++    f.input = ggml_new_tensor_4d(f.inputs.get(), GGML_TYPE_F32, width, tokens, sequences, 1);
++    ggml_set_input(f.input);
++    std::array<ggml_tensor *, 4> weights;
++    for (size_t i = 0; i < weights.size(); ++i) {
++        weights[i] = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_Q8_0, width, i < 2 ? 128 : 32);
++        auto * result = ggml_mul_mat(f.compute.get(), weights[i], f.input);
++        if (lora && i == 0) {
++            auto * adapter = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width, 128);
++            result = ggml_add(f.compute.get(), result, ggml_scale(f.compute.get(), ggml_mul_mat(f.compute.get(), adapter, f.input), 0.1f));
++        }
++        f.add_output(result);
++    }
++    f.allocate();
++    for (size_t k = 0; k < weights.size(); ++k) {
++        std::vector<float> values(ggml_nelements(weights[k]));
++        for (size_t i = 0; i < values.size(); ++i) { values[i] = std::sin(float(i) * 0.021f + k) * 0.03f; }
++        std::vector<uint8_t> quantized(ggml_nbytes(weights[k]));
++        ggml_quantize_chunk(GGML_TYPE_Q8_0, values.data(), quantized.data(), 0, weights[k]->ne[1], width, nullptr);
++        ggml_backend_tensor_set(weights[k], quantized.data(), 0, quantized.size());
++    }
++    if (lora) {
++        auto * adapter = f.output[0]->src[1]->src[0]->src[0];
++        std::vector<float> values(ggml_nelements(adapter), 0.001f);
++        ggml_backend_tensor_set(adapter, values.data(), 0, ggml_nbytes(adapter));
++    }
++}
++
++static void normalization(fixture & f, int width, int tokens, int sequences, bool keep_norm, bool project_gate) {
++    f.input = ggml_new_tensor_4d(f.inputs.get(), GGML_TYPE_F32, width, 3, tokens, sequences);
++    f.gate = ggml_dup_tensor(f.inputs.get(), f.input);
++    auto * gamma = ggml_new_tensor_1d(f.inputs.get(), GGML_TYPE_F32, width);
++    ggml_set_input(f.input);
++    ggml_set_input(f.gate);
++    ggml_tensor * projection = nullptr;
++    ggml_tensor * gate = f.gate;
++    if (project_gate) {
++        // Qwen's Z is a projection with ancestors that would otherwise be
++        // visited between RMSNorm/gamma and SiLU/MUL, not an already-ready input.
++        projection = ggml_new_tensor_2d(f.inputs.get(), GGML_TYPE_F32, width * 3, width * 3);
++        auto * flat = ggml_reshape_2d(f.compute.get(), f.gate, width * 3, tokens * sequences);
++        gate = ggml_reshape_4d(f.compute.get(), ggml_mul_mat(f.compute.get(), projection, flat), width, 3, tokens, sequences);
++        if (explicit_dense_opt()) { ggml_build_forward_expand(f.graph, gate); }
++    }
++    auto * norm = ggml_rms_norm(f.compute.get(), f.input, 1e-6f);
++    auto * weighted = ggml_mul(f.compute.get(), norm, gamma);
++    auto * silu = ggml_silu(f.compute.get(), gate);
++    auto * output = ggml_mul(f.compute.get(), weighted, silu);
++    if (keep_norm) { f.add_output(norm); }
++    f.add_output(output);
++    if (project_gate) {
++        require(has_gated_norm_pattern(f.graph) == explicit_dense_opt(), "projected gate prevents the intended fusion order");
++    }
++    f.allocate();
++    if (projection) {
++        const int size = width * 3;
++        std::vector<float> values(size_t(size) * size, 0.0f);
++        for (int i = 0; i < size; ++i) { values[size_t(i) * size + i] = 1.0f; }
++        ggml_backend_tensor_set(projection, values.data(), 0, ggml_nbytes(projection));
++    }
++    std::vector<float> values(width);
++    for (int i = 0; i < width; ++i) { values[i] = 0.7f + i * 0.0003f; }
++    ggml_backend_tensor_set(gamma, values.data(), 0, ggml_nbytes(gamma));
++}
++
++static void compare(const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b, float tolerance) {
++    require(a.size() == b.size(), "output count changed");
++    for (size_t i = 0; i < a.size(); ++i) {
++        require(a[i].size() == b[i].size(), "output geometry changed");
++        for (size_t j = 0; j < a[i].size(); ++j) {
++            const float error = std::abs(a[i][j] - b[i][j]);
++            if (!std::isfinite(a[i][j]) || !std::isfinite(b[i][j]) || error > tolerance * (1 + std::abs(a[i][j]))) {
++                std::fprintf(stderr, "output %zu element %zu: reference=%g CUDA=%g error=%g\n", i, j, a[i][j], b[i][j], error);
++                throw std::runtime_error("CUDA result differs from the reference");
++            }
++        }
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        test_plan();
++        test_gate_order();
++        if (argc > 1 && std::string(argv[1]) == "--host-only") {
++            std::puts("PASS: dense input planner guards immutable values and fallbacks");
++            return 0;
++        }
++        ggml_backend_load_all();
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP: no CUDA device"); return 77; }
++        auto fusion_count = reinterpret_cast<uint64_t (*)()>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_test_norm_silu_fusions"));
++        require(fusion_count != nullptr, "CUDA fusion-activation test hook unavailable");
++        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++        ggml_backend_ptr gpu(ggml_backend_dev_init(ggml_backend_reg_dev_get(registry, 0), nullptr));
++        require(cpu && gpu, "cannot create reference/CUDA backends");
++        for (const auto test : {std::array<int, 3>{1, 1, 0}, {8, 1, 0}, {1, 2, 0}, {1, 1, 1}}) {
++            fixture reference(cpu.get()), candidate(gpu.get()), other(gpu.get());
++            projections(reference, test[0], test[1], test[2]);
++            projections(candidate, test[0], test[1], test[2]);
++            projections(other, 2, 1, false);
++            for (int iteration = 0; iteration < 6; ++iteration) {
++                // Alternate graph captures on one context/pool, then replay with new input values.
++                (void) other.run(iteration + 1);
++                compare(reference.run(iteration), candidate.run(iteration), 0.01f);
++            }
++        }
++        for (const auto test : {std::array<int, 5>{128, 1, 1, 0, 0}, {128, 17, 2, 0, 0}, {257, 3, 1, 0, 0},
++                               {4096, 1, 1, 0, 0}, {128, 2, 1, 1, 0}, {128, 1, 1, 0, 1}}) {
++            const auto before = fusion_count();
++            fixture reference(cpu.get()), candidate(gpu.get());
++            normalization(reference, test[0], test[1], test[2], test[3], test[4]);
++            normalization(candidate, test[0], test[1], test[2], test[3], test[4]);
++            for (int iteration = 0; iteration < 6; ++iteration) { compare(reference.run(iteration), candidate.run(iteration), 3e-5f); }
++            const auto submitted = fusion_count() - before;
++            const bool expected = explicit_dense_opt() && !test[3];
++            std::fprintf(stderr, "gated-norm width=%d tokens=%d sequences=%d keep_norm=%d projected_gate=%d fused_submissions=%llu expected=%d\n",
++                test[0], test[1], test[2], test[3], test[4], (unsigned long long) submitted, int(expected));
++            require(expected ? submitted > 0 : submitted == 0,
++                    "gated normalization did not take the required fusion/fallback path");
++        }
++        std::puts("PASS: CUDA dense projections and gated RMSNorm match the CPU reference, including replay and fallbacks");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-cuda-kv-growth.cpp b/tests/test-cuda-kv-growth.cpp
+new file mode 100644
+index 0000000..426ca45
+--- /dev/null
++++ b/tests/test-cuda-kv-growth.cpp
+@@ -0,0 +1,211 @@
++#include "ggml-cpp.h"
++#include "ggml-cuda.h"
++#include "ggml-cuda-kv-growth.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++static void expect_fill(const ggml_tensor * tensor, size_t offset, size_t size, uint8_t fill) {
++    std::vector<uint8_t> actual(size);
++    ggml_backend_tensor_get(tensor, actual.data(), offset, size);
++    require(std::all_of(actual.begin(), actual.end(), [fill](uint8_t value) { return value == fill; }),
++            "committed or future page has an unexpected fill value");
++}
++
++int main() {
++    try {
++        ggml_backend_load_all();
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) {
++            std::fprintf(stderr, "SKIP: no CUDA device\n");
++            return 77;
++        }
++        auto * device = ggml_backend_reg_dev_get(registry, 0);
++        auto * buft = ggml_backend_dev_buffer_type(device);
++        auto * api = static_cast<const ggml_backend_cuda_kv_growth_api *>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_growth_api"));
++        require(api && api->version == 1 && api->granularity && api->reserve && api->commit && api->committed && api->clear_existing,
++                "CUDA KV growth API unavailable");
++        constexpr size_t mib = 1024*1024;
++        const size_t page = api->granularity(buft);
++        if (!page || page > 4*mib) {
++            std::fprintf(stderr, "SKIP: VMM unavailable or granularity exceeds the 32 MiB test budget\n");
++            return 77;
++        }
++        require(page >= 1024, "unexpectedly small CUDA VMM granularity");
++        require(api->granularity(nullptr) == 0 && !api->reserve(nullptr, mib) && !api->reserve(buft, 0),
++                "invalid reserve inputs accepted");
++        require(!api->reserve(buft, std::numeric_limits<size_t>::max()), "overflowing reserve accepted");
++        require(!api->commit(nullptr, 0, 1) && api->committed(nullptr) == std::numeric_limits<size_t>::max(),
++                "invalid buffer inputs accepted");
++
++        auto set_limit = reinterpret_cast<decltype(&ggml_backend_cuda_set_memory_limit)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_set_memory_limit"));
++        auto get_stats = reinterpret_cast<decltype(&ggml_backend_cuda_get_memory_stats)>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_get_memory_stats"));
++        require(set_limit && get_stats, "CUDA memory policy API unavailable");
++        // Establish enforcement before creating any backend allocation or pool.
++        require(set_limit(device, 16*mib, true), "cannot enable the 16 MiB quota");
++        struct policy_owner {
++            decltype(set_limit) release;
++            ggml_backend_dev_t device;
++            bool active = true;
++            ~policy_owner() { if (active) { release(device, 0, false); } }
++        } policy { set_limit, device };
++        auto stats = [&] {
++            ggml_backend_cuda_memory_stats result = {};
++            require(get_stats(device, &result), "cannot read CUDA policy stats");
++            return result;
++        };
++        const size_t baseline = stats().managed_used_bytes;
++        require(stats().enabled && stats().limit_bytes == 16*mib, "test quota was not activated");
++
++        // Reserve more logical capacity than either physical quota, including
++        // a non-page-aligned tail. No tensor-sized cudaMalloc is permitted.
++        const size_t logical = 128*mib + 129;
++        ggml_backend_buffer_ptr buffer(api->reserve(buft, logical));
++        require(buffer && ggml_backend_buffer_get_size(buffer.get()) == logical, "logical KV reservation failed");
++        void * const address = ggml_backend_buffer_get_base(buffer.get());
++        require(address && api->committed(buffer.get()) == 0 && stats().managed_used_bytes == baseline,
++                "virtual reservation committed full physical storage");
++        ggml_context_ptr context(ggml_init({16*ggml_tensor_overhead(), nullptr, true}));
++        require(context != nullptr, "cannot create metadata-only tensor context");
++        auto * flat = ggml_new_tensor_1d(context.get(), GGML_TYPE_I8, int64_t(logical));
++        require(ggml_backend_tensor_alloc(buffer.get(), flat, address) == GGML_STATUS_SUCCESS,
++                "cannot attach logical tensor to reserved VAS");
++        require(api->committed(buffer.get()) == 0, "plain tensor initialization committed full KV");
++
++        require(api->commit(buffer.get(), page + 13, 1), "first sparse page commit failed");
++        require(api->committed(buffer.get()) == page && stats().managed_used_bytes == baseline + page,
++                "sparse commit was not charged at physical page granularity");
++        expect_fill(flat, page, page, 0);
++
++        // A CPU-origin write through a view crosses two physical pages. Growing
++        // the map must preserve earlier bytes and zero untouched page padding.
++        std::vector<uint8_t> pattern(257);
++        for (size_t i = 0; i < pattern.size(); ++i) { pattern[i] = uint8_t(i*37 + 11); }
++        const size_t cross_offset = 2*page - 64;
++        auto * cross = ggml_view_1d(context.get(), flat, int64_t(pattern.size()), cross_offset);
++        require(ggml_backend_view_init(cross) == GGML_STATUS_SUCCESS, "cannot initialize offset view");
++        ggml_backend_tensor_set(cross, pattern.data(), 0, pattern.size());
++        require(api->committed(buffer.get()) == 2*page, "view write committed incorrect pages");
++        std::vector<uint8_t> two_pages(2*page);
++        ggml_backend_tensor_get(flat, two_pages.data(), page, two_pages.size());
++        for (size_t i = 0; i < two_pages.size(); ++i) {
++            const size_t relative = i - std::min(i, page - 64);
++            const uint8_t expected = i >= page - 64 && relative < pattern.size() ? pattern[relative] : 0;
++            require(two_pages[i] == expected, "growth changed existing bytes or exposed uninitialized padding");
++        }
++        const size_t twice = api->committed(buffer.get());
++        require(api->commit(buffer.get(), page + 1, page - 2) && api->commit(buffer.get(), logical, 0),
++                "idempotent/empty commit failed");
++        require(api->committed(buffer.get()) == twice && stats().managed_used_bytes == baseline + twice,
++                "repeated commit was charged twice");
++        require(!api->commit(buffer.get(), logical + 1, 0) && !api->commit(buffer.get(), logical - 1, 2) &&
++                !api->commit(buffer.get(), std::numeric_limits<size_t>::max(), 2), "invalid commit bounds accepted");
++
++        // Occupy the remaining quota through an ordinary CUDA allocation. A
++        // failed KV extension must preserve data/accounting, then succeed once
++        // that competing allocation is freed. This failure touches one new run.
++        ggml_backend_buffer_ptr blocker(ggml_backend_buft_alloc_buffer(buft, 16*mib - stats().managed_used_bytes));
++        require(blocker && stats().managed_used_bytes == 16*mib, "cannot fill the small physical quota");
++        const auto full = stats();
++        require(!api->commit(buffer.get(), 4*page + 7, 17), "KV extension exceeded the physical quota");
++        require(api->committed(buffer.get()) == twice && stats().managed_used_bytes == full.managed_used_bytes &&
++                stats().denied_allocations > full.denied_allocations, "failed extension leaked accounting");
++        std::vector<uint8_t> recovered(pattern.size());
++        ggml_backend_tensor_get(cross, recovered.data(), 0, recovered.size());
++        require(recovered == pattern, "denied extension corrupted existing bytes");
++        const auto before_cleanup = stats();
++        require(api->clear_existing(buffer.get(), cross_offset, 5*page), "cleanup of mapped bytes plus missing pages failed");
++        require(api->committed(buffer.get()) == twice && stats().managed_used_bytes == before_cleanup.managed_used_bytes &&
++                stats().denied_allocations == before_cleanup.denied_allocations,
++                "restore cleanup allocated missing pages or retried a denied reservation");
++        expect_fill(cross, 0, pattern.size(), 0);
++        require(!api->clear_existing(buffer.get(), logical - 1, 2) && !api->clear_existing(blocker.get(), 0, 1),
++                "invalid/conventional cleanup input accepted");
++        ggml_backend_tensor_set(cross, pattern.data(), 0, pattern.size());
++        blocker.reset();
++        require(api->commit(buffer.get(), 4*page + 7, 17), "KV extension did not recover after pressure was released");
++        require(api->committed(buffer.get()) == 3*page, "retry committed the wrong physical extent");
++
++        // Re-register this single test owner with a larger quota while retaining
++        // the same mapped data/address; retained mappings stay charged.
++        require(set_limit(device, 0, false), "cannot release initial policy owner");
++        policy.active = false;
++        require(set_limit(device, 32*mib, true), "cannot enable the 32 MiB quota with tracked live pages");
++        policy.active = true;
++        require(stats().managed_used_bytes == baseline + 3*page, "policy transition lost mapped accounting");
++
++        constexpr size_t rows = 3, width = 257, host_stride = width + 19;
++        auto * strided = ggml_view_1d(context.get(), flat, int64_t(2*page + width), 6*page + 17);
++        require(ggml_backend_view_init(strided) == GGML_STATUS_SUCCESS, "cannot initialize strided view");
++        std::vector<uint8_t> source(rows*host_stride, 0xd3), actual(rows*host_stride, 0xbd);
++        for (size_t row = 0; row < rows; ++row) {
++            for (size_t column = 0; column < width; ++column) {
++                source[row*host_stride + column] = uint8_t((row*53 + column*17 + 7)%251);
++            }
++        }
++        ggml_backend_tensor_set_2d(strided, source.data(), 0, width, rows, page, host_stride);
++        ggml_backend_tensor_get_2d(strided, actual.data(), 0, width, rows, page, host_stride);
++        require(api->committed(buffer.get()) == 6*page, "2D callback committed gaps between rows");
++        for (size_t row = 0; row < rows; ++row) {
++            for (size_t column = 0; column < host_stride; ++column) {
++                require(actual[row*host_stride + column] == (column < width ? source[row*host_stride + column] : uint8_t(0xbd)),
++                        "2D view copy changed row values or host padding");
++            }
++        }
++        expect_fill(flat, 6*page + 16, 1, 0);
++        expect_fill(flat, 6*page + 17 + width, 1, 0);
++        ggml_backend_tensor_memset(strided, 0xa6, 0, width);
++        expect_fill(strided, 0, width, 0xa6);
++        ggml_backend_tensor_get(cross, recovered.data(), 0, recovered.size());
++        require(recovered == pattern && ggml_backend_buffer_get_base(buffer.get()) == address,
++                "later growth moved VAS or overwrote an earlier view");
++
++        ggml_backend_buffer_clear(buffer.get(), 0x5a);
++        require(api->committed(buffer.get()) == 6*page, "clear eagerly committed the entire reservation");
++        require(!api->clear_existing(buffer.get(), 11*page, page) && api->committed(buffer.get()) == 6*page,
++                "zero-only cleanup changed a nonzero logical lazy fill");
++        expect_fill(cross, 0, pattern.size(), 0x5a);
++        require(api->commit(buffer.get(), 10*page + 3, 257), "future-page commit after clear failed");
++        expect_fill(flat, 10*page + 3, 257, 0x5a);
++
++        // Quantized padding must be zero even when the buffer's current fill
++        // is nonzero. Read it as bytes so no quantized arithmetic is involved.
++        auto * quantized = ggml_new_tensor_1d(context.get(), GGML_TYPE_Q8_0, 32);
++        const size_t data_bytes = ggml_nbytes(quantized);
++        const size_t allocation_bytes = ggml_backend_buft_get_alloc_size(buft, quantized);
++        require(allocation_bytes > data_bytes && allocation_bytes < page - 128, "Q8 padding test shape has no bounded padding");
++        const size_t quant_offset = 4*page + 128;
++        require(ggml_backend_tensor_alloc(buffer.get(), quantized, static_cast<char *>(address) + quant_offset) == GGML_STATUS_SUCCESS,
++                "quantized tensor initialization failed");
++        expect_fill(flat, quant_offset, data_bytes, 0x5a);
++        expect_fill(flat, quant_offset + data_bytes, allocation_bytes - data_bytes, 0);
++
++        ggml_backend_buffer_clear(buffer.get(), 0);
++        expect_fill(cross, 0, pattern.size(), 0);
++        expect_fill(flat, 10*page + 3, 257, 0);
++        // A read callback grows a previously unmapped page and must inherit
++        // the most recent clear, without resurrecting stale GPU memory.
++        expect_fill(flat, 12*page + 33, 257, 0);
++        require(api->committed(buffer.get()) == 8*page && stats().managed_used_bytes == baseline + 8*page &&
++                stats().managed_used_bytes <= 32*mib, "physical growth escaped quota accounting");
++        require(ggml_backend_buffer_get_base(buffer.get()) == address, "clear/growth changed the logical address");
++        buffer.reset();
++        require(stats().managed_used_bytes == baseline, "free did not unmap pages and return managed usage to baseline");
++        std::printf("PASS: CUDA KV VAS reservation, 16/32 MiB quotas, sparse growth, preserved bytes, views/2D, padding, future clears and cleanup (page=%zu)\n", page);
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-dense-embedding.cpp b/tests/test-dense-embedding.cpp
+new file mode 100644
+index 0000000..deb0204
+--- /dev/null
++++ b/tests/test-dense-embedding.cpp
+@@ -0,0 +1,183 @@
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "../src/llama-model.h"
++
++#include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void make_fixture(const std::string & path, bool tied, bool moe) {
++    constexpr int dim = 64, ff = 128, layers = 2, vocab = 259;
++    gguf_context_ptr meta(gguf_init_empty());
++    gguf_set_val_str(meta.get(), "general.architecture", "llama");
++    gguf_set_val_str(meta.get(), "general.name", "dense-embedding-regression");
++    gguf_set_val_u32(meta.get(), "llama.context_length", 256);
++    gguf_set_val_u32(meta.get(), "llama.embedding_length", dim);
++    gguf_set_val_u32(meta.get(), "llama.block_count", layers);
++    gguf_set_val_u32(meta.get(), "llama.feed_forward_length", ff);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count", 4);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count_kv", 2);
++    gguf_set_val_u32(meta.get(), "llama.rope.dimension_count", 16);
++    gguf_set_val_f32(meta.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    if (moe) {
++        gguf_set_val_u32(meta.get(), "llama.expert_count", 4);
++        gguf_set_val_u32(meta.get(), "llama.expert_used_count", 2);
++    }
++    gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) {
++        char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i);
++        tokens.emplace_back(name);
++    }
++    std::vector<const char *> strings;
++    for (const auto & token : tokens) { strings.push_back(token.c_str()); }
++    std::vector<float> scores(vocab, 0);
++    std::vector<int32_t> types(vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", strings.data(), strings.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.eos_token_id", 2);
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_bos_token", true);
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_eos_token", false);
++    ggml_context_ptr tensors(ggml_init({16 * 1024 * 1024, nullptr, false}));
++    require(tensors != nullptr, "cannot allocate fixture tensors");
++    auto tensor = [&](const std::string & name, int x, int y = 1, int z = 1) {
++        auto * t = ggml_new_tensor_3d(tensors.get(), GGML_TYPE_F32, x, y, z);
++        ggml_set_name(t, name.c_str());
++        uint32_t salt = 2166136261u;
++        for (unsigned char c : name) { salt = (salt ^ c) * 16777619u; }
++        auto * data = static_cast<float *>(t->data);
++        for (int64_t i = 0; i < ggml_nelements(t); ++i) {
++            salt = salt * 1664525u + 1013904223u;
++            data[i] = float(int(salt >> 16) - 32768) * (0.02f / 32768);
++            if (name.find("norm.weight") != std::string::npos) { data[i] += 1.0f; }
++        }
++        gguf_add_tensor(meta.get(), t);
++    };
++    tensor("token_embd.weight", dim, vocab);
++    tensor("output_norm.weight", dim);
++    if (!tied) { tensor("output.weight", dim, vocab); }
++    for (int i = 0; i < layers; ++i) {
++        const auto prefix = "blk." + std::to_string(i) + ".";
++        tensor(prefix + "attn_norm.weight", dim);
++        tensor(prefix + "attn_q.weight", dim, dim);
++        tensor(prefix + "attn_k.weight", dim, dim / 2);
++        tensor(prefix + "attn_v.weight", dim, dim / 2);
++        tensor(prefix + "attn_output.weight", dim, dim);
++        tensor(prefix + "ffn_norm.weight", dim);
++        if (moe) {
++            tensor(prefix + "ffn_gate_inp.weight", dim, 4);
++            tensor(prefix + "ffn_gate_exps.weight", dim, ff, 4);
++            tensor(prefix + "ffn_up_exps.weight", dim, ff, 4);
++            tensor(prefix + "ffn_down_exps.weight", ff, dim, 4);
++        } else {
++            tensor(prefix + "ffn_gate.weight", dim, ff);
++            tensor(prefix + "ffn_up.weight", dim, ff);
++            tensor(prefix + "ffn_down.weight", ff, dim);
++        }
++    }
++    require(gguf_write_to_file(meta.get(), path.c_str(), false), "cannot write fixture GGUF");
++}
++
++struct result { std::vector<float> logits; uint64_t model_bytes = 0; };
++
++static result evaluate(const std::string & path, bool strict, bool tied, bool moe, bool override_cpu = false) {
++    auto params = llama_model_default_params();
++    params.n_gpu_layers = 999;
++    params.load_mode = LLAMA_LOAD_MODE_NONE;
++    params.use_extra_bufts = false;
++    params.no_host = true;
++    params.gpu_exclusive = strict;
++    params.gpu_vram_limit_mib = strict ? 64 : 0;
++    const llama_model_tensor_buft_override overrides[] = {
++        {"^token_embd\\.weight$", ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))},
++        {nullptr, nullptr}
++    };
++    if (override_cpu) { params.tensor_buft_overrides = overrides; }
++    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path.c_str(), params), llama_model_free);
++    require(model != nullptr, "cannot load embedding fixture");
++    require((model->hparams.n_expert > 0) == moe, "fixture expert metadata does not match the tested policy");
++    const bool host = ggml_backend_buffer_is_host(model->tok_embd->buffer);
++    require(host == (!strict || moe || override_cpu), "token embedding placement changed unexpectedly");
++    if (strict && !moe && !override_cpu) {
++        require(!ggml_backend_buffer_is_host(model->output->buffer), "output left CUDA");
++        require((model->tok_embd == model->output) == tied, "tied embedding/output was duplicated");
++        require(model->layers.front().wq &&
++                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model->tok_embd->buffer)) ==
++                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model->layers.front().wq->buffer)),
++                "embedding is not on the first decoder device");
++    }
++    result output;
++    output.model_bytes = llama_model_size(model.get());
++    if (moe || override_cpu) { return output; } // placement-only guards; do not change their execution policies
++    auto cp = llama_context_default_params();
++    cp.n_ctx = 256; cp.n_batch = 8; cp.n_ubatch = 8; cp.n_seq_max = 1;
++    cp.n_threads = 2; cp.n_threads_batch = 2;
++    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
++    require(ctx != nullptr, "cannot initialize embedding fixture context within quota");
++    std::vector<llama_token> tokens = {23, 42, 91, 72};
++    for (int step = 0; step < 4; ++step) {
++        auto batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
++        require(llama_decode(ctx.get(), batch) == 0, "fixture decode failed");
++        const float * values = llama_get_logits_ith(ctx.get(), -1);
++        require(values != nullptr, "missing logits");
++        output.logits.insert(output.logits.end(), values, values + llama_vocab_n_tokens(llama_model_get_vocab(model.get())));
++        tokens = {llama_token(100 + step)};
++    }
++    require(llama_n_ctx(ctx.get()) == 256, "embedding placement changed context capacity");
++    if (strict) {
++        llama_gpu_execution_stats execution{};
++        require(llama_gpu_execution_stats_get(ctx.get(), &execution) && execution.cpu_heavy_ops_submitted == 0 &&
++                execution.gpu_heavy_ops_submitted > 0, "strict embedding test used CPU arithmetic");
++        llama_gpu_memory_stats memory{};
++        require(llama_model_get_gpu_memory_stats(model.get(), &memory) &&
++                memory.limit_bytes == 64 * 1024 * 1024 && memory.managed_used_bytes <= memory.limit_bytes &&
++                memory.managed_peak_bytes <= memory.limit_bytes,
++                "embedding allocation escaped the VRAM quota");
++    }
++    return output;
++}
++
++int main(int argc, char ** argv) {
++    if (argc != 2) { std::fprintf(stderr, "usage: test-dense-embedding fixture-directory\n"); return 2; }
++    try {
++        ggml_backend_load_all();
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) { std::puts("SKIP: CUDA required"); return 77; }
++        llama_backend_init();
++        const std::filesystem::path directory(argv[1]);
++        std::filesystem::create_directories(directory);
++        for (bool tied : {false, true}) {
++            const auto path = (directory / (tied ? "dense-embedding-tied.gguf" : "dense-embedding.gguf")).string();
++            make_fixture(path, tied, false);
++            const auto reference = evaluate(path, false, tied, false);
++            const auto strict = evaluate(path, true, tied, false);
++            require(strict.model_bytes <= reference.model_bytes, "resident embedding increased unique model bytes");
++            require(reference.logits.size() == strict.logits.size(), "logit geometry changed");
++            for (size_t i = 0; i < reference.logits.size(); ++i) {
++                require(std::isfinite(strict.logits[i]) && std::abs(reference.logits[i] - strict.logits[i]) <=
++                        1e-4f * (1 + std::abs(reference.logits[i])), "resident embedding changed logits");
++            }
++            (void) evaluate(path, true, tied, false, true);
++        }
++        const auto moe = (directory / "moe-embedding-placement.gguf").string();
++        make_fixture(moe, false, true);
++        (void) evaluate(moe, true, false, true);
++        llama_backend_free();
++        std::puts("PASS: dense exclusive embeddings stay resident; tied weights share storage; normal, MoE, overrides and quotas preserved");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-kv-growth.cpp b/tests/test-kv-growth.cpp
+new file mode 100644
+index 0000000..fd014d0
+--- /dev/null
++++ b/tests/test-kv-growth.cpp
+@@ -0,0 +1,378 @@
++#include "llama.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml-cuda-kv-growth.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct environment_guard {
++    std::string key, previous;
++    bool existed;
++
++    environment_guard(const char * name, const char * value) : key(name), existed(std::getenv(name) != nullptr) {
++        if (existed) { previous = std::getenv(name); }
++        set(value);
++    }
++    void set(const char * value) {
++#ifdef _WIN32
++        require(_putenv_s(key.c_str(), value ? value : "") == 0, "cannot set KV growth test environment");
++#else
++        require((value ? setenv(key.c_str(), value, 1) : unsetenv(key.c_str())) == 0,
++                "cannot set KV growth test environment");
++#endif
++    }
++    ~environment_guard() {
++#ifdef _WIN32
++        _putenv_s(key.c_str(), existed ? previous.c_str() : "");
++#else
++        if (existed) { setenv(key.c_str(), previous.c_str(), 1); }
++        else { unsetenv(key.c_str()); }
++#endif
++    }
++};
++
++struct batch_owner {
++    llama_batch batch = llama_batch_init(64, 0, 1);
++    ~batch_owner() { llama_batch_free(batch); }
++};
++
++struct result {
++    uint32_t context = 0;
++    size_t vocab = 0;
++    uint64_t initial_bytes = 0, prefill_bytes = 0, decode_bytes = 0;
++    uint64_t at_256_bytes = 0, restored_bytes = 0;
++    std::vector<float> prefill, decode, shifted;
++};
++
++static uint64_t managed_bytes(const llama_model * model) {
++    llama_gpu_memory_stats stats {};
++    require(llama_model_get_gpu_memory_stats(model, &stats) && stats.enabled && stats.limit_bytes == 0,
++            "strict quota-zero CUDA allocation accounting is unavailable");
++    return stats.managed_used_bytes;
++}
++
++static llama_token fixed_token(size_t position, size_t vocab) {
++    // Feed the same tokens in both modes: a small numerical difference must
++    // not change the subsequent workload through autoregressive sampling.
++    require(vocab > 32, "KV fixture vocabulary is too small");
++    return llama_token(16 + ((position*13 + 7) % (vocab - 32)));
++}
++
++static void decode_fixed(llama_context * ctx, batch_owner & owner, size_t vocab,
++                         uint32_t begin, uint32_t count, std::vector<float> & output, bool collect_logits = true) {
++    auto & batch = owner.batch;
++    require(count > 0 && count <= 64, "invalid KV test batch size");
++    batch.n_tokens = int32_t(count);
++    for (uint32_t i = 0; i < count; ++i) {
++        batch.token[i] = fixed_token(begin + i, vocab);
++        batch.pos[i] = llama_pos(begin + i);
++        batch.n_seq_id[i] = 1;
++        batch.seq_id[i][0] = 0;
++        batch.logits[i] = collect_logits || i+1 == count;
++    }
++    require(llama_decode(ctx, batch) == 0, "KV fixture decode failed");
++    if (!collect_logits) { return; }
++    for (uint32_t i = 0; i < count; ++i) {
++        const float * logits = llama_get_logits_ith(ctx, int32_t(i));
++        require(logits != nullptr, "missing KV fixture logits");
++        output.insert(output.end(), logits, logits + vocab);
++    }
++}
++
++static std::vector<float> continuation(llama_context * ctx, batch_owner & batch, size_t vocab, uint32_t begin = 320) {
++    std::vector<float> output;
++    output.reserve(16*vocab);
++    for (uint32_t i = 0; i < 16; ++i) { decode_fixed(ctx, batch, vocab, begin + i, 1, output); }
++    return output;
++}
++
++static void require_identical(const std::vector<float> & expected, const std::vector<float> & actual,
++                              const char * message) {
++    require(expected.size() == actual.size() &&
++            std::memcmp(expected.data(), actual.data(), expected.size()*sizeof(float)) == 0, message);
++}
++
++static result evaluate(const char * path, ggml_backend_dev_t device, bool growing, uint32_t context) {
++    // The setting must be read per constructor, not cached process-wide. These
++    // two evaluations run sequentially in the same executable, with no model
++    // overlap and otherwise identical parameters and CUDA kernels.
++    environment_guard setting("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", growing ? "256" : "0");
++    auto mp = llama_model_default_params();
++    ggml_backend_dev_t devices[] = { device, nullptr };
++    mp.devices = devices;
++    mp.n_gpu_layers = 999;
++    mp.split_mode = LLAMA_SPLIT_MODE_NONE;
++    mp.main_gpu = 0;
++    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
++    mp.use_extra_bufts = false;
++    mp.no_host = true;
++    mp.gpu_exclusive = true;
++    mp.gpu_diagnostics = false;
++    mp.gpu_vram_limit_mib = 0;
++    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path, mp), llama_model_free);
++    require(model != nullptr, "cannot load dense KV fixture");
++    char architecture[64] {};
++    llama_model_meta_val_str(model.get(), "general.architecture", architecture, sizeof(architecture));
++    require(std::string(architecture) == "llama", "KV integration test requires the dense Llama fixture");
++
++    auto cp = llama_context_default_params();
++    cp.n_ctx = context;
++    cp.n_batch = 64;
++    cp.n_ubatch = 64;
++    cp.n_seq_max = 1;
++    cp.n_rs_seq = 0;
++    cp.n_threads = 2;
++    cp.n_threads_batch = 2;
++    cp.type_k = GGML_TYPE_Q8_0;
++    cp.type_v = GGML_TYPE_Q8_0;
++    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    cp.offload_kqv = true;
++    cp.kv_unified = true;
++    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
++    require(ctx != nullptr, "cannot create CUDA KV fixture context");
++    require(llama_n_ctx(ctx.get()) == context && llama_n_ctx_seq(ctx.get()) == context,
++            "physical KV commitment changed logical context capacity");
++
++    result out;
++    out.context = llama_n_ctx(ctx.get());
++    out.vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++    out.initial_bytes = managed_bytes(model.get());
++    batch_owner batch;
++    out.prefill.reserve(320*out.vocab);
++    for (uint32_t begin = 0; begin < 320; begin += 64) {
++        decode_fixed(ctx.get(), batch, out.vocab, begin, 64, out.prefill);
++        if (begin == 192) { out.at_256_bytes = managed_bytes(model.get()); }
++    }
++    out.prefill_bytes = managed_bytes(model.get());
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 319,
++            "prefill lost positions when crossing the initial 256-token commitment");
++
++    const size_t capacity = llama_state_get_size(ctx.get());
++    require(capacity > 0, "empty state snapshot at 320 tokens");
++    std::vector<uint8_t> state(capacity);
++    const size_t written = llama_state_get_data(ctx.get(), state.data(), state.size());
++    require(written > 0 && written <= state.size(), "cannot save KV state across the growth boundary");
++    state.resize(written);
++
++    out.decode = continuation(ctx.get(), batch, out.vocab);
++    out.decode_bytes = managed_bytes(model.get());
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 335, "decode lost KV positions");
++    require(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size(), "cannot restore KV state over a longer live history");
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 319, "state restore retained stale tail cells");
++    const auto replay = continuation(ctx.get(), batch, out.vocab);
++    require_identical(out.decode, replay, "restored KV state changed continuation logits bitwise");
++
++    // Clearing must touch committed pages only, then restoration must commit
++    // and copy precisely the saved active rows, never the full virtual range.
++    llama_memory_clear(llama_get_memory(ctx.get()), true);
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == -1, "KV clear retained sequence metadata");
++    require(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size(), "cannot reload KV state after clearing");
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 319, "clear/reload lost saved positions");
++    const auto after_clear = continuation(ctx.get(), batch, out.vocab);
++    require_identical(out.decode, after_clear, "clear/reload changed continuation logits bitwise");
++
++    require(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size(), "cannot restore prefix before K shift");
++    require(llama_memory_can_shift(llama_get_memory(ctx.get())), "dense fixture does not support K shifting");
++    llama_memory_seq_add(llama_get_memory(ctx.get()), 0, 0, -1, 1);
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 320, "K shift did not update logical positions");
++    out.shifted = continuation(ctx.get(), batch, out.vocab, 321);
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 336, "K-shift continuation lost positions");
++    out.restored_bytes = managed_bytes(model.get());
++    require(llama_n_ctx(ctx.get()) == context, "KV growth or restoration reduced the context");
++    llama_gpu_execution_stats execution {};
++    require(llama_gpu_execution_stats_get(ctx.get(), &execution) && !execution.cpu_heavy_ops_submitted &&
++            execution.gpu_heavy_ops_submitted > 0, "dense KV test did not demonstrate exclusive CUDA execution");
++    std::printf("KV mode=%s context=%u vocab=%zu state=%zu managed_initial=%llu managed_at256=%llu managed_prefill320=%llu managed_decode336=%llu managed_restored=%llu\n",
++            growing ? "growth256" : "fully_committed", out.context, out.vocab, state.size(),
++            (unsigned long long) out.initial_bytes, (unsigned long long) out.at_256_bytes,
++            (unsigned long long) out.prefill_bytes, (unsigned long long) out.decode_bytes,
++            (unsigned long long) out.restored_bytes);
++    return out;
++}
++
++static float compare_logits(const result & reference, const result & growing,
++                            const std::vector<float> & a, const std::vector<float> & b) {
++    require(reference.vocab == growing.vocab && a.size() == b.size() && a.size()%reference.vocab == 0,
++            "off/on KV output shape differs");
++    float maximum = 0;
++    for (size_t token = 0; token < a.size()/reference.vocab; ++token) {
++        const auto offset = token*reference.vocab;
++        for (size_t v = 0; v < reference.vocab; ++v) {
++            require(std::isfinite(a[offset+v]) && std::isfinite(b[offset+v]), "nonfinite KV integration logits");
++            maximum = std::max(maximum, std::abs(a[offset+v] - b[offset+v]));
++        }
++        const auto top_a = std::max_element(a.begin()+offset, a.begin()+offset+reference.vocab) - a.begin();
++        const auto top_b = std::max_element(b.begin()+offset, b.begin()+offset+reference.vocab) - b.begin();
++        require(top_a == top_b, "initial KV commitment changed greedy top-1");
++    }
++    require(maximum <= 2e-4f, "initial KV commitment changed logits beyond 2e-4");
++    return maximum;
++}
++
++static void quota_denied_restore(const char * path, ggml_backend_dev_t device) {
++    constexpr uint64_t quota_mib = 512;
++    constexpr uint32_t context = 65536;
++    // The tied-wide fixture has 136-byte quantized KV rows. With a 2 MiB
++    // minimum VMM page, 512 rows still fit inside the initially committed page
++    // (~15420 rows/page), so they cannot exercise a denied growth. 32768 rows
++    // span multiple new pages; the independent 65536 context leaves the prefix
++    // and tensor-padding tail separate even in the small-context fallback case.
++    constexpr uint32_t snapshot_tokens = 32768;
++    ggml_backend_dev_t devices[] = { device, nullptr };
++    auto create = [&]() {
++        auto mp = llama_model_default_params();
++        mp.devices = devices;
++        mp.n_gpu_layers = 999;
++        mp.split_mode = LLAMA_SPLIT_MODE_NONE;
++        mp.main_gpu = 0;
++        mp.load_mode = LLAMA_LOAD_MODE_MMAP;
++        mp.use_extra_bufts = false;
++        mp.no_host = true;
++        mp.gpu_exclusive = true;
++        mp.gpu_diagnostics = false;
++        mp.gpu_vram_limit_mib = quota_mib;
++        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path, mp), llama_model_free);
++        require(model != nullptr, "cannot load quota/state fixture");
++        auto cp = llama_context_default_params();
++        cp.n_ctx = context; cp.n_batch = 64; cp.n_ubatch = 64; cp.n_seq_max = 1; cp.n_rs_seq = 0;
++        cp.n_threads = 2; cp.n_threads_batch = 2;
++        cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q8_0;
++        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        cp.offload_kqv = true; cp.kv_unified = true;
++        std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
++        require(ctx != nullptr && llama_n_ctx(ctx.get()) == context, "cannot create unchanged-context quota fixture");
++        return std::make_pair(std::move(model), std::move(ctx));
++    };
++
++    std::vector<uint8_t> snapshot;
++    std::vector<float> expected;
++    size_t vocab = 0;
++    {
++        environment_guard setting("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "0");
++        auto session = create();
++        vocab = llama_vocab_n_tokens(llama_model_get_vocab(session.first.get()));
++        batch_owner batch;
++        std::vector<float> prefill;
++        for (uint32_t begin = 0; begin < snapshot_tokens; begin += 64) {
++            // Only the final row is needed for the snapshot/continuation. Do
++            // not accumulate a long prompt's output logits on the host.
++            decode_fixed(session.second.get(), batch, vocab, begin, 64, prefill, false);
++        }
++        snapshot.resize(llama_state_get_size(session.second.get()));
++        const size_t written = llama_state_get_data(session.second.get(), snapshot.data(), snapshot.size());
++        require(written > 0 && written <= snapshot.size(), "cannot save 32768-token quota fixture state");
++        snapshot.resize(written);
++        expected = continuation(session.second.get(), batch, vocab, snapshot_tokens);
++    }
++
++    environment_guard setting("WILDLLAMA_KV_CACHE_INITIAL_TOKENS", "256");
++    auto session = create();
++    auto stats = [&] {
++        llama_gpu_memory_stats memory {};
++        require(llama_model_get_gpu_memory_stats(session.first.get(), &memory) && memory.enabled &&
++                memory.limit_bytes == quota_mib*1024*1024, "quota fixture memory policy is not active");
++        return memory;
++    };
++    const auto before = stats();
++    require(before.managed_used_bytes + 65536 < before.limit_bytes, "fixture exhausted its quota before restore blocker");
++    // Existing CUDA metadata and graph buffers are allocated already. Leave
++    // less than one VMM page available so any required new KV page is denied.
++    const size_t blocker_bytes = size_t(before.limit_bytes - before.managed_used_bytes - 1024);
++    ggml_backend_buffer_ptr blocker(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(device), blocker_bytes));
++    require(blocker != nullptr, "cannot allocate restore quota blocker");
++    const auto blocked = stats();
++    require(blocked.managed_used_bytes <= blocked.limit_bytes && blocked.limit_bytes - blocked.managed_used_bytes < 65536,
++            "restore blocker did not leave less than one CUDA VMM page");
++    require(llama_state_set_data(session.second.get(), snapshot.data(), snapshot.size()) == 0,
++            "restore ignored denied KV commitment");
++    require(stats().denied_allocations > blocked.denied_allocations && stats().managed_used_bytes <= blocked.limit_bytes,
++            "restore denial escaped the allocation policy or did not report a denied allocation");
++    blocker.reset();
++    llama_memory_clear(llama_get_memory(session.second.get()), true);
++    require(llama_state_set_data(session.second.get(), snapshot.data(), snapshot.size()) == snapshot.size(),
++            "valid restore did not recover after releasing the quota blocker");
++    require(llama_memory_seq_pos_max(llama_get_memory(session.second.get()), 0) == llama_pos(snapshot_tokens-1),
++            "recovered state restore lost saved positions");
++    batch_owner batch;
++    const auto actual = continuation(session.second.get(), batch, vocab, snapshot_tokens);
++    require_identical(expected, actual, "recovered quota-denied restore changed continuation logits bitwise");
++    std::printf("PASS KV quota_restore quota_mib=%llu context=%u snapshot_tokens=%u initial_tokens=256 continuation=bitwise denied_allocations=%llu\n",
++            (unsigned long long) quota_mib, context, snapshot_tokens, (unsigned long long) stats().denied_allocations);
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) {
++        std::fprintf(stderr, "usage: test-kv-growth dense-llama-fixture.gguf [context8192or65536or131072; default65536]\n");
++        return 2;
++    }
++    std::setvbuf(stdout, nullptr, _IONBF, 0);
++    ggml_backend_load_all();
++    llama_backend_init();
++    try {
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) {
++            std::fprintf(stderr, "SKIP: CUDA unavailable\n");
++            llama_backend_free();
++            return 77;
++        }
++        auto * device = ggml_backend_reg_dev_get(registry, 0);
++        const auto * api = static_cast<const ggml_backend_cuda_kv_growth_api *>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_growth_api"));
++        if (!api || api->version != 1 || !api->granularity || !api->granularity(ggml_backend_dev_buffer_type(device))) {
++            std::fprintf(stderr, "SKIP: CUDA KV growth VMM support unavailable\n");
++            llama_backend_free();
++            return 77;
++        }
++        const size_t page = api->granularity(ggml_backend_dev_buffer_type(device));
++        if (page > 4*1024*1024) {
++            std::fprintf(stderr, "SKIP: tied-wide fixture prefix cannot prove growth with VMM pages above 4 MiB\n");
++            llama_backend_free();
++            return 77;
++        }
++        const auto requested = argc > 2 ? std::stoul(argv[2]) : 65536ul;
++        require(requested == 8192 || requested == 65536 || requested == 131072,
++                "KV integration test context must be 8192, 65536 or 131072");
++        const bool expected_growth = requested >= 65536;
++        std::printf("KV fixture VMM_min_page=%zu requested_context=%lu expected_memory=%s quota_restore_prefix=32768_tokens\n",
++                page, requested, expected_growth ? "strict_saving" : "full_allocation_fallback");
++        const auto reference = evaluate(argv[1], device, false, uint32_t(requested));
++        const auto growing = evaluate(argv[1], device, true, uint32_t(requested));
++        const float prefill_error = compare_logits(reference, growing, reference.prefill, growing.prefill);
++        const float decode_error = compare_logits(reference, growing, reference.decode, growing.decode);
++        const float shift_error = compare_logits(reference, growing, reference.shifted, growing.shifted);
++        if (expected_growth) {
++            require(growing.initial_bytes < reference.initial_bytes, "KV growth allocated the full initial CUDA memory footprint");
++            require(growing.prefill_bytes < reference.prefill_bytes && growing.decode_bytes < reference.decode_bytes &&
++                    growing.restored_bytes < reference.restored_bytes, "KV growth/state restoration lost physical CUDA memory savings");
++        } else {
++            // At 8192 tokens the fixture's logical KV is only 8.5 MiB. Mapping
++            // prefixes plus quantization-padding tails in 2 MiB pages can cost
++            // more; the allocator must fall back to the ordinary full buffer.
++            require(growing.initial_bytes <= reference.initial_bytes && growing.prefill_bytes <= reference.prefill_bytes &&
++                    growing.decode_bytes <= reference.decode_bytes && growing.restored_bytes <= reference.restored_bytes,
++                    "small-context KV fallback used more physical memory than ordinary allocation");
++        }
++        std::printf("PASS KV off/on context=%u tokens=320+16 max_prefill_abs=%.9g max_decode_abs=%.9g max_kshift_abs=%.9g greedy_top1=identical state_replays=bitwise\n",
++                growing.context, prefill_error, decode_error, shift_error);
++        quota_denied_restore(argv[1], device);
++        llama_backend_free();
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        llama_backend_free();
++        return 1;
++    }
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 665be9d..47be244 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6274,7 +6274,15 @@ void server_routes::init_routes() {
+             meta->chat_params,
+             files,
+             session);
+-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
++        json result = {{ "prompt", std::move(data.at("prompt")) }};
++        if (json_value(body, "count_tokens", false) && files.empty() && ctx_server.mctx == nullptr) {
++            // Match text generation's tokenize_input_prompts(..., true, true),
++            // including model-specific BOS and parsing of structural tokens.
++            // Projector runners use process_mtmd_prompt instead; their media
++            // accounting remains outside this text-only extension.
++            result["token_count"] = tokenize_mixed(ctx_server.vocab, result.at("prompt"), true, true).size();
++        }
++        res->ok(result);
+         return res;
+     };
+ 
+diff --git a/tools/server/tests/unit/test_template.py b/tools/server/tests/unit/test_template.py
+index 43a3560..2e265c3 100644
+--- a/tools/server/tests/unit/test_template.py
++++ b/tools/server/tests/unit/test_template.py
+@@ -104,3 +104,24 @@ def test_add_generation_prompt(template_name: str, expected_generation_prompt: s
+         assert expected_generation_prompt in prompt, f"Expected generation prompt ({expected_generation_prompt}) in content ({prompt})"
+     else:
+         assert expected_generation_prompt not in prompt, f"Did not expect generation prompt ({expected_generation_prompt}) in content ({prompt})"
++
++
++@pytest.mark.parametrize("thinking", [False, True])
++def test_apply_template_exact_text_token_count(thinking: bool):
++    server.jinja = True
++    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
++    server.start()
++    body = {
++        "messages": [{"role": "user", "content": "Text with </s> and Unicode: árvore."}],
++        "chat_template_kwargs": {"enable_thinking": thinking},
++    }
++    plain = server.make_request("POST", "/apply-template", data=body)
++    counted = server.make_request("POST", "/apply-template", data={**body, "count_tokens": True})
++    assert plain.status_code == counted.status_code == 200
++    assert "token_count" not in plain.body
++    assert counted.body["prompt"] == plain.body["prompt"]
++    tokenized = server.make_request("POST", "/tokenize", data={
++        "content": counted.body["prompt"], "add_special": True, "parse_special": True,
++    })
++    assert tokenized.status_code == 200
++    assert counted.body["token_count"] == len(tokenized.body["tokens"])

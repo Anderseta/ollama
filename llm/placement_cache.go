@@ -49,6 +49,12 @@ func placementKey(path string, model *gguf.Model, opts api.Options, devices []ml
 }
 
 func ObservedServerVRAM(path string, model *gguf.Model, opts api.Options, devices []ml.DeviceInfo, parallel int, config LlamaServerConfig) (uint64, bool) {
+	if initial, err := api.ResolveKVCacheInitialTokens(opts); err != nil || initial > 0 {
+		// A load-time observation of growing KV is not an upper bound on its
+		// later commitment. Keep admission nominal until native eligibility and
+		// a lifetime resource reservation can be proven by the scheduler.
+		return 0, false
+	}
 	key := placementKey(path, model, opts, devices, parallel, config)
 	placements.Lock()
 	defer placements.Unlock()
@@ -62,6 +68,9 @@ func ObservedServerVRAM(path string, model *gguf.Model, opts api.Options, device
 }
 
 func (s *llamaServerRunner) rememberPlacement() {
+	if initial, err := api.ResolveKVCacheInitialTokens(s.launch.opts); err != nil || initial > 0 {
+		return
+	}
 	if s.launch.numParallel != 1 || s.launch.modelExperts != 0 || len(s.launch.projectors) != 0 || s.launch.draftType != "" || s.launch.forceNoMMProjOffload {
 		return
 	}

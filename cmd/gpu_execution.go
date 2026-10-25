@@ -9,6 +9,15 @@ import (
 )
 
 func configureGPUExecution(cmd *cobra.Command) error {
+	if cmd.Flags().Changed("kv-cache-initial-tokens") {
+		tokens, err := cmd.Flags().GetInt("kv-cache-initial-tokens")
+		if err != nil {
+			return err
+		}
+		if err := os.Setenv("OLLAMA_KV_CACHE_INITIAL_TOKENS", strconv.Itoa(tokens)); err != nil {
+			return err
+		}
+	}
 	if cmd.Flags().Changed("moe-runtime") {
 		enabled, err := cmd.Flags().GetBool("moe-runtime")
 		if err != nil {

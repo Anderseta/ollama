@@ -2418,7 +2418,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime"}})
+		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget"}})
 	})
 	r.GET("/api/activity", s.RuntimeActivityHandler)
 	r.GET("/api/status", s.StatusHandler)
@@ -3594,29 +3594,62 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 
 	lastMsgIdx := len(req.Messages) - 1
 	currMsgIdx := 0
+	starts := promptTruncationStarts(req.Messages)
 	var system []api.Message
+	var previousPrompt string
+	var previousTokenCount int
+	haveTokenCount := false
+	changedSinceRender := true
 
 	for i := 0; i <= lastMsgIdx; i++ {
-		system = system[:0]
-		for j := range i {
-			if req.Messages[j].Role == "system" {
-				system = append(system, req.Messages[j])
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			if req.Messages[i-1].Role == "system" {
+				system = append(system, req.Messages[i-1])
+			} else {
+				changedSinceRender = true
 			}
+		}
+		if !starts[i] {
+			continue
+		}
+		if !changedSinceRender {
+			// Removing only preserved system messages produces the same input.
+			continue
 		}
 
 		renderReq := req
 		renderReq.Messages = append(slices.Clone(system), req.Messages[i:]...)
-		prompt, err := r.ApplyChatTemplate(ctx, renderReq)
-		if err != nil {
-			return nil, err
+		var ctxLen int
+		if counter, ok := r.(interface {
+			ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
+		}); ok {
+			_, count, err := counter.ApplyChatTemplateWithTokenCount(ctx, renderReq)
+			if err != nil {
+				return nil, err
+			}
+			ctxLen = count
+		} else {
+			prompt, err := r.ApplyChatTemplate(ctx, renderReq)
+			if err != nil {
+				return nil, err
+			}
+			// Keep one exact prompt/count during preparation only. Templates can
+			// ignore old turns; avoid repeated tokenization without hashing or
+			// retaining sensitive prompts across requests.
+			if !haveTokenCount || prompt != previousPrompt {
+				tokens, err := r.Tokenize(ctx, prompt)
+				if err != nil {
+					return nil, err
+				}
+				previousPrompt, previousTokenCount = prompt, len(tokens)
+				haveTokenCount = true
+			}
+			ctxLen = previousTokenCount
 		}
-
-		tokens, err := r.Tokenize(ctx, prompt)
-		if err != nil {
-			return nil, err
-		}
-
-		ctxLen := len(tokens)
+		changedSinceRender = false
 		if m != nil && m.ProjectorPaths != nil {
 			for _, msg := range renderReq.Messages {
 				ctxLen += 768 * len(msg.Images)
@@ -3627,10 +3660,9 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 			currMsgIdx = i
 			break
 		}
-		if i == lastMsgIdx {
-			currMsgIdx = lastMsgIdx
-			break
-		}
+		// If the last result belongs to an oversized tool group, retain its
+		// valid owner boundary rather than returning an orphan tool response.
+		currMsgIdx = i
 	}
 
 	if currMsgIdx > 0 {

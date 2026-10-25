@@ -1080,6 +1080,7 @@ func NewLlamaServerRunner(
 		serverEnvs[key] = value
 	}
 	setMOERuntimeEnvironment(serverEnvs, execution.Runtime)
+	setKVCacheInitialEnvironment(serverEnvs, execution.KVCacheInitialTokens)
 	// Only resolved CLI flags carry these policies; clear inherited native aliases
 	// so an explicit API false cannot accidentally re-enable the mode in the child.
 	serverEnvs["LLAMA_ARG_GPU_EXCLUSIVE"] = ""
@@ -1778,8 +1779,9 @@ func (t llamaServerTimings) promptEvalCount() int {
 }
 
 type llamaServerApplyTemplateResponse struct {
-	Prompt string `json:"prompt"`
-	Error  any    `json:"error"`
+	Prompt     string `json:"prompt"`
+	TokenCount *int   `json:"token_count"`
+	Error      any    `json:"error"`
 }
 
 type llamaServerTokenProb struct {
@@ -2119,49 +2121,75 @@ func convertLogprobs(probs []llamaServerTokenProb, includeTop bool) []Logprob {
 }
 
 func (s *llamaServerRunner) ApplyChatTemplate(ctx context.Context, req ChatRequest) (string, error) {
+	response, err := s.applyChatTemplate(ctx, req, false)
+	return response.Prompt, err
+}
+
+// ApplyChatTemplateWithTokenCount sizes the entire rendered text with generation's
+// BOS/special-token policy. Older payloads omit token_count and use /tokenize.
+// Media token accounting remains the caller's separate, model-aware concern.
+func (s *llamaServerRunner) ApplyChatTemplateWithTokenCount(ctx context.Context, req ChatRequest) (string, int, error) {
+	response, err := s.applyChatTemplate(ctx, req, true)
+	if err != nil {
+		return "", 0, err
+	}
+	if response.TokenCount != nil {
+		if *response.TokenCount < 0 {
+			return "", 0, errors.New("llama-server returned a negative template token count")
+		}
+		return response.Prompt, *response.TokenCount, nil
+	}
+	tokens, err := s.tokenize(ctx, response.Prompt, true)
+	return response.Prompt, len(tokens), err
+}
+
+func (s *llamaServerRunner) applyChatTemplate(ctx context.Context, req ChatRequest, countTokens bool) (llamaServerApplyTemplateResponse, error) {
 	data, err := s.llamaServerChatRequest(req, false)
 	if err != nil {
-		return "", err
+		return llamaServerApplyTemplateResponse{}, err
+	}
+	if countTokens {
+		data["count_tokens"] = true
 	}
 
 	body, err := json.Marshal(data)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal chat template request: %v", err)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("failed to marshal chat template request: %v", err)
 	}
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/apply-template", s.port)
 	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("error creating chat template request: %v", err)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("error creating chat template request: %v", err)
 	}
 	serverReq.Header.Set("Content-Type", "application/json")
 
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return "", err
+			return llamaServerApplyTemplateResponse{}, err
 		}
-		return "", fmt.Errorf("llama-server apply-template error: %w", err)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("llama-server apply-template error: %w", err)
 	}
 	defer res.Body.Close()
 
 	bodyBytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed reading llama-server template response: %w", err)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("failed reading llama-server template response: %w", err)
 	}
 	if res.StatusCode >= 400 {
-		return "", api.StatusError{StatusCode: res.StatusCode, ErrorMessage: s.statusErrorMessage(bodyBytes)}
+		return llamaServerApplyTemplateResponse{}, api.StatusError{StatusCode: res.StatusCode, ErrorMessage: s.statusErrorMessage(bodyBytes)}
 	}
 
 	var lsResp llamaServerApplyTemplateResponse
 	if err := json.Unmarshal(bodyBytes, &lsResp); err != nil {
-		return "", fmt.Errorf("error unmarshalling llama-server template response: %v", err)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("error unmarshalling llama-server template response: %v", err)
 	}
 	if lsResp.Error != nil {
-		return "", fmt.Errorf("llama-server template error: %v", lsResp.Error)
+		return llamaServerApplyTemplateResponse{}, fmt.Errorf("llama-server template error: %v", lsResp.Error)
 	}
 
-	return lsResp.Prompt, nil
+	return lsResp, nil
 }
 
 func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(ChatResponse)) error {
@@ -2460,6 +2488,13 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 	if req.Options.SpeculativeAdaptive != nil {
 		body["speculative_adaptive"] = *req.Options.SpeculativeAdaptive
 	}
+	if req.Options.ReasoningBudget != nil {
+		budget := *req.Options.ReasoningBudget
+		if budget < -1 || budget > 2097152 {
+			return nil, fmt.Errorf("reasoning_budget must be between -1 and 2097152")
+		}
+		body["reasoning_budget_tokens"] = budget
+	}
 	if req.Logprobs {
 		body["logprobs"] = true
 		body["top_logprobs"] = max(req.TopLogprobs, 1)
@@ -2495,6 +2530,11 @@ func llamaServerChatTemplateKwargs(think *api.ThinkValue) map[string]any {
 func llamaServerChatMessage(msg Message) (map[string]any, error) {
 	converted := map[string]any{
 		"role": msg.Role,
+	}
+	// Native templates decide which assistant reasoning belongs in the history.
+	// Preserve it separately instead of changing content or thinking policy here.
+	if msg.Role == "assistant" && msg.Thinking != "" {
+		converted["reasoning_content"] = msg.Thinking
 	}
 	if msg.ToolCallID != "" {
 		converted["tool_call_id"] = msg.ToolCallID
@@ -2998,27 +3038,6 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 		vram = total
 	}
 	return total, vram
-}
-
-// PredictServerVRAM estimates VRAM usage for a model without spawning llama-server.
-// Uses model file size as a proxy for weights plus a rough KV cache estimate.
-// This is intentionally conservative — it overestimates to avoid VRAM contention.
-func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
-	weights := modelFileSize(modelPath, f)
-
-	// KV cache: 2 (K+V) * layers * kv_heads * head_dim * context * 2 bytes (f16)
-	layers := f.KV().BlockCount()
-	kvHeads := f.KV().HeadCountKVMin()
-	if kvHeads == 0 {
-		kvHeads = 1
-	}
-	headDim := uint64(0)
-	if f.KV().HeadCountMax() > 0 {
-		headDim = f.KV().EmbeddingLength() / f.KV().HeadCountMax()
-	}
-	kvCache := 2 * layers * kvHeads * headDim * uint64(numCtx) * 2
-
-	return weights + kvCache
 }
 
 // memoryParsingWriter wraps an io.Writer and parses llama-server log output

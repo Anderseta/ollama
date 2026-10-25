@@ -579,6 +579,7 @@ type Options struct {
 	Runner
 	BackendSampling     *bool `json:"backend_sampling,omitempty"`
 	SpeculativeAdaptive *bool `json:"speculative_adaptive,omitempty"`
+	ReasoningBudget     *int  `json:"reasoning_budget,omitempty"`
 
 	// Predict options used at runtime
 	NumKeep          int      `json:"num_keep,omitempty"`
@@ -598,21 +599,22 @@ type Options struct {
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
-	MOERuntime      *bool             `json:"moe_runtime,omitempty"`
-	GPUExclusive    *bool             `json:"gpu_exclusive,omitempty"`
-	GPUDiagnostics  *bool             `json:"gpu_diagnostics,omitempty"`
-	GPUVRAMLimitMiB *int              `json:"gpu_vram_limit_mib,omitempty"`
-	SpeculativeType string            `json:"speculative_type,omitempty"`
-	RunnerEnv       map[string]string `json:"runner_env,omitempty"`
-	NumUbatch       int               `json:"num_ubatch,omitempty"`
-	MoeRAMLimitMiB  *int              `json:"moe_ram_limit_mib,omitempty"`
-	NumCtx          int               `json:"num_ctx,omitempty"`
-	NumBatch        int               `json:"num_batch,omitempty"`
-	NumGPU          int               `json:"num_gpu,omitempty"`
-	MainGPU         *int              `json:"main_gpu,omitempty"`
-	UseMMap         *bool             `json:"use_mmap,omitempty"`
-	NumThread       int               `json:"num_thread,omitempty"`
-	DraftNumPredict int               `json:"draft_num_predict,omitempty"`
+	KVCacheInitialTokens *int              `json:"kv_cache_initial_tokens,omitempty"`
+	MOERuntime           *bool             `json:"moe_runtime,omitempty"`
+	GPUExclusive         *bool             `json:"gpu_exclusive,omitempty"`
+	GPUDiagnostics       *bool             `json:"gpu_diagnostics,omitempty"`
+	GPUVRAMLimitMiB      *int              `json:"gpu_vram_limit_mib,omitempty"`
+	SpeculativeType      string            `json:"speculative_type,omitempty"`
+	RunnerEnv            map[string]string `json:"runner_env,omitempty"`
+	NumUbatch            int               `json:"num_ubatch,omitempty"`
+	MoeRAMLimitMiB       *int              `json:"moe_ram_limit_mib,omitempty"`
+	NumCtx               int               `json:"num_ctx,omitempty"`
+	NumBatch             int               `json:"num_batch,omitempty"`
+	NumGPU               int               `json:"num_gpu,omitempty"`
+	MainGPU              *int              `json:"main_gpu,omitempty"`
+	UseMMap              *bool             `json:"use_mmap,omitempty"`
+	NumThread            int               `json:"num_thread,omitempty"`
+	DraftNumPredict      int               `json:"draft_num_predict,omitempty"`
 }
 
 // SystemOneRequest is the request passed to [Client.SystemOne]. It asks a
@@ -1140,6 +1142,28 @@ func (opts *Options) FromMap(m map[string]any) error {
 	}
 
 	for key, val := range m {
+		if key == "reasoning_budget" && val != nil {
+			var n float64
+			switch value := val.(type) {
+			case int64:
+				n = float64(value)
+			case float64:
+				n = value
+			default:
+				return fmt.Errorf("reasoning_budget must be an integer between -1 and 2097152")
+			}
+			if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) || n < -1 || n > 2097152 {
+				return fmt.Errorf("reasoning_budget must be an integer between -1 and 2097152")
+			}
+		}
+		if key == "kv_cache_initial_tokens" && val != nil {
+			n, err := parseKVCacheInitialTokensOption(val)
+			if err != nil {
+				return err
+			}
+			opts.KVCacheInitialTokens = &n
+			continue
+		}
 		if key == "speculative_type" && val != nil {
 			value, ok := val.(string)
 			if !ok || !slices.Contains([]string{"", "auto", "none", "draft-mtp", "draft-eagle3", "ngram-simple", "ngram-mod", "ngram-cache"}, value) {

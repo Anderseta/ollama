@@ -70,6 +70,10 @@ func setMOERuntimeEnvironment(environment map[string]string, enabled bool) {
 	}
 }
 
+func setKVCacheInitialEnvironment(environment map[string]string, tokens int) {
+	environment["WILDLLAMA_KV_CACHE_INITIAL_TOKENS"] = strconv.Itoa(tokens)
+}
+
 func appendGPUExecutionArgs(params []string, opts api.Options) ([]string, error) {
 	cfg, err := api.ResolveGPUExecution(opts)
 	if err != nil {

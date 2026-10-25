@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated runner-cold/warm Flash benchmark; never changes the production store.
+"""Isolated runner-cold/warm GGUF benchmark; never changes the production store.
 
 Preparation copies only the executable/native payload and small metadata. Model
 blobs are hard links on the same volume, never copies. Run as a normal Python
@@ -220,7 +220,7 @@ def prepare(source, payload, lab):
     (lab / "gpu-first-lab.json").write_text(json.dumps(marker, indent=2), encoding="utf8")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--payload", type=Path, required=True)
     parser.add_argument("--lab-root", type=Path, required=True)
@@ -234,6 +234,13 @@ def main():
     parser.add_argument("--predict", type=int, default=8)
     parser.add_argument("--prompt", default="Responda apenas OK.")
     parser.add_argument("--context", type=int, default=131072)
+    parser.add_argument("--model-mode", choices=("moe", "dense"), default="moe")
+    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--ubatch", type=int)
+    parser.add_argument("--dense-opt", choices=(0, 1), type=int, default=0)
+    parser.add_argument("--dense-trace", action="store_true",
+                        help="Diagnostic CUDA path logging; keep disabled for timed comparisons")
+    parser.add_argument("--kv-cache-initial-tokens", type=int, default=0)
     parser.add_argument("--moe-ram-mib", type=int, default=6144)
     parser.add_argument("--moe-gpu-cache-mib", type=int, default=1024)
     parser.add_argument("--fit-margin-mib", type=int, default=4096)
@@ -248,7 +255,9 @@ def main():
     parser.add_argument("--hold-seconds", type=float, default=0,
                         help="Keep the successful model loaded for observation after all timed requests")
     parser.add_argument("--free-ram-guard-gib", type=float, default=4)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.ubatch is None:
+        args.ubatch = 128 if args.model_mode == "dense" else 32
     payload, lab = args.payload.resolve(), args.lab_root.resolve()
     output = args.output.resolve()
     if args.port in (11434, 11446, 11447) or not 1024 <= args.port <= 65535:
@@ -257,6 +266,10 @@ def main():
         raise ValueError("Invalid report label")
     if args.rounds < 1 or args.predict < 1:
         raise ValueError("Positive rounds and prediction length required")
+    if args.context < 4 or args.batch < 1 or not 1 <= args.ubatch <= args.batch:
+        raise ValueError("Context >=4 and 1 <= ubatch <= batch required")
+    if args.kv_cache_initial_tokens != 0 and not 256 <= args.kv_cache_initial_tokens <= 2097152:
+        raise ValueError("KV initial commitment must be 0 or 256..2097152 tokens")
     if not 0 <= args.hold_seconds <= 60:
         raise ValueError("Observation hold must be between 0 and 60 seconds")
     if args.prepare_from:
@@ -277,7 +290,7 @@ def main():
     if report_file.exists() or log_file.exists():
         raise ValueError("Refusing to overwrite benchmark results; select another label")
     binary = payload / "ollama.exe"
-    if args.gpu_exclusive or args.gpu_diagnostics or args.gpu_vram_limit_mib or args.moe_runtime:
+    if args.gpu_exclusive or args.gpu_diagnostics or args.gpu_vram_limit_mib or args.moe_runtime or args.kv_cache_initial_tokens:
         # Older API servers can ignore unknown JSON options. Require the new
         # executable flags so a legacy run cannot be mislabeled GPU-exclusive.
         help_text = run_output([str(binary), "serve", "--help"])
@@ -288,6 +301,8 @@ def main():
             required.append("--gpu-vram-limit-mib")
         if args.moe_runtime:
             required.append("--moe-runtime")
+        if args.kv_cache_initial_tokens:
+            required.append("--kv-cache-initial-tokens")
         if any(flag not in help_text for flag in required):
             raise ValueError("This payload does not advertise the requested GPU-first options")
     report = {"label": args.label, "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -306,7 +321,7 @@ def main():
     def save():
         report_file.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf8")
     save()
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("OLLAMA_", "LLAMA_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("OLLAMA_", "LLAMA_", "WILDLLAMA_"))}
     paths = {"USERPROFILE": lab / "home", "HOME": lab / "home", "OLLAMA_MODELS": lab / "models",
              "LOCALAPPDATA": lab / "home/AppData/Local", "APPDATA": lab / "home/AppData/Roaming",
              "TEMP": lab / "runtime/temp", "TMP": lab / "runtime/temp", "TMPDIR": lab / "runtime/temp",
@@ -322,16 +337,27 @@ def main():
                 "LLAMA_ARG_LAZY_MODE": "on", "LLAMA_ARG_CPU_MOE": "1",
                 "LLAMA_ARG_MOE_CACHE_MIB": str(args.moe_gpu_cache_mib), "LLAMA_ARG_N_GPU_LAYERS": "auto",
                 "LLAMA_ARG_FIT": "on", "LLAMA_ARG_FIT_TARGET": str(args.fit_margin_mib),
-                "LLAMA_ARG_BATCH": "512", "LLAMA_ARG_UBATCH": "32",
+                "LLAMA_ARG_BATCH": str(args.batch), "LLAMA_ARG_UBATCH": str(args.ubatch),
                 "LLAMA_ARG_OVERRIDE_TENSOR": "per_layer_token_embd=CPU", "PYTHONDONTWRITEBYTECODE": "1"})
+    if args.model_mode == "dense":
+        for key in tuple(env):
+            if (key.startswith(("OLLAMA_", "LLAMA_")) and "MOE" in key) or key == "LLAMA_ARG_OVERRIDE_TENSOR":
+                env.pop(key)
+        env.update({"LLAMA_ARG_FIT": "off", "LLAMA_ARG_LOAD_MODE": "none", "LLAMA_ARG_LAZY_MODE": "off",
+                    "LLAMA_ARG_CACHE_RAM": "8192"})
     if args.gpu_exclusive:
         # Strict mode rejects explicit CPU tensor placement and explicit partial offload.
-        env.pop("LLAMA_ARG_OVERRIDE_TENSOR")
+        env.pop("LLAMA_ARG_OVERRIDE_TENSOR", None)
         env["LLAMA_ARG_N_GPU_LAYERS"] = "all"
-    env["OLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
-    env["WILDLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
-    env["WILDLLAMA_MOE_DYNAMIC_PREFILL"] = "1" if args.moe_dynamic_prefill else "0"
-    env["WILDLLAMA_MOE_CACHE_AUTO"] = "0" if args.fixed_expert_cache else "1"
+    if args.model_mode == "moe":
+        env["OLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
+        env["WILDLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
+        env["WILDLLAMA_MOE_DYNAMIC_PREFILL"] = "1" if args.moe_dynamic_prefill else "0"
+        env["WILDLLAMA_MOE_CACHE_AUTO"] = "0" if args.fixed_expert_cache else "1"
+    env["GGML_CUDA_DENSE_OPT"] = str(args.dense_opt)
+    env["GGML_CUDA_DENSE_TRACE"] = "1" if args.dense_trace else "0"
+    env["OLLAMA_KV_CACHE_INITIAL_TOKENS"] = str(args.kv_cache_initial_tokens)
+    env["WILDLLAMA_KV_CACHE_INITIAL_TOKENS"] = str(args.kv_cache_initial_tokens)
     if args.expert_trace_path:
         trace_path = args.expert_trace_path.resolve()
         if trace_path.exists():
@@ -342,7 +368,8 @@ def main():
         env.pop("WILDLLAMA_EXPERT_TRACE", None)
     if args.graph_input_debug:
         env["LLAMA_GRAPH_INPUT_DEBUG"] = "1"
-    report["runner_environment"] = {k: v for k, v in env.items() if k.startswith(("OLLAMA_", "LLAMA_", "WILDLLAMA_"))}
+    report["runner_environment"] = {k: v for k, v in env.items()
+        if k.startswith(("OLLAMA_", "LLAMA_", "WILDLLAMA_")) or k in ("GGML_CUDA_DENSE_OPT", "GGML_CUDA_DENSE_TRACE")}
     report["manifest_sha256"] = {str(p.relative_to(lab / "models")): sha256(p)
         for directory in ("manifests", "manifests-v2")
         for p in sorted((lab / "models" / directory).rglob("*")) if p.is_file()}
@@ -436,6 +463,12 @@ def main():
                 try:
                     with api("/api/version", timeout=2) as response:
                         report["version"] = json.load(response)
+                    if args.model_mode == "dense":
+                        required = {"runner_env", "num_ubatch"}
+                        if args.kv_cache_initial_tokens:
+                            required.add("kv_cache_initial_tokens")
+                        if not required.issubset(report["version"].get("capabilities", [])):
+                            raise ValueError("Dense payload lacks required API options; refusing a silently mismatched benchmark")
                     break
                 except OSError:
                     time.sleep(.2)
@@ -446,6 +479,17 @@ def main():
                 options = {"num_ctx": args.context, "num_batch": 0, "moe_ram_limit_mib": args.moe_ram_mib,
                            "num_predict": args.predict, "temperature": 0, "seed": 42,
                            "moe_runtime": args.moe_runtime}
+                if args.model_mode == "dense":
+                    options = {"num_ctx": args.context, "num_batch": args.batch, "num_ubatch": args.ubatch,
+                               "num_gpu": -1, "use_mmap": False, "num_predict": args.predict,
+                               "temperature": 0, "seed": 42, "repeat_penalty": 1,
+                               "presence_penalty": 0, "frequency_penalty": 0,
+                               "kv_cache_initial_tokens": args.kv_cache_initial_tokens,
+                               "runner_env": {key: env[key] for key in (
+                                   "OLLAMA_NUM_PARALLEL", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE",
+                                   "LLAMA_ARG_FIT", "LLAMA_ARG_LOAD_MODE", "LLAMA_ARG_LAZY_MODE",
+                                   "LLAMA_ARG_CACHE_RAM", "LLAMA_ARG_BATCH", "LLAMA_ARG_UBATCH",
+                                   "LLAMA_ARG_N_GPU_LAYERS")}}
                 if args.gpu_exclusive:
                     options.update(gpu_exclusive=True, gpu_vram_limit_mib=args.gpu_vram_limit_mib)
                 elif args.gpu_vram_limit_mib:
@@ -492,6 +536,10 @@ def main():
                 print(json.dumps({k: v for k, v in result.items() if k not in ("request", "final", "text", "thinking")}), flush=True)
                 with api("/api/ps") as response:
                     report["loaded_models"] = json.load(response)
+                if args.model_mode == "dense":
+                    loaded = report["loaded_models"].get("models", [])
+                    if len(loaded) != 1 or loaded[0].get("context_length") != args.context:
+                        raise RuntimeError("Dense benchmark context/model changed; results cannot be compared")
             report["ok"] = True
             if args.hold_seconds:
                 report["observation_hold_started_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()

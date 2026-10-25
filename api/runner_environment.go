@@ -35,7 +35,7 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			choices = "|auto|mmap|none|dio"
 		case "LLAMA_ARG_LAZY_MODE", "LLAMA_ARG_FIT", "LLAMA_ARG_FLASH_ATTN":
 			choices = "|auto|on|off"
-		case "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_NO_WARMUP", "OLLAMA_FLASH_ATTENTION", "LLAMA_ARG_GPU_EXCLUSIVE", "LLAMA_ARG_GPU_DIAGNOSTICS", "WILDLLAMA_MOE_RUNTIME":
+		case "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_NO_WARMUP", "OLLAMA_FLASH_ATTENTION", "LLAMA_ARG_GPU_EXCLUSIVE", "LLAMA_ARG_GPU_DIAGNOSTICS", "WILDLLAMA_MOE_RUNTIME", "GGML_CUDA_DENSE_OPT":
 			choices = "|0|1"
 		case "OLLAMA_KV_CACHE_TYPE", "LLAMA_ARG_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_V":
 			choices = "|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl"

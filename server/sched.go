@@ -639,19 +639,27 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			}
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+			estimate := llm.EstimateServerVRAM(req.model.ModelPath, f, req.opts, numParallel)
+			predicted := estimate.Total()
+			req.contextShift = resolveContextShift(req.shift, req.model)
+			config := llamaServerConfigForModel(req.model)
+			config.ContextShift = req.contextShift
+			// An exact prior signature is useful before placement as well as
+			// preflight. Never borrow observations from a different context,
+			// batch, device, draft or mmap policy.
+			placementPrediction := predicted
+			if observed, ok := llm.ObservedServerVRAM(req.model.ModelPath, f, req.opts, gpus, numParallel, config); ok {
+				placementPrediction = observed
+			}
+			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, placementPrediction, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttentionForOptions(loadGpus, req.opts)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
 			launchOpts.NumBatch = req.opts.NumBatch
 			var batchMemory uint64
 			launchOpts.NumBatch, batchMemory = llm.LlamaServerBatch(f, launchOpts, completion)
-			predictedForLoad := predicted + batchMemory
+			predictedForLoad := saturatingMemorySum(predicted, batchMemory)
 			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
-			req.contextShift = resolveContextShift(req.shift, req.model)
-			config := llamaServerConfigForModel(req.model)
-			config.ContextShift = req.contextShift
 			if observed, ok := llm.ObservedServerVRAM(req.model.ModelPath, f, launchOpts, loadGpus, numParallel, config); ok {
 				predictedForLoad = observed
 			}
@@ -666,6 +674,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					slog.Info("llama-server model predicted to exceed available memory, evicting",
 						"predicted", format.HumanBytes2(predictedForLoad),
 						"predicted_num_ctx", predictedCtx,
+						"predicted_kv", format.HumanBytes2(estimate.KV),
+						"predicted_recurrent", format.HumanBytes2(estimate.Recurrent),
+						"predicted_auxiliary", format.HumanBytes2(estimate.Auxiliary),
 						"num_batch", launchOpts.NumBatch,
 						"available", format.HumanBytes2(freeMemory),
 						"gpu_free", format.HumanBytes2(gpuFreeMemory),
@@ -905,7 +916,9 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
 
 	req.opts.NumCtx = newNumCtx
 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictionOpts := launchOpts
+	predictionOpts.NumCtx = req.opts.NumCtx
+	predictedVRAM := llm.EstimateServerVRAM(req.model.ModelPath, f, predictionOpts, numParallel).Total()
 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttentionForOptions(gpus, req.opts), gpus)
 	newNumBatch = req.opts.NumBatch
@@ -921,7 +934,18 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
 }
 
 func effectiveLlamaServerContext(numCtx int, f *gguf.Model, numParallel int) int {
-	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
+	context, parallel := effectiveModelContext(numCtx, f), max(numParallel, 1)
+	if context > math.MaxInt/parallel {
+		return math.MaxInt
+	}
+	return context * parallel
+}
+
+func saturatingMemorySum(a, b uint64) uint64 {
+	if b > math.MaxUint64-a {
+		return math.MaxUint64
+	}
+	return a + b
 }
 
 const (
@@ -1257,8 +1281,9 @@ func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api
 		launchOpts.UseMMap = req.opts.UseMMap
 		return launchOpts
 	}
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictionOpts := launchOpts
+	predictionOpts.NumCtx = req.opts.NumCtx
+	predictedVRAM := llm.EstimateServerVRAM(req.model.ModelPath, f, predictionOpts, numParallel).Total()
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 
 	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
@@ -1321,8 +1346,9 @@ func allDevicesLibrary(gpus []ml.DeviceInfo, library string) bool {
 func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) {
 	modelSize := modelFileSize(req.model.modelPaths()...)
 	loadedMmapSize := s.loadedMmapModelSizeLocked()
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictionOpts := launchOpts
+	predictionOpts.NumCtx = req.opts.NumCtx
+	predictedVRAM := llm.EstimateServerVRAM(req.model.ModelPath, f, predictionOpts, numParallel).Total()
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	placementGpus := gpusForPlacement(gpus, launchOpts)
 

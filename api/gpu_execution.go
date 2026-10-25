@@ -10,16 +10,22 @@ import (
 // GPUExecutionConfig is the effective opt-in native execution policy.
 // VRAMLimitMiB limits this runner's native allocations, not other GPU processes.
 type GPUExecutionConfig struct {
-	Runtime      bool
-	Exclusive    bool
-	Diagnostics  bool
-	VRAMLimitMiB int
+	KVCacheInitialTokens int
+	Runtime              bool
+	Exclusive            bool
+	Diagnostics          bool
+	VRAMLimitMiB         int
 }
 
 // ResolveGPUExecution retains explicit false and zero overrides. A cleared
 // runner environment value removes the inherited native setting.
 func ResolveGPUExecution(opts Options) (GPUExecutionConfig, error) {
 	var cfg GPUExecutionConfig
+	var err error
+	cfg.KVCacheInitialTokens, err = ResolveKVCacheInitialTokens(opts)
+	if err != nil {
+		return cfg, err
+	}
 	if opts.MOERuntime != nil {
 		cfg.Runtime = *opts.MOERuntime
 	} else {
@@ -88,6 +94,9 @@ func gpuExecutionEnv(opts Options, server, native string) string {
 // Ordinary requests keep their nil defaults for compatibility with old options.
 func NormalizeGPUExecution(opts Options) (Options, GPUExecutionConfig, error) {
 	cfg, err := ResolveGPUExecution(opts)
+	if err == nil && cfg.KVCacheInitialTokens > 0 {
+		opts.KVCacheInitialTokens = &cfg.KVCacheInitialTokens
+	}
 	if err == nil && cfg.Runtime {
 		opts.MOERuntime = &cfg.Runtime
 	}
