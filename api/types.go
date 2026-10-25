@@ -561,13 +561,16 @@ type DebugInfo struct {
 }
 
 type Metrics struct {
-	TotalDuration         time.Duration `json:"total_duration,omitempty"`
-	LoadDuration          time.Duration `json:"load_duration,omitempty"`
-	PromptEvalCount       int           `json:"prompt_eval_count,omitempty"`
-	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration `json:"prompt_eval_duration,omitempty"`
-	EvalCount             int           `json:"eval_count,omitempty"`
-	EvalDuration          time.Duration `json:"eval_duration,omitempty"`
+	// GPUFirst contains optional native diagnostics. Shared counters can include
+	// concurrent requests; the payload reports its scope and lifetime peaks.
+	GPUFirst              json.RawMessage `json:"gpu_first,omitempty"`
+	TotalDuration         time.Duration   `json:"total_duration,omitempty"`
+	LoadDuration          time.Duration   `json:"load_duration,omitempty"`
+	PromptEvalCount       int             `json:"prompt_eval_count,omitempty"`
+	PromptEvalCachedCount *int            `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration    time.Duration   `json:"prompt_eval_duration,omitempty"`
+	EvalCount             int             `json:"eval_count,omitempty"`
+	EvalDuration          time.Duration   `json:"eval_duration,omitempty"`
 }
 
 // Options specified in [GenerateRequest].  If you add a new option here, also
@@ -595,6 +598,9 @@ type Options struct {
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
+	GPUExclusive    *bool             `json:"gpu_exclusive,omitempty"`
+	GPUDiagnostics  *bool             `json:"gpu_diagnostics,omitempty"`
+	GPUVRAMLimitMiB *int              `json:"gpu_vram_limit_mib,omitempty"`
 	SpeculativeType string            `json:"speculative_type,omitempty"`
 	RunnerEnv       map[string]string `json:"runner_env,omitempty"`
 	NumUbatch       int               `json:"num_ubatch,omitempty"`
@@ -1175,7 +1181,7 @@ func (opts *Options) FromMap(m map[string]any) error {
 			if val == nil {
 				continue
 			}
-			if key == "moe_ram_limit_mib" {
+			if key == "moe_ram_limit_mib" || key == "gpu_vram_limit_mib" {
 				var limit float64
 				switch n := val.(type) {
 				case int64:

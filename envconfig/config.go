@@ -274,7 +274,10 @@ func Uint(key string, defaultValue uint) func() uint {
 
 var (
 	// NumParallel sets the number of parallel model requests. NumParallel can be configured via the OLLAMA_NUM_PARALLEL environment variable.
-	NumParallel = Uint("OLLAMA_NUM_PARALLEL", 1)
+	NumParallel     = Uint("OLLAMA_NUM_PARALLEL", 1)
+	GPUExclusive    = Bool("OLLAMA_GPU_EXCLUSIVE")
+	GPUDiagnostics  = Bool("OLLAMA_GPU_DIAGNOSTICS")
+	GPUVRAMLimitMiB = Uint64("OLLAMA_GPU_VRAM_LIMIT_MIB", 0)
 	// MaxRunners sets the maximum number of loaded models. MaxRunners can be configured via the OLLAMA_MAX_LOADED_MODELS environment variable.
 	MaxRunners = Uint("OLLAMA_MAX_LOADED_MODELS", 0)
 	// MaxQueue sets the maximum number of queued requests. MaxQueue can be configured via the OLLAMA_MAX_QUEUE environment variable.
@@ -318,6 +321,9 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_FLASH_ATTENTION":      {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":        {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
 		"OLLAMA_MOE_RAM_LIMIT_MIB":    {"OLLAMA_MOE_RAM_LIMIT_MIB", Var("OLLAMA_MOE_RAM_LIMIT_MIB"), "Locked host model-weight budget for MoE GGUFs (MiB); excludes KV and compute, 0 disables"},
+		"OLLAMA_GPU_EXCLUSIVE":        {"OLLAMA_GPU_EXCLUSIVE", Var("OLLAMA_GPU_EXCLUSIVE"), "Require native CUDA inference without CPU compute fallback (default false)"},
+		"OLLAMA_GPU_DIAGNOSTICS":      {"OLLAMA_GPU_DIAGNOSTICS", Var("OLLAMA_GPU_DIAGNOSTICS"), "Enable detailed native GPU execution diagnostics (default false)"},
+		"OLLAMA_GPU_VRAM_LIMIT_MIB":   {"OLLAMA_GPU_VRAM_LIMIT_MIB", Var("OLLAMA_GPU_VRAM_LIMIT_MIB"), "GPU-exclusive runner allocation budget in MiB; 0 uses available VRAM"},
 		"OLLAMA_GPU_OVERHEAD":         {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_IGPU_ENABLE":          {"OLLAMA_IGPU_ENABLE", String("OLLAMA_IGPU_ENABLE")(), "Enable integrated GPUs"},
 		"LLAMA_ARG_FIT":               {"LLAMA_ARG_FIT", String("LLAMA_ARG_FIT")(), "Enable llama.cpp automatic fit of unset memory options (default \"on\")"},

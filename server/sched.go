@@ -211,6 +211,24 @@ func effectiveContext(numCtx, trainCtx int) int {
 }
 
 func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+	var policy api.GPUExecutionConfig
+	var policyErr error
+	opts, policy, policyErr = api.NormalizeGPUExecution(opts)
+	if policyErr == nil && policy.Exclusive {
+		switch {
+		case m.IsMLX():
+			policyErr = errors.New("gpu_exclusive requires a GGUF CUDA runner; MLX is not supported")
+		case opts.NumCtx < 4:
+			policyErr = errors.New("gpu_exclusive requires num_ctx >= 4; context will not be silently increased")
+		case m.CheckCapabilities(model.CapabilityVision) == nil && opts.NumCtx < 2048:
+			policyErr = errors.New("gpu_exclusive vision models require num_ctx >= 2048; context will not be silently increased")
+		}
+	}
+	if policyErr != nil {
+		successCh, errCh := make(chan *runnerRef, 1), make(chan error, 1)
+		errCh <- policyErr
+		return successCh, errCh
+	}
 	if opts.NumCtx < 4 {
 		opts.NumCtx = 4
 	}
@@ -541,6 +559,21 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
 	loadStarted := time.Now()
+	var policy api.GPUExecutionConfig
+	var policyErr error
+	req.opts, policy, policyErr = api.NormalizeGPUExecution(req.opts)
+	if policyErr == nil && policy.Exclusive {
+		if req.model.IsMLX() {
+			policyErr = errors.New("gpu_exclusive requires a GGUF CUDA runner; MLX is not supported")
+		} else {
+			gpus = slices.DeleteFunc(slices.Clone(gpus), func(device ml.DeviceInfo) bool { return !strings.EqualFold(device.Library, "CUDA") })
+			policyErr = llm.ValidateGPUExecution(req.opts, gpus, 0)
+		}
+	}
+	if policyErr != nil {
+		req.errCh <- policyErr
+		return false
+	}
 	numParallel := max(int(envconfig.NumParallel()), 1)
 	if value := req.opts.RunnerEnv["OLLAMA_NUM_PARALLEL"]; value != "" {
 		if n, err := strconv.Atoi(value); err == nil && n > 0 && n <= 64 {
@@ -583,6 +616,18 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				s.loadedMu.Unlock()
 				return false
 			}
+			if policy.Exclusive {
+				if validationErr := llm.ValidateGPUExecution(req.opts, gpus, f.KV().BlockCount()+1); validationErr != nil {
+					req.errCh <- validationErr
+					s.loadedMu.Unlock()
+					return false
+				}
+				if trainContext := int(f.KV().ContextLength()); trainContext > 0 && req.opts.NumCtx > trainContext {
+					req.errCh <- fmt.Errorf("gpu_exclusive requested num_ctx=%d above model training context %d; context will not be silently reduced", req.opts.NumCtx, trainContext)
+					s.loadedMu.Unlock()
+					return false
+				}
+			}
 			if !completion && f.KV().Has("pooling_type") && !f.KV().Bool("attention.causal", true) {
 				numParallel = 8
 				if value := os.Getenv("OLLAMA_EMBEDDING_MAX_SEQUENCES"); value != "" {
@@ -613,7 +658,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// Pre-flight check: estimate whether the model fits in remaining memory.
 			// llama-server auto-detects layers based on available VRAM, so if
 			// we predict it won't fit, evict before spawning.
-			if requireFull && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(loadGpus) > 0 {
+			if requireFull && !policy.Exclusive && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(loadGpus) > 0 {
 				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 				// Use 80% of free memory as threshold to leave headroom.
 				if predictedForLoad > freeMemory*80/100 {
@@ -831,6 +876,9 @@ iGPUScan:
 }
 
 func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int, completion bool, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, launchOpts api.Options) (oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch int, ok bool) {
+	if policy, err := api.ResolveGPUExecution(req.opts); err != nil || policy.Exclusive {
+		return 0, 0, 0, 0, 0, false
+	}
 	if !req.numCtxAuto {
 		return 0, 0, 0, 0, 0, false
 	}
@@ -1194,6 +1242,15 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
 }
 
 func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
+	if policy, err := api.ResolveGPUExecution(req.opts); err == nil && policy.Exclusive {
+		if req.opts.UseMMap == nil {
+			enabled := true
+			req.opts.UseMMap = &enabled
+			req.useMMapAuto = true
+		}
+		launchOpts.UseMMap = req.opts.UseMMap
+		return launchOpts
+	}
 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)

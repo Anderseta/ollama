@@ -35,7 +35,7 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			choices = "|auto|mmap|none|dio"
 		case "LLAMA_ARG_LAZY_MODE", "LLAMA_ARG_FIT", "LLAMA_ARG_FLASH_ATTN":
 			choices = "|auto|on|off"
-		case "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_NO_WARMUP", "OLLAMA_FLASH_ATTENTION":
+		case "LLAMA_ARG_CPU_MOE", "LLAMA_ARG_NO_WARMUP", "OLLAMA_FLASH_ATTENTION", "LLAMA_ARG_GPU_EXCLUSIVE", "LLAMA_ARG_GPU_DIAGNOSTICS":
 			choices = "|0|1"
 		case "OLLAMA_KV_CACHE_TYPE", "LLAMA_ARG_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_V":
 			choices = "|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl"
@@ -55,7 +55,7 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			continue
 		case "LLAMA_ARG_OVERRIDE_TENSOR":
 			continue
-		case "LLAMA_ARG_N_CPU_MOE", "LLAMA_ARG_MOE_CACHE_MIB", "LLAMA_ARG_CACHE_RAM", "LLAMA_ARG_MOE_RAM_LIMIT_MIB":
+		case "LLAMA_ARG_N_CPU_MOE", "LLAMA_ARG_MOE_CACHE_MIB", "LLAMA_ARG_CACHE_RAM", "LLAMA_ARG_MOE_RAM_LIMIT_MIB", "LLAMA_ARG_GPU_VRAM_LIMIT_MIB":
 		case "LLAMA_ARG_BATCH", "LLAMA_ARG_UBATCH":
 			if value != "" {
 				if err := runnerInteger(key, value, 1, 2097152); err != nil {
@@ -83,7 +83,7 @@ func ParseRunnerEnvironment(value any) (map[string]string, error) {
 			}
 		} else if value != "" {
 			maximum := int64(2097152)
-			if key == "LLAMA_ARG_MOE_RAM_LIMIT_MIB" {
+			if key == "LLAMA_ARG_MOE_RAM_LIMIT_MIB" || key == "LLAMA_ARG_GPU_VRAM_LIMIT_MIB" {
 				maximum--
 			}
 			if err := runnerInteger(key, value, 0, maximum); err != nil {

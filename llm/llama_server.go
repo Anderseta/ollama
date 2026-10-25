@@ -409,16 +409,9 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	if err != nil {
 		return nil, 0, err
 	}
-	params, err = appendWarmupArgs(params)
+	params, err = appendRunnerWarmupArgs(params, launch.opts)
 	if err != nil {
 		return nil, 0, err
-	}
-	if value, exists := launch.opts.RunnerEnv["LLAMA_ARG_NO_WARMUP"]; exists {
-		if value == "1" {
-			params = append(params, "--no-warmup")
-		} else {
-			params = append(params, "--warmup")
-		}
 	}
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
@@ -468,6 +461,10 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 
 	params = appendMainGPUArgs(params, launch.opts)
+	params, err = appendGPUExecutionArgs(params, launch.opts)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
 
@@ -776,6 +773,9 @@ func (launch llamaServerLaunchConfig) mmprojOffloadDisabled() (bool, string) {
 }
 
 func (launch llamaServerLaunchConfig) requiresMMProjGPUOffload() bool {
+	if launch.opts.GPUExclusive != nil && *launch.opts.GPUExclusive {
+		return true
+	}
 	// Gemma3n's MobileNetV5 projector silently produces corrupted image
 	// embeddings when it runs on the CPU backend, so keep it on the GPU
 	// whenever one is in play.
@@ -982,6 +982,14 @@ func NewLlamaServerRunner(
 		}
 		opts.RunnerEnv = validated
 	}
+	var err error
+	opts, _, err = api.NormalizeGPUExecution(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateGPUExecution(opts, gpus, f.KV().BlockCount()+1); err != nil {
+		return nil, err
+	}
 	// Check if this is an embedding model
 	arch := f.KV().Architecture()
 	isEmbedding := f.KV().Has("pooling_type")
@@ -1065,6 +1073,11 @@ func NewLlamaServerRunner(
 	for key, value := range opts.RunnerEnv {
 		serverEnvs[key] = value
 	}
+	// Only resolved CLI flags carry these policies; clear inherited native aliases
+	// so an explicit API false cannot accidentally re-enable the mode in the child.
+	serverEnvs["LLAMA_ARG_GPU_EXCLUSIVE"] = ""
+	serverEnvs["LLAMA_ARG_GPU_VRAM_LIMIT_MIB"] = ""
+	serverEnvs["LLAMA_ARG_GPU_DIAGNOSTICS"] = ""
 	if value, exists := opts.RunnerEnv["OLLAMA_KV_CACHE_TYPE"]; exists {
 		kvCacheType = value
 	}
@@ -1254,6 +1267,9 @@ func (s *llamaServerRunner) retryWithMMProjCPUOffload(loadErr error) (bool, erro
 }
 
 func (s *llamaServerRunner) shouldRetryMMProjCPUOffload(err error) bool {
+	if s.launch.opts.GPUExclusive != nil && *s.launch.opts.GPUExclusive {
+		return false
+	}
 	if err == nil || s.mmprojOffloadOOMRetried || !IsOutOfMemory(err) || len(s.launch.projectors) == 0 {
 		return false
 	}
@@ -1737,11 +1753,12 @@ type llamaServerChatResponse struct {
 }
 
 type llamaServerTimings struct {
-	CacheN    *int    `json:"cache_n"`
-	PromptN   int     `json:"prompt_n"`
-	PromptMS  float64 `json:"prompt_ms"`
-	PredictN  int     `json:"predicted_n"`
-	PredictMS float64 `json:"predicted_ms"`
+	GPUFirst  json.RawMessage `json:"gpu_first,omitempty"`
+	CacheN    *int            `json:"cache_n"`
+	PromptN   int             `json:"prompt_n"`
+	PromptMS  float64         `json:"prompt_ms"`
+	PredictN  int             `json:"predicted_n"`
+	PredictMS float64         `json:"predicted_ms"`
 }
 
 func (t llamaServerTimings) promptEvalCount() int {
@@ -1976,6 +1993,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					PromptEvalDuration:    time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond)),
 					EvalCount:             lsResp.Timings.PredictN,
 					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
+					GPUFirst:              lsResp.Timings.GPUFirst,
 				}
 				hasFinalResp = true
 			}
@@ -2279,6 +2297,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.PromptEvalDuration = time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond))
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
+				resp.GPUFirst = lsResp.Timings.GPUFirst
 				toolCalls, err := accumulatedToolCalls(toolCalls)
 				if err != nil {
 					return err

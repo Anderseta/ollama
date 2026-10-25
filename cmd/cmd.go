@@ -2263,6 +2263,9 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 }
 
 func RunServer(cmd *cobra.Command, _ []string) error {
+	if err := configureGPUExecution(cmd); err != nil {
+		return err
+	}
 	if cmd.Flags().Changed("moe-ram-limit-mib") {
 		limit, err := cmd.Flags().GetInt("moe-ram-limit-mib")
 		if err != nil {
@@ -2671,6 +2674,9 @@ func NewCLI() *cobra.Command {
 	}
 
 	serveCmd.Flags().Int("moe-ram-limit-mib", 0, "Maximum RAM for resident MoE model weights in MiB; excludes KV and buffers (0 disables)")
+	serveCmd.Flags().Bool("gpu-exclusive", false, "Require CUDA inference; unsupported operations fail instead of using CPU compute")
+	serveCmd.Flags().Bool("gpu-diagnostics", false, "Enable detailed native GPU execution diagnostics")
+	serveCmd.Flags().Int("gpu-vram-limit-mib", 0, "GPU-exclusive native allocation budget in MiB (0 uses available VRAM)")
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",

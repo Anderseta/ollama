@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -115,6 +116,11 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	// Verify the requested context size is <= the model training size
 	trainCtx := f.KV().ContextLength()
 	if opts.NumCtx > int(trainCtx) && trainCtx > 0 {
+		if policy, err := api.ResolveGPUExecution(opts); err != nil {
+			return nil, err
+		} else if policy.Exclusive {
+			return nil, fmt.Errorf("gpu_exclusive requested num_ctx=%d above model training context %d; context will not be silently reduced", opts.NumCtx, trainCtx)
+		}
 		slog.Warn("requested context size too large for model", "num_ctx", opts.NumCtx, "n_ctx_train", trainCtx)
 		opts.NumCtx = int(trainCtx)
 	}
@@ -243,15 +249,16 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	Message               api.Message   `json:"message"`
-	DoneReason            DoneReason    `json:"done_reason"`
-	Done                  bool          `json:"done"`
-	PromptEvalCount       int           `json:"prompt_eval_count"`
-	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration `json:"prompt_eval_duration"`
-	EvalCount             int           `json:"eval_count"`
-	EvalDuration          time.Duration `json:"eval_duration"`
-	Logprobs              []Logprob     `json:"logprobs,omitempty"`
+	GPUFirst              json.RawMessage `json:"gpu_first,omitempty"`
+	Message               api.Message     `json:"message"`
+	DoneReason            DoneReason      `json:"done_reason"`
+	Done                  bool            `json:"done"`
+	PromptEvalCount       int             `json:"prompt_eval_count"`
+	PromptEvalCachedCount *int            `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration    time.Duration   `json:"prompt_eval_duration"`
+	EvalCount             int             `json:"eval_count"`
+	EvalDuration          time.Duration   `json:"eval_duration"`
+	Logprobs              []Logprob       `json:"logprobs,omitempty"`
 }
 
 // DoneReason represents the reason why a completion response is done
@@ -287,14 +294,15 @@ type Logprob struct {
 }
 
 type CompletionResponse struct {
-	Content               string        `json:"content"`
-	DoneReason            DoneReason    `json:"done_reason"`
-	Done                  bool          `json:"done"`
-	PromptEvalCount       int           `json:"prompt_eval_count"`
-	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration `json:"prompt_eval_duration"`
-	EvalCount             int           `json:"eval_count"`
-	EvalDuration          time.Duration `json:"eval_duration"`
+	GPUFirst              json.RawMessage `json:"gpu_first,omitempty"`
+	Content               string          `json:"content"`
+	DoneReason            DoneReason      `json:"done_reason"`
+	Done                  bool            `json:"done"`
+	PromptEvalCount       int             `json:"prompt_eval_count"`
+	PromptEvalCachedCount *int            `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration    time.Duration   `json:"prompt_eval_duration"`
+	EvalCount             int             `json:"eval_count"`
+	EvalDuration          time.Duration   `json:"eval_duration"`
 
 	// Logprobs contains log probability information if requested
 	Logprobs []Logprob `json:"logprobs,omitempty"`
