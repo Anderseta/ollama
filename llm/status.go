@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -12,7 +13,10 @@ type StatusWriter struct {
 	out io.Writer
 	// Subprocess wrappers may wire both stdout and stderr to the same
 	// StatusWriter, and os/exec serializes Write calls in that case.
-	lastErrMsg atomic.Value
+	lastErrMsg   atomic.Value
+	activityMu   sync.Mutex
+	activityTail []byte
+	activity     RuntimeActivity
 }
 
 const maxCapturedErrorBytes = 8 * 1024
@@ -153,6 +157,7 @@ func lastNonEmptyLine(msg string) string {
 }
 
 func (w *StatusWriter) Write(b []byte) (int, error) {
+	w.observeActivity(b)
 	for _, raw := range bytes.Split(b, []byte{'\n'}) {
 		line := strings.TrimRight(string(raw), " \t\r")
 		if line == "" {

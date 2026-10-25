@@ -1078,6 +1078,7 @@ func NewLlamaServerRunner(
 	serverEnvs["LLAMA_ARG_GPU_EXCLUSIVE"] = ""
 	serverEnvs["LLAMA_ARG_GPU_VRAM_LIMIT_MIB"] = ""
 	serverEnvs["LLAMA_ARG_GPU_DIAGNOSTICS"] = ""
+	serverEnvs["WILDLLAMA_ACTIVITY"] = "1"
 	if value, exists := opts.RunnerEnv["OLLAMA_KV_CACHE_TYPE"]; exists {
 		kvCacheType = value
 	}
@@ -1528,6 +1529,7 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 		case ServerStatusReady:
 			if s.status != nil {
 				s.status.SetLastError("")
+				s.status.setActivityPhase("ready")
 			}
 			slog.Info(fmt.Sprintf("llama-server started in %0.2f seconds", time.Since(s.loadStart).Seconds()))
 			return nil

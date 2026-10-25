@@ -74,8 +74,9 @@ type Scheduler struct {
 	// including by evicting one or more other models. We can only load
 	// one model at a time but new requests to models that already loaded can
 	// happen in parallel
-	activeLoading llm.LlamaServer
-	loaded        map[string]*runnerRef
+	activeLoading  llm.LlamaServer
+	activeActivity *runnerActivityEntry
+	loaded         map[string]*runnerRef
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
@@ -704,6 +705,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		}
 
 		s.activeLoading = llama
+		s.activeActivity = newRunnerActivity(req.model, llama, launchOpts)
 	} else {
 		wantPath := req.model.ModelPath
 		if wantPath == "" {
@@ -741,6 +743,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				slog.Info("model is too large for system memory", "requireFull", requireFull)
 				s.activeLoading.Close()
 				s.activeLoading = nil
+				s.activeActivity = nil
 				req.errCh <- err
 				return false
 			}
@@ -750,6 +753,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		slog.Info("Load failed", "model", req.model.ModelPath, "error", err)
 		s.activeLoading.Close()
 		s.activeLoading = nil
+		s.activeActivity = nil
 
 		s.loadedMu.Lock()
 		loadedCount := len(s.loaded)
@@ -819,6 +823,7 @@ iGPUScan:
 		gpus:            gpuIDs,
 		discreteGPUs:    discreteGPUs,
 		runner:          runnerName,
+		activity:        newRunnerActivity(req.model, llama, req.opts),
 		totalSize:       totalSize,
 		vramSize:        vramSize,
 		loading:         true,
@@ -842,6 +847,7 @@ iGPUScan:
 		oldRunner.refMu.Unlock()
 	}
 	s.activeLoading = nil
+	s.activeActivity = nil
 	s.loaded[runner.modelKey] = runner
 	slog.Info("loaded runners", "count", len(s.loaded))
 	s.loadedMu.Unlock()
@@ -1455,6 +1461,7 @@ func (s *Scheduler) updateFreeSpace(allGpus []ml.DeviceInfo) {
 
 // TODO consolidate sched_types.go
 type runnerRef struct {
+	activity     *runnerActivityEntry // immutable; readable without the load/unload lock
 	lastUsed     time.Time
 	loadDuration time.Duration
 	useCount     uint64
@@ -1858,6 +1865,7 @@ func (s *Scheduler) unloadAllRunners() {
 		slog.Debug("shutting down currently loading runner")
 		s.activeLoading.Close()
 		s.activeLoading = nil
+		s.activeActivity = nil
 	}
 
 	for model, runner := range s.loaded {

@@ -1,0 +1,282 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 418368f..4a4781d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ #include "llama-model-ram.h"
+ #include "llama-gpu-layer-diagnostics.h"
++#include "llama-runtime-activity.h"
+ #include <algorithm>
+ 
+ #include "ggml.h"
+@@ -193,6 +194,7 @@ llama_context::llama_context(
+     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
++    llama_runtime_activity::phase("context");
+ 
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+@@ -2931,6 +2933,13 @@ ggml_status llama_context::graph_compute(
+             return ask ? cache->needs_prepare(node) : cache->prepare(node);
+         }, model.ram_cache.get());
+     }
++    llama_runtime_activity::scope activity("compute");
++    if (llama_runtime_activity::cuda_snapshot_due()) {
++        llama_gpu_memory_stats memory {};
++        if (llama_model_get_gpu_memory_stats(&model, &memory) && memory.enabled) {
++            llama_runtime_activity::cuda(memory.managed_used_bytes, memory.limit_bytes);
++        }
++    }
+     ggml_status status;
+     std::unique_ptr<llama_gpu_layer_diagnostics::frame> diagnostic_frame;
+     if (model.gpu_diagnostics()) {
+@@ -2961,6 +2970,10 @@ ggml_status llama_context::graph_compute(
+     if (model.ram_cache) {
+         ggml_backend_sched_synchronize(sched.get());
+         model.ram_cache->report();
++        if (llama_runtime_activity::enabled()) {
++            const auto stats = model.ram_cache->stats(weight_guard);
++            llama_runtime_activity::ram(stats.resident, stats.limit, stats.bytes_read, stats.h2d_bytes);
++        }
+     }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+index ad78518..8b1dd70 100644
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-model-ram.h"
+ #include "llama-impl.h"
++#include "llama-runtime-activity.h"
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+ 
+@@ -438,6 +439,8 @@ struct llama_model_ram_cache::impl {
+             } else { ++misses; missing += page_size; }
+         }
+         if (!missing) { return; }
++        llama_runtime_activity::scope activity("reading_weights");
++        llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
+         while (missing > limit - resident) { evict(missing - (limit - resident)); }
+         allowance(resident + missing);
+         std::sort(needed.begin(), needed.end(), [](page * a, page * b) {
+@@ -492,6 +495,7 @@ struct llama_model_ram_cache::impl {
+                 const size_t got = requests[head].finish();
+                 elapsed(start, io_wait_us);
+                 bytes_read += got;
++                llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
+                 if (got < job.prefix + job.size) { throw std::runtime_error("MoE RAM cache: truncated queued GGUF read"); }
+                 start = clock();
+                 memcpy(job.dst, staging + head*(io_chunk + alignment) + job.prefix, job.size);
+@@ -724,6 +728,7 @@ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector
+     const bool device = std::any_of(copies.begin(), copies.end(), [](const llama_model_ram_copy & copy) {
+         return device_tensor(copy.dst);
+     });
++    llama_runtime_activity::scope activity(device ? "uploading_weights" : "compute", llama_runtime_activity::layer(copies.front().src->name));
+     const int64_t start = device ? p.clock() : 0;
+     // No cache mutation until all transfers finish; the caller holds acquire().
+     struct upload_guard {
+@@ -769,6 +774,7 @@ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector
+     p.synchronize(backend, device);
+     guard.backend = nullptr;
+     p.elapsed(start, p.h2d_us);
++    llama_runtime_activity::ram(p.resident, p.limit, p.bytes_read, p.h2d_bytes);
+     return true;
+ }
+ bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size) {
+@@ -787,6 +793,7 @@ bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src
+         std::vector<impl::page *> needed;
+         p.range(needed, src, checked_add(src_offset, done), n);
+         p.ensure(needed);
++        llama_runtime_activity::scope activity(device ? "uploading_weights" : "compute", llama_runtime_activity::layer(src->name));
+         const int64_t start = device ? p.clock() : 0;
+         ggml_backend_tensor_set(dst, (const uint8_t *) src->data + src_offset + done, dst_offset + done, n);
+         p.uploaded(device, n);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 561d9f0..34bc781 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-moe-cache.h"
++#include "llama-runtime-activity.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -654,9 +655,12 @@ struct llama_moe_cache::impl {
+             }
+         }
+         ids.resize(ggml_nelements(sel));
++        {
++        llama_runtime_activity::scope activity("routing", llama_runtime_activity::layer(b.weight->name));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         // Also protects bank slots and host maps from reuse before the previous tile completes.
+         ggml_backend_synchronize(backend);
++        }
+         for (int32_t id : ids) {
+             if (id < 0 || id >= b.weight->ne[2]) { throw std::runtime_error("gpu-exclusive: invalid selected expert ID"); }
+         }
+diff --git a/src/llama-runtime-activity.h b/src/llama-runtime-activity.h
+new file mode 100644
+index 0000000..11548c4
+--- /dev/null
++++ b/src/llama-runtime-activity.h
+@@ -0,0 +1,100 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <string>
++
++// Lightweight progress is separate from gpu_diagnostics: no graph barriers,
++// CUDA events, tensor readbacks or cache locks are added for the UI.
++namespace llama_runtime_activity {
++inline bool enabled() {
++    static const bool value = [] { const char * env = std::getenv("WILDLLAMA_ACTIVITY"); return env && std::string(env) == "1"; }();
++    return value;
++}
++
++inline void phase(const char * name, double progress = -1, int64_t processed = -1,
++                  int64_t total = -1, int64_t generated = -1, double rate = -1,
++                  const char * stage = "") {
++    if (!enabled()) { return; }
++    static std::mutex mutex;
++    static std::string previous;
++    static int64_t last = 0;
++    std::lock_guard<std::mutex> guard(mutex);
++    const int64_t now = ggml_time_us();
++    const std::string key = std::string(name) + stage;
++    if (key == previous && now - last < 250000 && progress != 1) { return; }
++    previous = key; last = now;
++    char data[768];
++    size_t at = std::snprintf(data, sizeof(data), "wildllama_activity {\"kind\":\"phase\",\"phase\":\"%s\",\"stage\":\"%s\"", name, stage);
++    auto append = [&](const char * format, auto... args) {
++        if (at >= sizeof(data)) { return; }
++        const int n = std::snprintf(data+at,sizeof(data)-at,format,args...);
++        at = n < 0 ? sizeof(data) : at + size_t(n);
++    };
++    if (progress >= 0 && std::isfinite(progress)) { append(",\"progress\":%.6f",std::min(1.0,progress)); }
++    if (processed >= 0) { append(",\"prompt_processed\":%lld",(long long) processed); }
++    if (total >= 0) { append(",\"prompt_total\":%lld",(long long) total); }
++    if (generated >= 0) { append(",\"generated_tokens\":%lld",(long long) generated); }
++    if (rate >= 0 && std::isfinite(rate)) { append(",\"tokens_per_second\":%.6g",rate); }
++    if (at >= sizeof(data)) { return; }
++    std::fprintf(stderr,"%s}\n",data);
++}
++
++struct scope;
++struct operation_state { const scope * visible = nullptr; scope * current = nullptr; int64_t last = 0; };
++inline operation_state & operations() { static thread_local operation_state state; return state; }
++struct scope {
++    scope * parent = nullptr;
++    const char * name;
++    int layer;
++    explicit scope(const char * name, int layer = -1) : name(name), layer(layer) {
++        if (!enabled()) { return; }
++        auto & state = operations(); parent = state.current; state.current = this;
++        if (this->layer < 0 && parent) { this->layer = parent->layer; }
++        const int64_t now = ggml_time_us();
++        if (now - state.last >= 250000) { publish(this, now); }
++    }
++    static void publish(const scope * current, int64_t now) {
++        auto & state = operations(); state.visible = current; state.last = now;
++        std::fprintf(stderr,"wildllama_activity {\"kind\":\"operation\",\"name\":\"%s\",\"layer\":%d}\n",
++                     current ? current->name : "compute", current ? current->layer : -1);
++    }
++    ~scope() {
++        if (!enabled()) { return; }
++        auto & state = operations(); state.current = parent;
++        // A published sub-operation must never remain displayed after it ends.
++        if (state.visible == this) { publish(parent, ggml_time_us()); }
++    }
++    scope(const scope &) = delete;
++    scope & operator=(const scope &) = delete;
++};
++
++inline int layer(const char * tensor_name) {
++    int result = -1;
++    return std::sscanf(tensor_name,"blk.%d.",&result) == 1 ? result : -1;
++}
++
++inline void ram(uint64_t used, uint64_t limit, uint64_t ssd, uint64_t h2d) {
++    if (!enabled()) { return; }
++    static thread_local int64_t last = 0;
++    const int64_t now = ggml_time_us(); if (now - last < 250000) { return; } last = now;
++    std::fprintf(stderr,"wildllama_activity {\"kind\":\"memory\",\"stage\":\"ram\",\"memory\":{\"ram_bytes\":%llu,\"ram_limit_bytes\":%llu,\"ssd_bytes\":%llu,\"h2d_bytes\":%llu}}\n",
++                 (unsigned long long) used,(unsigned long long) limit,(unsigned long long) ssd,(unsigned long long) h2d);
++}
++inline bool cuda_snapshot_due() {
++    if (!enabled()) { return false; }
++    static thread_local int64_t last = 0;
++    const int64_t now = ggml_time_us(); if (now - last < 250000) { return false; } last = now;
++    return true;
++}
++inline void cuda(uint64_t used, uint64_t limit) {
++    if (!enabled()) { return; }
++    std::fprintf(stderr,"wildllama_activity {\"kind\":\"memory\",\"stage\":\"cuda\",\"memory\":{\"vram_bytes\":%llu,\"vram_limit_bytes\":%llu}}\n",
++                 (unsigned long long) used,(unsigned long long) limit);
++}
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ac3d976..041674a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6,6 +6,7 @@
+ #include "server-common.h"
+ #include "server-decision.h"
+ #include "server-gpu-diagnostics.h"
++#include "../../src/llama-runtime-activity.h"
+ #include "server-http.h"
+ #include "server-task.h"
+ #include "server-queue.h"
+@@ -709,6 +710,7 @@ struct server_slot {
+     }
+ 
+     void print_timings_tg() {
++        llama_runtime_activity::phase("generating", -1, -1, -1, stats.n_gen, stats.n_gen_tps());
+         if (stats.n_gen < 100) {
+             return;
+         }
+@@ -1166,6 +1168,7 @@ private:
+     };
+     static bool load_progress_callback(float progress, void * user_data) {
+         auto * d = static_cast<load_progress_data *>(user_data);
++        llama_runtime_activity::phase("loading", progress, -1, -1, -1, -1, d->stage.c_str());
+         GGML_ASSERT(d);
+         // always emit the first and final sample; throttle the rest to one per 200ms
+         {
+@@ -1526,6 +1529,9 @@ private:
+             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+             slot.callback_on_release = [this](int id_slot) {
++                if (std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
++                    llama_runtime_activity::phase("ready");
++                }
+                 queue_tasks.pop_deferred_task(id_slot);
+             };
+ 
+@@ -2004,6 +2010,7 @@ private:
+             return false;
+         }
+ 
++        llama_runtime_activity::phase("prefill", 0, 0, slot.task->n_tokens());
+         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
+         if (params_base.gpu_diagnostics) {
+             slot.gpu_before.capture(model_tgt, ctx_tgt);
+@@ -4732,6 +4739,9 @@ private:
+         iterate(slots, [&](server_slot & slot) {
+             // optionally send prompt processing progress
+             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
++                const int64_t total = slot.task->n_tokens();
++                const int64_t processed = slot.prompt.n_tokens();
++                llama_runtime_activity::phase("prefill", total > 0 ? double(processed)/total : 1, processed, total);
+                 if (slot.task->params.stream && slot.task->params.return_progress) {
+                     send_partial_response(slot, {}, true);
+                 }
