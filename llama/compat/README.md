@@ -32,6 +32,9 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
 - `004-gpu-first-moe.patch` - opt-in CUDA execution enforcement, bounded expert
   tiling, selective token rows, CUDA allocation quotas and optional diagnostics.
   See `docs/gpu-first-moe-inference.md` and the memory-validation document.
+- `005-live-runtime-activity.patch` - sampled load, context, generation and
+  weight-transfer observations for the optional HTTP activity endpoint.
+  See `docs/runtime-activity.md` for protocol and memory-counter scopes.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under

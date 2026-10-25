@@ -225,7 +225,7 @@ index 0000000..11548c4
 +}
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index ac3d976..041674a 100644
+index ac3d976..665be9d 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -6,6 +6,7 @@
@@ -244,14 +244,14 @@ index ac3d976..041674a 100644
          if (stats.n_gen < 100) {
              return;
          }
-@@ -1166,6 +1168,7 @@ private:
-     };
+@@ -1167,6 +1169,7 @@ private:
      static bool load_progress_callback(float progress, void * user_data) {
          auto * d = static_cast<load_progress_data *>(user_data);
-+        llama_runtime_activity::phase("loading", progress, -1, -1, -1, -1, d->stage.c_str());
          GGML_ASSERT(d);
++        llama_runtime_activity::phase("loading", progress, -1, -1, -1, -1, d->stage.c_str());
          // always emit the first and final sample; throttle the rest to one per 200ms
          {
+             auto & t_last = d->t_last_load_progress_ms;
 @@ -1526,6 +1529,9 @@ private:
              SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
  
@@ -262,14 +262,14 @@ index ac3d976..041674a 100644
                  queue_tasks.pop_deferred_task(id_slot);
              };
  
-@@ -2004,6 +2010,7 @@ private:
-             return false;
-         }
+@@ -2073,6 +2079,7 @@ private:
+         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
  
+         slot.task = std::make_unique<const server_task>(std::move(task));
 +        llama_runtime_activity::phase("prefill", 0, 0, slot.task->n_tokens());
-         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
-         if (params_base.gpu_diagnostics) {
-             slot.gpu_before.capture(model_tgt, ctx_tgt);
+ 
+         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
+             slot.state = SLOT_STATE_PROCESSING_PROMPT;
 @@ -4732,6 +4739,9 @@ private:
          iterate(slots, [&](server_slot & slot) {
              // optionally send prompt processing progress
