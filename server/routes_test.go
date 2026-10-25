@@ -853,7 +853,7 @@ func TestRoutes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("failed to read response body: %v", err)
 				}
-				expectedBody := fmt.Sprintf(`{"capabilities":["runner_env","num_ubatch","embedding_batch","gpu_exclusive","gpu_vram_limit_mib","gpu_diagnostics","live_activity"],"version":"%s"}`, version.Version)
+				expectedBody := fmt.Sprintf(`{"capabilities":["runner_env","num_ubatch","embedding_batch","gpu_exclusive","gpu_vram_limit_mib","gpu_diagnostics","live_activity","moe_runtime"],"version":"%s"}`, version.Version)
 				if string(body) != expectedBody {
 					t.Errorf("expected body %s, got %s", expectedBody, string(body))
 				}

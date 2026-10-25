@@ -1,0 +1,3368 @@
+diff --git a/ggml/include/ggml-cuda-host-op.h b/ggml/include/ggml-cuda-host-op.h
+new file mode 100644
+index 0000000..e6e7147
+--- /dev/null
++++ b/ggml/include/ggml-cuda-host-op.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// A runtime-only CUDA provider attached to an existing GGML_OP_CUSTOM node.
++// The normal custom-op fields remain valid, including its fail-closed CPU
++// function. The provider receives ready device inputs and must complete its
++// output (or establish its own parent-stream dependency) before returning.
++typedef bool (*ggml_backend_cuda_host_op_callback)(ggml_backend_dev_t device, struct ggml_tensor * node,
++                                                  void * data0, void * data1);
++
++// Optional CUDA registry extension named "ggml_backend_cuda_host_op_api".
++// Its proc address points directly to this versioned table.
++struct ggml_backend_cuda_host_op_api {
++    uint32_t version;
++    bool (*set)(struct ggml_tensor * node, ggml_backend_cuda_host_op_callback callback, void * data0, void * data1);
++    bool (*supports)(const struct ggml_tensor * node);
++};
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/include/ggml-cuda-upload.h b/ggml/include/ggml-cuda-upload.h
+new file mode 100644
+index 0000000..6782840
+--- /dev/null
++++ b/ggml/include/ggml-cuda-upload.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Optional registry extension named "ggml_backend_cuda_upload_api". Its proc
++// address is a pointer to this versioned table, not a callable function. Calls
++// on a queue must be serialized by its owner. Sources must be pinned and remain
++// unchanged until their recorded slot completes or synchronize() succeeds.
++struct ggml_backend_cuda_upload_api {
++    uint32_t version;
++    void * (*create)(ggml_backend_t backend);
++    void   (*free)(void * queue);
++    // Fence previously submitted consumers before overwriting device ranges.
++    bool (*begin)(void * queue, ggml_backend_t backend);
++    bool (*copy)(void * queue, struct ggml_tensor * tensor, const void * source, size_t offset, size_t size);
++    bool (*record)(void * queue, unsigned slot);
++    bool (*wait_host)(void * queue, unsigned slot);
++    // Make subsequently submitted compute wait for the completed uploads.
++    bool (*end)(void * queue, ggml_backend_t backend);
++    // Drain uploads and close an unfinished batch, including I/O-error cleanup.
++    bool (*synchronize)(void * queue);
++};
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 23789f5..6d8906b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1982,6 +1982,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
++    const char * runtime = getenv("WILDLLAMA_MOE_RUNTIME");
++    const bool async_prepare = runtime && strcmp(runtime, "1") == 0;
+ 
+     int prev_backend_id = -1;
+ 
+@@ -2050,8 +2052,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     return ec;
+                 }
+ 
+-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+-                ggml_backend_synchronize(split_backend);
++                // A real preparation synchronizes before it mutates host data.
++                // Only an evaluation callback requesting results needs the
++                // post-view host barrier; otherwise retain backend stream order.
++                if (!async_prepare || need) {
++                    ggml_backend_synchronize(split_backend);
++                }
+ 
+                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                     break;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 04921af..7cef587 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1,4 +1,6 @@
+ #include "ggml-cuda.h"
++#include "ggml-cuda-upload.h"
++#include "ggml-cuda-host-op.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
+@@ -81,6 +83,8 @@
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
++#include <exception>
+ #include <cfloat>
+ #include <initializer_list>
+ #include <limits>
+@@ -2412,8 +2416,72 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++struct ggml_cuda_host_op_params {
++    uint64_t magic;
++    ggml_backend_cuda_host_op_callback callback;
++    void * data0;
++    void * data1;
++};
++static constexpr uint64_t ggml_cuda_host_op_magic = UINT64_C(0x574c4c414d414f50);
++static_assert(sizeof(ggml_custom_op_params) + sizeof(ggml_cuda_host_op_params) <= GGML_MAX_OP_PARAMS,
++              "CUDA provider metadata does not fit custom op parameters");
++
++static bool ggml_cuda_host_op_enabled() {
++    const char * env = std::getenv("WILDLLAMA_MOE_RUNTIME");
++    return env && std::strcmp(env, "1") == 0;
++}
++
++static bool ggml_cuda_host_op_get(const ggml_tensor * node, ggml_cuda_host_op_params & params) {
++    if (!node || node->op != GGML_OP_CUSTOM) { return false; }
++    memcpy(&params, reinterpret_cast<const char *>(node->op_params) + sizeof(ggml_custom_op_params), sizeof(params));
++    return params.magic == ggml_cuda_host_op_magic && params.callback;
++}
++
++static bool ggml_cuda_host_op_set(ggml_tensor * node, ggml_backend_cuda_host_op_callback callback, void * data0, void * data1) {
++    if (!node || node->op != GGML_OP_CUSTOM || !callback || !ggml_cuda_host_op_enabled()) { return false; }
++    ggml_custom_op_params cpu;
++    memcpy(&cpu, node->op_params, sizeof(cpu));
++    if (!cpu.fun) { return false; }
++    const ggml_cuda_host_op_params params { ggml_cuda_host_op_magic, callback, data0, data1 };
++    memcpy(reinterpret_cast<char *>(node->op_params) + sizeof(ggml_custom_op_params), &params, sizeof(params));
++    return true;
++}
++
++static bool ggml_cuda_host_op_supports(const ggml_tensor * node) {
++    ggml_cuda_host_op_params params;
++    return ggml_cuda_host_op_get(node, params) && ggml_cuda_host_op_enabled();
++}
++
++static bool ggml_cuda_host_op_compute(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
++    ggml_cuda_host_op_params params;
++    if (!ggml_cuda_host_op_get(node, params) || !ggml_cuda_host_op_enabled()) { return false; }
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    auto * device = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), ctx.device);
++    bool success = false;
++    try {
++        success = params.callback(device, node, params.data0, params.data1);
++    } catch (const std::exception & error) {
++        GGML_LOG_ERROR("%s: CUDA host provider failed: %s\n", __func__, error.what());
++    } catch (...) {
++        GGML_LOG_ERROR("%s: CUDA host provider threw an unknown exception\n", __func__);
++    }
++    ggml_cuda_set_device(ctx.device);
++    return success;
++}
++
++static const ggml_backend_cuda_host_op_api ggml_cuda_host_op_api = {
++    1, ggml_cuda_host_op_set, ggml_cuda_host_op_supports,
++};
++#endif
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        case GGML_OP_CUSTOM:
++            if (!ggml_cuda_host_op_compute(ctx, dst)) { return false; }
++            break;
++#endif
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+             break;
+@@ -2805,6 +2873,128 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++struct ggml_cuda_upload_queue {
++    int device;
++    cudaStream_t stream = nullptr;
++    cudaEvent_t reusable = nullptr;
++    cudaEvent_t ready = nullptr;
++    cudaEvent_t sources[2] = { nullptr, nullptr };
++    bool recorded[2] = { false, false };
++    bool active = false;
++    bool failed = false;
++
++    explicit ggml_cuda_upload_queue(int device) : device(device) {}
++
++    bool result(cudaError_t status) {
++        failed |= status != cudaSuccess;
++        return !failed;
++    }
++
++    ~ggml_cuda_upload_queue() {
++        ggml_cuda_set_device(device);
++        // Draining precedes the owner's pinned-source buffer destruction,
++        // including when construction, a copy or a later operation failed.
++        if (stream) { cudaStreamSynchronize(stream); }
++        for (auto event : sources) { if (event) { cudaEventDestroy(event); } }
++        if (ready) { cudaEventDestroy(ready); }
++        if (reusable) { cudaEventDestroy(reusable); }
++        if (stream) { cudaStreamDestroy(stream); }
++    }
++};
++
++static void * ggml_cuda_upload_create(ggml_backend_t backend) {
++    if (!backend || !ggml_backend_is_cuda(backend)) { return nullptr; }
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    std::unique_ptr<ggml_cuda_upload_queue> queue(new (std::nothrow) ggml_cuda_upload_queue(ctx->device));
++    if (!queue) { return nullptr; }
++    ggml_cuda_set_device(queue->device);
++    if (!queue->result(cudaStreamCreateWithFlags(&queue->stream, cudaStreamNonBlocking)) ||
++        !queue->result(cudaEventCreateWithFlags(&queue->reusable, cudaEventDisableTiming)) ||
++        !queue->result(cudaEventCreateWithFlags(&queue->ready, cudaEventDisableTiming))) { return nullptr; }
++    for (auto & event : queue->sources) {
++        if (!queue->result(cudaEventCreateWithFlags(&event, cudaEventDisableTiming))) { return nullptr; }
++    }
++    return queue.release();
++}
++
++static void ggml_cuda_upload_free(void * data) {
++    delete static_cast<ggml_cuda_upload_queue *>(data);
++}
++
++static bool ggml_cuda_upload_begin(void * data, ggml_backend_t backend) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue || queue->failed || queue->active || !backend || !ggml_backend_is_cuda(backend)) { return false; }
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (ctx->device != queue->device) { return false; }
++    ggml_cuda_set_device(queue->device);
++    cudaStreamCaptureStatus capture;
++    if (!queue->result(cudaStreamIsCapturing(ctx->stream(), &capture)) || capture != cudaStreamCaptureStatusNone) { return false; }
++    if (!queue->result(cudaEventRecord(queue->reusable, ctx->stream())) ||
++        !queue->result(cudaStreamWaitEvent(queue->stream, queue->reusable, 0))) { return false; }
++    queue->active = true;
++    return true;
++}
++
++static bool ggml_cuda_upload_copy(void * data, ggml_tensor * tensor, const void * source, size_t offset, size_t size) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue || queue->failed || !queue->active || !tensor || !tensor->data || (!source && size)) { return false; }
++    const size_t bytes = ggml_nbytes(tensor);
++    if (offset > bytes || size > bytes - offset) { return false; }
++    auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(queue->device)) { return false; }
++    if (!size) { return true; }
++    ggml_cuda_set_device(queue->device);
++    return queue->result(cudaMemcpyAsync(static_cast<char *>(tensor->data) + offset, source, size,
++                                        cudaMemcpyHostToDevice, queue->stream));
++}
++
++static bool ggml_cuda_upload_record(void * data, unsigned slot) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue || queue->failed || !queue->active || slot >= 2) { return false; }
++    ggml_cuda_set_device(queue->device);
++    if (!queue->result(cudaEventRecord(queue->sources[slot], queue->stream))) { return false; }
++    queue->recorded[slot] = true;
++    return true;
++}
++
++static bool ggml_cuda_upload_wait_host(void * data, unsigned slot) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue || queue->failed || slot >= 2) { return false; }
++    if (!queue->recorded[slot]) { return true; }
++    ggml_cuda_set_device(queue->device);
++    return queue->result(cudaEventSynchronize(queue->sources[slot]));
++}
++
++static bool ggml_cuda_upload_end(void * data, ggml_backend_t backend) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue || queue->failed || !queue->active || !backend || !ggml_backend_is_cuda(backend)) { return false; }
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (ctx->device != queue->device) { return false; }
++    ggml_cuda_set_device(queue->device);
++    if (!queue->result(cudaEventRecord(queue->ready, queue->stream)) ||
++        !queue->result(cudaStreamWaitEvent(ctx->stream(), queue->ready, 0))) { return false; }
++    queue->active = false;
++    return true;
++}
++
++static bool ggml_cuda_upload_synchronize(void * data) {
++    auto * queue = static_cast<ggml_cuda_upload_queue *>(data);
++    if (!queue) { return false; }
++    ggml_cuda_set_device(queue->device);
++    if (!queue->result(cudaStreamSynchronize(queue->stream))) { return false; }
++    // A host-side I/O failure can abandon a batch before end(). Draining its
++    // uploads releases all source borrows and makes a later retry well-defined.
++    queue->active = false;
++    return true;
++}
++
++static const ggml_backend_cuda_upload_api ggml_cuda_upload_api = {
++    1, ggml_cuda_upload_create, ggml_cuda_upload_free, ggml_cuda_upload_begin, ggml_cuda_upload_copy,
++    ggml_cuda_upload_record, ggml_cuda_upload_wait_host, ggml_cuda_upload_end, ggml_cuda_upload_synchronize,
++};
++#endif
++
+ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+@@ -2922,6 +3112,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+ 
++        if (node->op == GGML_OP_CUSTOM) { return false; }
++
+         if (ggml_cuda_is_view_or_noop(node)) {
+             continue;
+         }
+@@ -4788,7 +4980,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
+-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -4976,6 +5168,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
++                    if (node->op == GGML_OP_CUSTOM) { return false; }
+                 }
+                 GGML_ASSERT(ok);
+ 
+@@ -5015,6 +5208,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         graph_evaluated_or_captured = true;
+ #endif  // USE_CUDA_GRAPH
+     }
++    return true;
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+@@ -5139,6 +5333,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i]->op == GGML_OP_CUSTOM) {
++            cuda_ctx->curr_stream_no = 0;
++            cuda_ctx->stream_context().reset();
++            break;
++        }
++    }
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+@@ -5198,10 +5399,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+     }
+ 
+-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
++    const bool success = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+     if (timing) { timing->end(timing_slot, cuda_ctx->stream()); }
+ 
+-    return GGML_STATUS_SUCCESS;
++    return success ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+ }
+ 
+ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+@@ -5232,6 +5433,15 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    bool has_host_provider = false;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i]->op == GGML_OP_CUSTOM) {
++            cuda_ctx->stream_context().reset();
++            has_host_provider = true;
++            break;
++        }
++    }
++
+     const bool disable_fusion = ggml_cuda_fusion_disabled();
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
+@@ -5344,9 +5554,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+ 
+ #ifdef USE_CUDA_GRAPH
+     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
++    const bool use_cuda_graph = !has_host_provider && ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ #else
+     const bool use_cuda_graph = false;
++    GGML_UNUSED(has_host_provider);
+     GGML_UNUSED(cuda_ctx);
+     GGML_UNUSED(cgraph);
+ #endif
+@@ -5940,6 +6151,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+     }
+ 
+     switch (op->op) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        case GGML_OP_CUSTOM:
++            return ggml_cuda_host_op_supports(op);
++#endif
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+                 case GGML_UNARY_OP_ABS:
+@@ -6563,6 +6778,14 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_host_op_api") == 0) {
++        return const_cast<ggml_backend_cuda_host_op_api *>(&ggml_cuda_host_op_api);
++    }
++    if (strcmp(name, "ggml_backend_cuda_upload_api") == 0) {
++        return const_cast<ggml_backend_cuda_upload_api *>(&ggml_cuda_upload_api);
++    }
++#endif
+     if (strcmp(name, "ggml_backend_cuda_set_memory_limit") == 0) {
+         return (void *)ggml_backend_cuda_set_memory_limit;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4a4781d..d9b93c8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -15,6 +15,8 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
++#include "llama-moe-runtime.h"
++#include "llama-moe-budget.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
+@@ -587,6 +589,8 @@ llama_context::llama_context(
+             }
+         }
+         int cache_attempts = 0;
++        bool cache_planned = false;
++        const size_t requested_cache = cparams.moe_cache_size;
+         for (;;) {
+             ++cache_attempts;
+             try {
+@@ -594,6 +598,34 @@ llama_context::llama_context(
+                     moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+                 }
+                 sched_reserve();
++                if (!cache_planned && cache_attempts==1 && model.gpu_exclusive() && !model.hparams.no_alloc &&
++                    cparams.moe_cache_size && llama_moe_runtime::option("WILDLLAMA_MOE_CACHE_AUTO")) {
++                    cache_planned = true;
++                    llama_gpu_memory_stats memory {};
++                    size_t physical_free=0,physical_total=0,total_experts=0;
++                    for (const auto & layer:model.layers) {
++                        for (const auto * tensor:{layer.ffn_gate_up_exps,layer.ffn_gate_exps,layer.ffn_up_exps,layer.ffn_down_exps}) {
++                            if (tensor && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) { total_experts+=ggml_nbytes(tensor); }
++                        }
++                    }
++                    for (auto * backend:backend_ptrs) {
++                        const auto device=ggml_backend_get_device(backend);
++                        if (ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU) {
++                            ggml_backend_dev_memory(device,&physical_free,&physical_total); break;
++                        }
++                    }
++                    if (llama_model_get_gpu_memory_stats(&model,&memory) && memory.enabled) {
++                        const size_t planned=llama_moe_budget::plan(cparams.moe_cache_size,memory.limit_bytes,
++                            memory.managed_used_bytes,physical_free,total_experts);
++                        if (planned>cparams.moe_cache_size) {
++                            ggml_backend_sched_synchronize(sched.get());
++                            sched.reset(); gf_res_reserve.reset(); moe_cache.reset();
++                            cparams.moe_cache_size=planned; sched_need_reserve=true;
++                            LLAMA_LOG_INFO("gpu-exclusive: planned %.2f MiB expert cache after fixed allocations; context unchanged\n",planned/1048576.0);
++                            continue;
++                        }
++                    }
++                }
+                 break;
+             } catch (const std::exception & e) {
+                 const std::string message = e.what();
+@@ -602,7 +634,7 @@ llama_context::llama_context(
+                     (sched && ggml_backend_sched_get_error(sched.get())[0])) {
+                     throw;
+                 }
+-                if (cache_attempts >= 2) {
++                if (cache_attempts >= (cache_planned ? 3 : 2)) {
+                     throw std::runtime_error("gpu-exclusive: insufficient VRAM after bounded expert-cache retry; context and model are unchanged: " + message);
+                 }
+                 // Free failed compute reservations before recreating smaller banks.
+@@ -611,7 +643,7 @@ llama_context::llama_context(
+                 sched.reset();
+                 gf_res_reserve.reset();
+                 moe_cache.reset();
+-                cparams.moe_cache_size /= 2;
++                cparams.moe_cache_size = cache_planned && cparams.moe_cache_size>requested_cache ? requested_cache : cparams.moe_cache_size/2;
+                 sched_need_reserve = true;
+                 LLAMA_LOG_WARN("gpu-exclusive: retrying with %.2f MiB expert cache after allocation failure; context unchanged\n",
+                         cparams.moe_cache_size / 1048576.0);
+@@ -2925,6 +2957,7 @@ ggml_status llama_context::graph_compute(
+     }
+ 
+     copy_experts.reset();
++    if (moe_cache) { moe_cache->begin_evaluation(); }
+     std::unique_lock<std::mutex> weight_guard;
+     if (model.ram_cache) {
+         weight_guard = model.ram_cache->acquire();
+diff --git a/src/llama-expert-trace.h b/src/llama-expert-trace.h
+new file mode 100644
+index 0000000..22f22f2
+--- /dev/null
++++ b/src/llama-expert-trace.h
+@@ -0,0 +1,222 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <string>
++#include <thread>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
++
++// This optional trace records expert identities and quantized byte costs only.
++// It is independent of prompts, sampled token IDs, model paths and diagnostics.
++namespace llama_expert_trace {
++
++inline bool enabled() noexcept {
++    static const bool value = [] {
++        const char * path = std::getenv("WILDLLAMA_EXPERT_TRACE");
++        return path && path[0];
++    }();
++    return value;
++}
++
++class recorder {
++public:
++    recorder() noexcept {
++        try {
++            const char * path = std::getenv("WILDLLAMA_EXPERT_TRACE");
++            if (!path || !absolute(path)) { return; }
++            if (const char * value = std::getenv("WILDLLAMA_EXPERT_TRACE_MAX_BYTES")) {
++                char * end = nullptr;
++                const unsigned long long parsed = std::strtoull(value, &end, 10);
++                if (value[0] && value[0] != '-' && end && !*end && parsed >= 1024 && parsed <= (uint64_t(1) << 30)) {
++                    max_bytes = uint64_t(parsed);
++                }
++            }
++            // Exclusive creation protects an earlier observation from accidental reuse.
++            file = create_exclusive(path);
++            if (!file) { return; }
++            std::setvbuf(file, nullptr, _IOFBF, 64 * 1024);
++            const std::string header = "{\"kind\":\"header\",\"version\":1,\"unit\":\"expert_bundle\",\"scope\":\"runner_shared\"}\n";
++            if (std::fwrite(header.data(), 1, header.size(), file) != header.size()) {
++                std::fclose(file); file = nullptr; return;
++            }
++            planned_bytes = header.size();
++            active = true;
++            worker = std::thread([this] { consume(); });
++        } catch (...) {
++            active = false;
++            if (file) { std::fclose(file); file = nullptr; }
++        }
++    }
++
++    ~recorder() { finish(); }
++    recorder(const recorder &) = delete;
++    recorder & operator=(const recorder &) = delete;
++
++    void route(uint64_t evaluation, int32_t layer, const int32_t * ids, size_t n_ids,
++               uint32_t tokens, uint32_t k, uint64_t bytes, uint64_t model) noexcept {
++        if (!active.load(std::memory_order_relaxed)) { return; }
++        try {
++            std::lock_guard<std::mutex> guard(mutex);
++            if (!active.load(std::memory_order_relaxed) || stopping) { return; }
++            ++seen_routes;
++            if (!ids || layer < 0 || !tokens || !k || !bytes || n_ids > max_ids ||
++                uint64_t(tokens) * k != n_ids) {
++                ++dropped_routes; ++invalid_routes; return;
++            }
++            for (size_t i = 0; i < n_ids; ++i) {
++                if (ids[i] < 0) { ++dropped_routes; ++invalid_routes; return; }
++            }
++            std::string line;
++            line.reserve(192 + n_ids * 4);
++            line = "{\"kind\":\"route\",\"seq\":" + std::to_string(seen_routes) +
++                ",\"model\":" + std::to_string(model) + ",\"eval\":" + std::to_string(evaluation) +
++                ",\"layer\":" + std::to_string(layer) + ",\"tokens\":" + std::to_string(tokens) +
++                ",\"k\":" + std::to_string(k) + ",\"bytes\":" + std::to_string(bytes) + ",\"experts\":[";
++            for (size_t i = 0; i < n_ids; ++i) {
++                if (i) { line += ','; }
++                line += std::to_string(ids[i]);
++            }
++            line += "]}\n";
++            if (line.size() > max_bytes - footer_reserve - planned_bytes) {
++                ++dropped_routes; cap_reached = true; stopping = true;
++                condition.notify_one(); return;
++            }
++            if (queue.size() >= 1024 || line.size() > max_queue_bytes - queued_bytes) {
++                ++dropped_routes; ++queue_drops; return;
++            }
++            const size_t line_bytes = line.size();
++            queue.emplace_back(std::move(line));
++            planned_bytes += line_bytes; queued_bytes += line_bytes;
++            ++accepted_routes;
++            condition.notify_one();
++        } catch (...) {
++            // Tracing never changes whether inference succeeds.
++            std::lock_guard<std::mutex> guard(mutex);
++            ++dropped_routes; ++allocation_drops;
++        }
++    }
++
++    void finish() noexcept {
++        try {
++            std::lock_guard<std::mutex> finish_guard(finish_mutex);
++            {
++                std::lock_guard<std::mutex> guard(mutex);
++                stopping = true;
++                condition.notify_one();
++            }
++            if (worker.joinable()) { worker.join(); }
++        } catch (...) {}
++    }
++
++private:
++    static constexpr size_t max_ids = 65536;
++    static constexpr size_t max_queue_bytes = 1024 * 1024;
++    static constexpr uint64_t footer_reserve = 512;
++    std::atomic<bool> active { false };
++    FILE * file = nullptr;
++    std::thread worker;
++    std::mutex finish_mutex;
++    std::mutex mutex;
++    std::condition_variable condition;
++    std::deque<std::string> queue;
++    size_t queued_bytes = 0;
++    uint64_t max_bytes = 64 * 1024 * 1024;
++    uint64_t planned_bytes = 0, seen_routes = 0, accepted_routes = 0, written_routes = 0;
++    uint64_t dropped_routes = 0, queue_drops = 0, invalid_routes = 0, allocation_drops = 0;
++    bool stopping = false, cap_reached = false, io_error = false;
++
++    static FILE * create_exclusive(const char * path) noexcept {
++#ifdef _WIN32
++        // MinGW can target a CRT that predates fopen's C11 'x' mode.
++        const int descriptor = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
++        if (descriptor < 0) { return nullptr; }
++        FILE * result = _fdopen(descriptor, "wb");
++        if (!result) { _close(descriptor); }
++#else
++        const int descriptor = open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
++        if (descriptor < 0) { return nullptr; }
++        FILE * result = fdopen(descriptor, "wb");
++        if (!result) { close(descriptor); }
++#endif
++        return result;
++    }
++
++    static bool absolute(const char * path) noexcept {
++#ifdef _WIN32
++        return (path[0] && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) ||
++            (path[0] == '\\' && path[1] == '\\');
++#else
++        return path[0] == '/';
++#endif
++    }
++
++    void consume() noexcept {
++        auto last_flush = std::chrono::steady_clock::now();
++        for (;;) {
++            std::string line;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                condition.wait_for(lock, std::chrono::milliseconds(250), [this] { return stopping || !queue.empty(); });
++                if (queue.empty() && stopping) { break; }
++                if (!queue.empty()) {
++                    line = std::move(queue.front()); queue.pop_front(); queued_bytes -= line.size();
++                }
++            }
++            const auto now = std::chrono::steady_clock::now();
++            const bool write_failed = !line.empty() && std::fwrite(line.data(), 1, line.size(), file) != line.size();
++            const bool flush_due = now - last_flush >= std::chrono::milliseconds(250);
++            const bool flush_failed = flush_due && std::fflush(file) != 0;
++            if (write_failed || flush_failed) {
++                std::lock_guard<std::mutex> guard(mutex);
++                io_error = true;
++                active.store(false, std::memory_order_relaxed);
++                dropped_routes += queue.size() + (!line.empty() ? 1 : 0);
++                queue.clear(); queued_bytes = 0;
++                break;
++            }
++            if (!line.empty()) { ++written_routes; }
++            if (flush_due) { last_flush = now; }
++        }
++        {
++            std::lock_guard<std::mutex> guard(mutex);
++            active.store(false, std::memory_order_relaxed);
++            const bool truncated = cap_reached || dropped_routes || io_error;
++            std::fprintf(file, "{\"kind\":\"end\",\"truncated\":%s,\"routes\":%llu,\"seen_routes\":%llu,\"dropped_routes\":%llu,\"queue_drops\":%llu,\"invalid_routes\":%llu,\"allocation_drops\":%llu,\"io_error\":%s}\n",
++                truncated ? "true" : "false", (unsigned long long) written_routes,
++                (unsigned long long) seen_routes, (unsigned long long) dropped_routes,
++                (unsigned long long) queue_drops, (unsigned long long) invalid_routes,
++                (unsigned long long) allocation_drops, io_error ? "true" : "false");
++            std::fclose(file); file = nullptr;
++        }
++    }
++};
++
++inline recorder & instance() noexcept { static recorder value; return value; }
++
++inline void record_route(uint64_t evaluation, int32_t layer, const int32_t * ids, size_t n_ids,
++                         uint32_t tokens, uint32_t experts_per_token, uint64_t bytes_per_expert,
++                         uint64_t model_id = 0) noexcept {
++    if (!enabled()) { return; }
++    instance().route(evaluation, layer, ids, n_ids, tokens, experts_per_token, bytes_per_expert, model_id);
++}
++
++// Call during graceful runner teardown; abrupt termination produces an incomplete
++// file that the replay tool refuses unless explicitly allowed by its caller.
++inline void finish() noexcept { if (enabled()) { instance().finish(); } }
++
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c5ab70d..2846dfb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
++#include "llama-moe-runtime.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+@@ -1583,6 +1584,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     res              (params.res),
+     ctx0             (res->get_ctx()),
+     gf               (res->get_gf()) {
++        if (moe_cache) { moe_cache->begin_graph(); }
+         res->set_params(params);
+     }
+ 
+@@ -1732,7 +1734,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = nullptr;
+     const auto * tiles = moe_cache ? moe_cache->get_tiles(w) : nullptr;
+-    if (tiles && !tiles->empty()) {
++    auto * dynamic = tiles ? moe_cache->streamed_matmul(ctx0,w,cur_mm,ids) : nullptr;
++    if (dynamic) {
++        res=dynamic;
++        ggml_backend_sched_set_tensor_backend(sched,res,tiles->front().backend);
++        ggml_build_forward_expand(gf,res);
++    } else if (tiles && !tiles->empty()) {
+         auto join = [&](std::vector<ggml_tensor *> parts, int dim) {
+             // A balanced concatenation avoids quadratic activation traffic when
+             // a tight cache requires many independent output-row tiles.
+@@ -1748,12 +1755,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         std::vector<ggml_tensor *> token_parts;
+         // Token slices bound the worst-case expert union; row slices retain the
+         // original reduction axis, quantized bytes and accumulation precision.
+-        const int64_t batch = std::max<int64_t>(1, tiles->front().slots / ids->ne[0]);
++        const int64_t batch = llama_moe_runtime::enabled() ? moe_cache->token_batch(w) : std::max<int64_t>(1,tiles->front().slots/ids->ne[0]);
+         for (int64_t token = 0; token < ids->ne[1]; token += batch) {
+             const int64_t n = std::min(batch, ids->ne[1] - token);
+             auto * input = ggml_view_3d(ctx0, cur_mm, cur_mm->ne[0], cur_mm->ne[1], n,
+                     cur_mm->nb[1], cur_mm->nb[2], token * cur_mm->nb[2]);
+-            auto * selected = ggml_cont(ctx0, ggml_view_2d(ctx0, ids, ids->ne[0], n, ids->nb[1], token * ids->nb[1]));
++            auto * selected=llama_moe_runtime::enabled() ? moe_cache->selected_route(ctx0,ids,token,n) :
++                ggml_cont(ctx0,ggml_view_2d(ctx0,ids,ids->ne[0],n,ids->nb[1],token*ids->nb[1]));
+             auto * flat = ggml_reshape_1d(ctx0, selected, ggml_nelements(selected));
+             std::vector<ggml_tensor *> row_parts;
+             for (const auto & tile : *tiles) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e271c50..e3ff6bc 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1069,6 +1069,7 @@ struct llm_graph_context {
+ 
+     const llama_hadamard * hdmd;
+ 
++
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     const llm_graph_cb & cb_func;
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+index 8b1dd70..f55d17b 100644
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -1,6 +1,8 @@
+ #include "llama-model-ram.h"
+ #include "llama-impl.h"
+ #include "llama-runtime-activity.h"
++#include "llama-moe-runtime.h"
++#include "ggml-cuda-upload.h"
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+ 
+@@ -9,6 +11,7 @@
+ #include <cerrno>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <limits>
+ #include <list>
+ #include <map>
+@@ -144,6 +147,7 @@ struct read_request {
+         }
+         return bytes;
+     }
++    bool ready() const { return !pending || WaitForSingleObject(ov.hEvent, 0) == WAIT_OBJECT_0; }
+     void drain() noexcept {
+         if (pending) {
+             CancelIoEx(file, &ov);
+@@ -155,6 +159,7 @@ struct read_request {
+ #else
+     void start(reader & source, void * dst, size_t size, uint64_t offset) { bytes = source.read_at(dst, size, offset); }
+     size_t finish() { return bytes; }
++    bool ready() const { return true; }
+     void drain() noexcept {}
+ #endif
+ };
+@@ -221,6 +226,8 @@ struct llama_model_ram_cache::impl {
+         bool hot = false;
+         bool prefetched = false;
+         uint64_t epoch = 0;
++        uint8_t * storage = nullptr;
++        uint32_t device_refs = 0;
+         std::list<page *>::iterator position;
+     };
+     struct region {
+@@ -231,6 +238,10 @@ struct llama_model_ram_cache::impl {
+         ~region() { if (data) { release(data, reserved); } }
+     };
+     size_t limit, resident = 0, peak = 0;
++    bool pooled = false;
++    uint8_t * arena = nullptr;
++    size_t arena_committed = 0;
++    std::vector<uint8_t *> free_slots;
+     uint64_t epoch = 0, hits = 0, misses = 0, bytes_read = 0;
+     uint64_t read_calls = 0, evicted_pages = 0, eviction_calls = 0;
+     bool diagnostics = false;
+@@ -249,7 +260,13 @@ struct llama_model_ram_cache::impl {
+     struct upload_staging {
+         ggml_backend_buffer_ptr buffer;
+         ggml_backend_event_t events[2] = { nullptr, nullptr };
+-        ~upload_staging() { for (auto event : events) { if (event) { ggml_backend_event_free(event); } } }
++        const ggml_backend_cuda_upload_api * api = nullptr;
++        void * queue = nullptr;
++        size_t next_slot = 0;
++        ~upload_staging() {
++            if (queue) { api->free(queue); }
++            for (auto event : events) { if (event) { ggml_backend_event_free(event); } }
++        }
+     };
+     std::map<ggml_backend_dev_t, upload_staging> upload_buffers;
+     bool poisoned = false;
+@@ -270,7 +287,8 @@ struct llama_model_ram_cache::impl {
+         if (device) { h2d_bytes += size; ++h2d_calls; }
+     }
+ 
+-    impl(size_t bytes, const llama_files & files) : limit(bytes / page_size * page_size) {
++    impl(size_t bytes, const llama_files & files, bool streaming) : limit(bytes / page_size * page_size),
++            pooled(streaming && llama_moe_runtime::option("WILDLLAMA_MOE_RAM_POOL")) {
+         if (!limit) { throw std::runtime_error("MoE RAM cache: limit is smaller than a cache page"); }
+ #ifdef _WIN32
+         if (!GetProcessWorkingSetSize(GetCurrentProcess(), &old_min, &old_max)) { throw std::runtime_error("MoE RAM cache: cannot query lock allowance"); }
+@@ -302,11 +320,28 @@ struct llama_model_ram_cache::impl {
+ #endif
+             throw std::runtime_error("MoE RAM cache: cannot allocate and lock the I/O buffer");
+         }
++        if (pooled) {
++            try {
++                free_slots.reserve(limit/page_size);
++                arena = static_cast<uint8_t *>(reserve(limit));
++            }
++            catch (...) {
++#ifdef _WIN32
++                VirtualUnlock(staging, staging_size); VirtualFree(staging, 0, MEM_RELEASE);
++                SetProcessWorkingSetSize(GetCurrentProcess(), old_min, old_max);
++#else
++                munlock(staging, staging_size); free(staging);
++#endif
++                throw;
++            }
++        }
+     }
+     ~impl() {
+         for (auto & request : requests) { request.drain(); }
++        upload_buffers.clear();
+         // Releasing each reservation also releases its locked pages.
+         regions.clear();
++        if (arena) { release(arena, limit); }
+ #ifdef _WIN32
+         VirtualUnlock(staging, staging_size);
+         VirtualFree(staging, 0, MEM_RELEASE);
+@@ -339,6 +374,18 @@ struct llama_model_ram_cache::impl {
+                     if (buffer && ggml_backend_buffer_get_type(buffer.get()) == type) {
+                         upload_buffer_bytes += ggml_backend_buffer_get_size(buffer.get());
+                         it->second.buffer = std::move(buffer);
++                        if (pooled && llama_moe_runtime::option("WILDLLAMA_MOE_UPLOAD_OVERLAP")) {
++                            auto reg = ggml_backend_dev_backend_reg(device);
++                            auto get = reinterpret_cast<const ggml_backend_cuda_upload_api *>(
++                                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_upload_api"));
++                            if (get) {
++                                it->second.api = get;
++                                if (!it->second.api || it->second.api->version != 1 ||
++                                    !(it->second.queue = it->second.api->create(backend))) {
++                                    throw std::runtime_error("MoE RAM cache: cannot create upload queue");
++                                }
++                            }
++                        }
+                         if (props.caps.events) {
+                             for (auto & event : it->second.events) { event = ggml_backend_event_new(device); }
+                             if (!it->second.events[0] || !it->second.events[1]) {
+@@ -391,29 +438,89 @@ struct llama_model_ram_cache::impl {
+         }
+     }
+     void evict(size_t wanted) {
++        const bool cooperative = pooled && llama_moe_runtime::option("WILDLLAMA_MOE_COOPERATIVE_CACHE");
++        constexpr size_t hint_probe_limit = 64;
+         for (auto * queue : { &probation, &protected_pages }) {
++        // Device residency is a soft hint within an SLRU tier. Do not scan the
++        // entire cache, or discard protected pages while probation has a victim.
++        size_t hint_probes = 0;
++        for (int preference = 0; preference < (cooperative ? 2 : 1); ++preference) {
+             for (auto it = queue->begin(); it != queue->end(); ++it) {
++                if (cooperative && preference == 0) {
++                    if (hint_probes == hint_probe_limit) { break; }
++                    ++hint_probes;
++                }
+                 page * p = *it;
+-                if (p->epoch == epoch) { continue; }
++                if (p->epoch == epoch || (cooperative && preference == 0 && !p->device_refs)) { continue; }
+                 size_t n = 1;
+                 auto end = std::next(it);
+                 while (end != queue->end() && n * page_size < std::min(wanted, io_size)) {
++                    if (cooperative && preference == 0) {
++                        if (hint_probes == hint_probe_limit) { break; }
++                        ++hint_probes;
++                    }
+                     page * next = *end;
+-                    if (next->epoch == epoch || next->owner != p->owner || next->index != p->index + n) { break; }
++                    if (next->epoch == epoch || next->owner != p->owner || next->index != p->index + n ||
++                        (cooperative && preference == 0 && !next->device_refs)) { break; }
+                     ++n; ++end;
+                 }
+                 const int64_t start = clock();
+-                decommit(p->owner->data + p->index * page_size, n * page_size);
++                if (pooled) {
++                    for (auto cur = it; cur != end; ++cur) {
++                        free_slots.push_back((*cur)->storage);
++                        (*cur)->storage = nullptr;
++                    }
++                } else { decommit(p->owner->data + p->index * page_size, n * page_size); }
+                 elapsed(start, release_us);
+                 evicted_pages += n; ++eviction_calls;
+                 for (auto cur = it; cur != end; ++cur) { (*cur)->resident = false; }
+                 queue->erase(it, end);
+-                resident -= n * page_size;
++                if (!pooled) { resident -= n * page_size; }
+                 return;
+             }
+         }
++        }
+         throw std::runtime_error("MoE RAM cache: required weights exceed the limit");
+     }
++    size_t available() const { return pooled ? free_slots.size()*page_size + limit-arena_committed : limit-resident; }
++    uint8_t * allocate_slot() {
++        if (free_slots.empty()) {
++            const size_t bytes = std::min<size_t>(64*1024*1024, limit-arena_committed);
++            if (!bytes) { throw std::runtime_error("MoE RAM pool: no free slot"); }
++            free_slots.reserve(free_slots.size() + bytes/page_size);
++            allowance(arena_committed + bytes);
++            const int64_t start = clock();
++            commit_lock(arena + arena_committed, bytes);
++            elapsed(start, commit_us);
++            for (size_t offset = 0; offset < bytes; offset += page_size) { free_slots.push_back(arena + arena_committed + offset); }
++            arena_committed += bytes;
++            resident = arena_committed; peak = std::max(peak, resident);
++        }
++        uint8_t * result = free_slots.back(); free_slots.pop_back(); return result;
++    }
++    bool ready_range(const ggml_tensor * tensor, size_t offset, size_t bytes) const {
++        const region * r = find(tensor);
++        if (!r) { return false; }
++        const size_t first = checked_add((uintptr_t)tensor->data-(uintptr_t)r->data, offset);
++        const size_t end = checked_add(first, bytes);
++        for (size_t page = first/page_size; page < round_up(end,page_size)/page_size; ++page) {
++            if (!r->pages[page].resident) { return false; }
++        }
++        return true;
++    }
++    void copy_out(const ggml_tensor * tensor, size_t offset, void * dst, size_t bytes) const {
++        if (!pooled) { memcpy(dst, static_cast<const uint8_t *>(tensor->data)+offset, bytes); return; }
++        const region * r = find(tensor);
++        const size_t first = checked_add((uintptr_t)tensor->data-(uintptr_t)r->data, offset);
++        for (size_t done = 0; done < bytes;) {
++            const size_t at = first+done;
++            const page & p = r->pages[at/page_size];
++            if (!p.resident || !p.storage) { throw std::runtime_error("MoE RAM pool: unready source"); }
++            const size_t n = std::min(bytes-done,page_size-at%page_size);
++            memcpy(static_cast<uint8_t *>(dst)+done,p.storage+at%page_size,n);
++            done += n;
++        }
++    }
+     void range(std::vector<page *> & needed, const ggml_tensor * t, size_t offset, size_t size) {
+         region * r = find(t);
+         if (!r || !size) { return; }
+@@ -425,7 +532,7 @@ struct llama_model_ram_cache::impl {
+             if (p.epoch != epoch) { p.epoch = epoch; needed.push_back(&p); }
+         }
+     }
+-    void ensure(std::vector<page *> & needed, bool prefetch = false) {
++    void ensure(std::vector<page *> & needed, bool prefetch = false, const std::function<void()> & on_ready = {}) {
+         if (poisoned) { throw std::runtime_error("MoE RAM cache: unusable after failed page release"); }
+         if (needed.size() > limit / page_size) { throw std::runtime_error("MoE RAM cache: this operation needs more weight pages than the limit"); }
+         size_t missing = 0;
+@@ -441,8 +548,8 @@ struct llama_model_ram_cache::impl {
+         if (!missing) { return; }
+         llama_runtime_activity::scope activity("reading_weights");
+         llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
+-        while (missing > limit - resident) { evict(missing - (limit - resident)); }
+-        allowance(resident + missing);
++        while (missing > available()) { evict(missing - available()); }
++        if (!pooled) { allowance(resident + missing); }
+         std::sort(needed.begin(), needed.end(), [](page * a, page * b) {
+             if (a->owner->file != b->owner->file) { return a->owner->file < b->owner->file; }
+             return a->owner->offset + a->index*page_size < b->owner->offset + b->index*page_size;
+@@ -454,7 +561,7 @@ struct llama_model_ram_cache::impl {
+             bool committed = false;
+         };
+         std::array<load_job, io_depth> jobs;
+-        size_t i = 0, head = 0, active = 0;
++        size_t i = 0, active = 0;
+         try {
+             while (i < needed.size() || active) {
+                 while (i < needed.size() && active < io_depth) {
+@@ -466,7 +573,8 @@ struct llama_model_ram_cache::impl {
+                         if (next->resident || next->owner != first->owner || next->index != first->index + n) { break; }
+                         ++n;
+                     }
+-                    const size_t slot = (head + active) % io_depth;
++                    size_t slot = 0;
++                    while (jobs[slot].committed) { ++slot; }
+                     auto & job = jobs[slot];
+                     region & r = *first->owner;
+                     const size_t offset = first->index*page_size;
+@@ -478,10 +586,13 @@ struct llama_model_ram_cache::impl {
+                     // Allocate queue entries before committing pages or submitting I/O.
+                     for (size_t j = 0; j < n; ++j) { job.ready.push_back(needed[i + j]); }
+                     int64_t start = clock();
+-                    commit_lock(job.dst, job.bytes);
+-                    elapsed(start, commit_us);
++                    if (pooled) {
++                        job.committed = true;
++                        for (page * p : job.ready) { p->storage = allocate_slot(); }
++                    } else { commit_lock(job.dst, job.bytes); }
++                    if (!pooled) { elapsed(start, commit_us); }
+                     job.committed = true;
+-                    resident += job.bytes; peak = std::max(peak, resident);
++                    if (!pooled) { resident += job.bytes; peak = std::max(peak, resident); }
+                     start = clock();
+                     requests[slot].start(*readers[r.file], staging + slot*(io_chunk + alignment),
+                                          round_up(job.prefix + job.size, alignment), file_offset - job.prefix);
+@@ -490,15 +601,36 @@ struct llama_model_ram_cache::impl {
+                     i += n; ++active;
+                 }
+                 if (!active) { break; }
+-                auto & job = jobs[head];
+                 int64_t start = clock();
+-                const size_t got = requests[head].finish();
++                size_t slot = io_depth;
++                while (slot == io_depth) {
++                    for (size_t j = 0; j < io_depth; ++j) {
++                        if (jobs[j].committed && requests[j].ready()) { slot = j; break; }
++                    }
++#ifdef _WIN32
++                    if (slot == io_depth) {
++                        HANDLE events[io_depth]; DWORD count = 0;
++                        for (size_t j = 0; j < io_depth; ++j) { if (jobs[j].committed) { events[count++] = requests[j].ov.hEvent; } }
++                        const DWORD result = WaitForMultipleObjects(count,events,FALSE,INFINITE);
++                        if (result == WAIT_FAILED) { throw std::runtime_error("MoE RAM cache: completion wait failed"); }
++                    }
++#endif
++                }
++                auto & job = jobs[slot];
++                const size_t got = requests[slot].finish();
+                 elapsed(start, io_wait_us);
+                 bytes_read += got;
+                 llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
+                 if (got < job.prefix + job.size) { throw std::runtime_error("MoE RAM cache: truncated queued GGUF read"); }
+                 start = clock();
+-                memcpy(job.dst, staging + head*(io_chunk + alignment) + job.prefix, job.size);
++                const uint8_t * input = staging + slot*(io_chunk+alignment) + job.prefix;
++                if (pooled) {
++                    size_t done = 0;
++                    for (page * p : job.ready) {
++                        const size_t bytes = std::min(page_size,job.size-done);
++                        memcpy(p->storage,input+done,bytes); done += bytes;
++                    }
++                } else { memcpy(job.dst,input,job.size); }
+                 elapsed(start, host_copy_us);
+                 for (auto it = job.ready.begin(); it != job.ready.end(); ++it) {
+                     page * p = *it;
+@@ -507,14 +639,18 @@ struct llama_model_ram_cache::impl {
+                 }
+                 probation.splice(probation.end(), job.ready);
+                 job.committed = false;
+-                head = (head + 1) % io_depth; --active;
++                --active;
++                if (on_ready) { on_ready(); }
+             }
+         } catch (...) {
+             // I/O must finish before its buffers or destination pages can be released.
+             for (auto & request : requests) { request.drain(); }
+             for (auto & job : jobs) {
+                 if (!job.committed) { continue; }
+-                try { decommit(job.dst, job.bytes); resident -= job.bytes; }
++                try {
++                    if (pooled) { for (page * p : job.ready) { if (p->storage) { free_slots.push_back(p->storage); p->storage=nullptr; } } }
++                    else { decommit(job.dst, job.bytes); resident -= job.bytes; }
++                }
+                 catch (...) { poisoned = true; }
+             }
+             throw;
+@@ -522,7 +658,8 @@ struct llama_model_ram_cache::impl {
+     }
+ };
+ 
+-llama_model_ram_cache::llama_model_ram_cache(size_t limit, const llama_files & files) : pimpl(new impl(limit, files)) {
++llama_model_ram_cache::llama_model_ram_cache(size_t limit, const llama_files & files) : llama_model_ram_cache(limit,files,false) {}
++llama_model_ram_cache::llama_model_ram_cache(size_t limit, const llama_files & files, bool streaming) : pimpl(new impl(limit, files, streaming)) {
+     LLAMA_LOG_INFO("moe_ram: host weight budget = %zu bytes\n", pimpl->limit);
+ }
+ llama_model_ram_cache::~llama_model_ram_cache() { report(); }
+@@ -606,6 +743,7 @@ bool llama_model_ram_cache::prepare(ggml_tensor * node) {
+     auto & p = *pimpl;
+     try {
+         p.last_error.clear();
++        if (p.pooled) { throw std::runtime_error("MoE RAM pool: managed weights require the streaming copy path"); }
+         if (contains(node)) { throw std::runtime_error("MoE RAM cache: managed model weights are read-only"); }
+         ++p.epoch;
+         std::vector<impl::page *> needed;
+@@ -674,7 +812,7 @@ void llama_model_ram_cache::read(const ggml_tensor * src, size_t offset, void *
+         p.range(needed, src, offset + done, n);
+         p.ensure(needed);
+         const int64_t start = p.clock();
+-        memcpy((uint8_t *) dst + done, (const uint8_t *) src->data + offset + done, n);
++        p.copy_out(src,offset+done,static_cast<uint8_t *>(dst)+done,n);
+         p.elapsed(start, p.host_copy_us);
+         done += n;
+     }
+@@ -700,6 +838,21 @@ bool llama_model_ram_cache::prefetch(const std::vector<llama_model_ram_range> &
+     p.ensure(needed, true);
+     return true;
+ }
++void llama_model_ram_cache::device_residency(const ggml_tensor * tensor, size_t offset, size_t size, bool resident) {
++    auto & p = *pimpl;
++    if (!p.pooled || !llama_moe_runtime::option("WILDLLAMA_MOE_COOPERATIVE_CACHE")) { return; }
++    auto * r = p.find(tensor);
++    if (!r || !size) { return; }
++    const size_t start = checked_add((uintptr_t)tensor->data-(uintptr_t)r->data,offset);
++    const size_t end = checked_add(start,size);
++    if (end > r->size) { throw std::runtime_error("MoE RAM cache: residency hint exceeds tensor"); }
++    for (size_t index=start/page_size; index<round_up(end,page_size)/page_size; ++index) {
++        auto & page = r->pages[index];
++        if (resident) {
++            if (page.device_refs != UINT32_MAX) { ++page.device_refs; }
++        } else if (page.device_refs) { --page.device_refs; }
++    }
++}
+ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector<llama_model_ram_copy> & copies) {
+     if (!backend) { throw std::runtime_error("MoE RAM cache: missing upload backend"); }
+     auto & p = *pimpl;
+@@ -724,6 +877,51 @@ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector
+         }
+         return true;
+     }
++    if (upload->queue) {
++        const auto * api = upload->api;
++        if (!api->begin(upload->queue,backend)) { throw std::runtime_error("MoE upload: cannot begin batch"); }
++        struct queue_guard {
++            impl::upload_staging * upload;
++            bool finished = false;
++            ~queue_guard() { if (!finished) { upload->api->synchronize(upload->queue); } }
++        } guard { upload };
++        struct task { const llama_model_ram_copy * copy; size_t done,size; bool sent=false; };
++        std::vector<task> tasks;
++        const size_t capacity=io_size/2;
++        for (const auto & copy : copies) {
++            for (size_t done=0; done<copy.size;) {
++                const size_t bytes=std::min(capacity,copy.size-done);
++                tasks.push_back({&copy,done,bytes}); done+=bytes;
++            }
++        }
++        auto * data=static_cast<uint8_t *>(ggml_backend_buffer_get_base(upload->buffer.get()));
++        size_t remaining=tasks.size();
++        auto dispatch = [&] {
++            for (auto & task : tasks) {
++                if (task.sent || !p.ready_range(task.copy->src,task.copy->src_offset+task.done,task.size)) { continue; }
++                const unsigned slot=unsigned(upload->next_slot);
++                const int64_t start=p.clock();
++                if (!api->wait_host(upload->queue,slot)) { throw std::runtime_error("MoE upload: source-slot wait failed"); }
++                ++p.h2d_slot_waits; p.elapsed(start,p.h2d_wait_us);
++                const int64_t copied=p.clock();
++                uint8_t * target=data+slot*capacity;
++                p.copy_out(task.copy->src,task.copy->src_offset+task.done,target,task.size);
++                p.elapsed(copied,p.host_copy_us);
++                if (!api->copy(upload->queue,task.copy->dst,target,task.copy->dst_offset+task.done,task.size) ||
++                    !api->record(upload->queue,slot)) { throw std::runtime_error("MoE upload: transfer failed"); }
++                p.uploaded(device_tensor(task.copy->dst),task.size);
++                upload->next_slot^=1; task.sent=true; --remaining;
++            }
++        };
++        const int64_t start=p.clock();
++        dispatch();
++        p.ensure(needed,false,dispatch);
++        dispatch();
++        if (remaining || !api->end(upload->queue,backend)) { throw std::runtime_error("MoE upload: batch incomplete"); }
++        guard.finished=true;
++        p.elapsed(start,p.h2d_us);
++        return true;
++    }
+     p.ensure(needed);
+     const bool device = std::any_of(copies.begin(), copies.end(), [](const llama_model_ram_copy & copy) {
+         return device_tensor(copy.dst);
+@@ -746,7 +944,6 @@ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector
+     for (const auto & copy : copies) {
+         for (size_t done = 0; done < copy.size;) {
+             const size_t n = std::min(copy.size - done, chunk);
+-            const uint8_t * data = (const uint8_t *) copy.src->data + copy.src_offset + done;
+             if (n > capacity - used) {
+                 if (use_events) {
+                     ggml_backend_event_record(upload->events[slot], backend);
+@@ -763,7 +960,7 @@ bool llama_model_ram_cache::copy_batch(ggml_backend_t backend, const std::vector
+             }
+             uint8_t * target = data_upload + slot*capacity + used;
+             const int64_t host_start = p.clock();
+-            memcpy(target, data, n);
++            p.copy_out(copy.src,copy.src_offset+done,target,n);
+             p.elapsed(host_start, p.host_copy_us);
+             ggml_backend_tensor_set_async(backend, copy.dst, target, copy.dst_offset + done, n);
+             p.uploaded(device_tensor(copy.dst), n);
+@@ -784,6 +981,7 @@ bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src
+         throw std::runtime_error("MoE RAM cache: invalid device-copy range");
+     }
+     const bool device = device_tensor(dst);
++    if (device && llama_moe_runtime::enabled()) { p.synchronize(backend,true); }
+     const auto * r = p.find(src);
+     size_t done = 0;
+     while (done < size) {
+@@ -795,7 +993,16 @@ bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src
+         p.ensure(needed);
+         llama_runtime_activity::scope activity(device ? "uploading_weights" : "compute", llama_runtime_activity::layer(src->name));
+         const int64_t start = device ? p.clock() : 0;
+-        ggml_backend_tensor_set(dst, (const uint8_t *) src->data + src_offset + done, dst_offset + done, n);
++        if (p.pooled) {
++            size_t copied=0;
++            while (copied<n) {
++                const size_t position=at+copied;
++                const size_t bytes=std::min(n-copied,page_size-position%page_size);
++                const auto & page=r->pages[position/page_size];
++                ggml_backend_tensor_set(dst,page.storage+position%page_size,dst_offset+done+copied,bytes);
++                copied+=bytes;
++            }
++        } else { ggml_backend_tensor_set(dst, (const uint8_t *) src->data + src_offset + done, dst_offset + done, n); }
+         p.uploaded(device, n);
+         p.synchronize(backend, device);
+         p.elapsed(start, p.h2d_us);
+diff --git a/src/llama-model-ram.h b/src/llama-model-ram.h
+index 350e3d0..f4bc8bf 100644
+--- a/src/llama-model-ram.h
++++ b/src/llama-model-ram.h
+@@ -35,6 +35,7 @@ llama_model_ram_stats llama_model_ram_stats_delta(const llama_model_ram_stats &
+ class llama_model_ram_cache {
+ public:
+     llama_model_ram_cache(size_t limit, const llama_files & files);
++    llama_model_ram_cache(size_t limit, const llama_files & files, bool streaming);
+     ~llama_model_ram_cache();
+     void bind(ggml_tensor * tensor, uint16_t file, size_t offset);
+     bool contains(const ggml_tensor * tensor) const;
+@@ -43,6 +44,7 @@ public:
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size);
+     bool copy_batch(ggml_backend_t backend, const std::vector<llama_model_ram_copy> & copies);
+     bool prefetch(const std::vector<llama_model_ram_range> & ranges);
++    void device_residency(const ggml_tensor * tensor, size_t offset, size_t size, bool resident);
+     void load_device_tensor(ggml_tensor * tensor, uint16_t file, size_t offset);
+     // Caller holds acquire(), as for prepare() and copy().
+     void read(const ggml_tensor * tensor, size_t offset, void * dst, size_t size);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9d705f2..9e1696d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1945,7 +1945,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+         can_prefetch.clear();
+         if (!ml.no_alloc) {
+-            ram_cache.reset(new llama_model_ram_cache(params.moe_ram_limit, ml.files));
++            ram_cache.reset(new llama_model_ram_cache(params.moe_ram_limit, ml.files, params.gpu_exclusive));
+             ram_cache->set_diagnostics(params.gpu_diagnostics);
+             ml.ram_cache = ram_cache.get();
+         }
+diff --git a/src/llama-moe-admission.h b/src/llama-moe-admission.h
+new file mode 100644
+index 0000000..ff54add
+--- /dev/null
++++ b/src/llama-moe-admission.h
+@@ -0,0 +1,277 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++// The caller owns completion fences: a plan may reuse slots from the previous
++// plan only after their last GPU consumer has finished.
++struct llama_moe_admission {
++    uint64_t evictions = 0;
++    uint64_t bypasses = 0;
++    int32_t n_expert = 0;
++    int32_t n_slots = 0;
++    std::vector<int32_t *> slot_map;
++    std::vector<int32_t> key_of;
++    std::vector<int32_t> invalidated_slots;
++
++    void init(int32_t n_keys, int32_t experts, int32_t slots, int32_t scratch_slots = 0) {
++        if (n_keys <= 0 || experts <= 0 || slots <= 0 ||
++            int64_t(n_keys) * experts > std::numeric_limits<int32_t>::max()) {
++            throw std::invalid_argument("invalid expert admission dimensions");
++        }
++        n_expert = experts;
++        n_slots = slots;
++        persistent_limit = slots - std::min(slots, std::max(1, scratch_slots > 0 ? scratch_slots : slots / 8));
++        persistent_count = 0;
++        evictions = bypasses = tick = 0;
++        last_generation = 0;
++        decay_window = std::max<uint64_t>(256, uint64_t(n_keys) * 8);
++        slot_map.assign(n_keys, nullptr);
++        key_of.assign(slots, -1);
++        invalidated_slots.clear(); invalidated_slots.reserve(size_t(slots) * 2);
++        retained.assign(slots, false);
++        last_use.assign(slots, 0);
++        frequency.assign(size_t(n_keys) * experts, 0);
++        frequency_generation.assign(frequency.size(), 0);
++        layer_of.resize(n_keys);
++        for (int32_t key = 0; key < n_keys; ++key) { layer_of[key] = key; }
++        layer_count.assign(n_keys, 0);
++        layer_keys.assign(n_keys, 1);
++        active_layers = n_keys;
++        byte_cost.assign(n_keys, 1);
++        seen.assign(experts, 0);
++        seen_generation = 0;
++        position.assign(slots, -1);
++        heap.clear(); heap.reserve(slots);
++        free_slots.clear(); free_slots.reserve(slots);
++        for (int32_t slot = slots; slot > 0; --slot) { free_slots.push_back(slot - 1); }
++        transient.clear(); transient.reserve(slots);
++        next_transient.clear(); next_transient.reserve(slots);
++        selected_persistent.clear(); selected_persistent.reserve(slots);
++        unique.clear(); unique.reserve(std::min(experts, slots));
++    }
++
++    void set_layer(int32_t key, int32_t layer) {
++        if (key < 0 || size_t(key) >= layer_of.size() || layer < 0 || persistent_count) {
++            throw std::invalid_argument("expert layer mapping must precede admission");
++        }
++        if (size_t(layer) >= layer_count.size()) {
++            layer_count.resize(size_t(layer) + 1, 0);
++            layer_keys.resize(size_t(layer) + 1, 0);
++        }
++        if (--layer_keys[layer_of[key]] == 0) { --active_layers; }
++        if (layer_keys[layer]++ == 0) { ++active_layers; }
++        layer_of[key] = layer;
++    }
++
++    void set_cost(int32_t key, uint64_t bytes) {
++        if (key < 0 || size_t(key) >= byte_cost.size() || !bytes || persistent_count) {
++            throw std::invalid_argument("expert byte costs must precede admission");
++        }
++        byte_cost[key] = bytes;
++    }
++
++    int32_t persistent_slots() const { return persistent_count; }
++    int32_t persistent_capacity() const { return persistent_limit; }
++    bool is_retained(int32_t slot) const { return retained.at(slot); }
++
++    template<class Fill>
++    bool plan(int32_t key, const int32_t * ids, size_t count, std::vector<Fill> & fills, size_t & hits) {
++        invalidated_slots.clear();
++        fills.clear(); hits = 0;
++        if (key < 0 || size_t(key) >= slot_map.size() || !slot_map[key] || (!ids && count)) { return false; }
++        if (++seen_generation == 0) {
++            std::fill(seen.begin(), seen.end(), 0); seen_generation = 1;
++        }
++        unique.clear();
++        for (size_t i = 0; i < count; ++i) {
++            const int32_t expert = ids[i];
++            if (expert < 0 || expert >= n_expert) { return false; }
++            if (seen[expert] != seen_generation) {
++                seen[expert] = seen_generation;
++                unique.push_back(expert);
++            }
++        }
++        if (unique.size() > size_t(n_slots)) { return false; }
++        fills.reserve(unique.size());
++        ++tick;
++        const uint32_t generation = uint32_t(tick / decay_window);
++        if (generation != last_generation) {
++            for (int32_t slot : heap) { decay(key_of[slot], generation); }
++            rebuild_heap();
++            last_generation = generation;
++        }
++        // One-use traffic gets bounded scratch space. Wider prompt unions can
++        // borrow retained capacity, while every expert in this plan stays live.
++        next_transient.clear();
++        for (int32_t slot : transient) {
++            const int32_t id = key_of[slot];
++            if (id < 0) { continue; }
++            if (id / n_expert == key && seen[id % n_expert] == seen_generation) {
++                next_transient.push_back(slot);
++            } else { invalidate(slot, true); }
++        }
++        transient.swap(next_transient);
++        selected_persistent.clear();
++        for (int32_t expert : unique) {
++            const int32_t slot = slot_map[key][expert];
++            if (slot < 0) { continue; }
++            ++hits;
++            last_use[slot] = tick;
++            if (retained[slot]) {
++                erase_heap(slot);
++                selected_persistent.push_back(slot);
++            }
++        }
++        for (int32_t expert : unique) {
++            const int32_t id = key * n_expert + expert;
++            decay(id, generation);
++            if (frequency[id] != std::numeric_limits<uint16_t>::max()) { ++frequency[id]; }
++        }
++
++        std::sort(unique.begin(), unique.end());
++        for (int32_t expert : unique) {
++            if (slot_map[key][expert] >= 0) { continue; }
++            const int32_t id = key * n_expert + expert;
++            int32_t slot = -1;
++            bool keep = false;
++            if (persistent_count < persistent_limit && !free_slots.empty()) {
++                slot = take_free(); keep = true;
++            } else if (!heap.empty() && admits(id, heap.front())) {
++                slot = heap.front();
++                invalidate(slot, false); keep = true;
++            } else if (!free_slots.empty()) {
++                slot = take_free();
++            } else if (!heap.empty()) {
++                slot = heap.front();
++                invalidate(slot, false);
++            }
++            if (slot < 0) { throw std::logic_error("current experts exceeded planned slots"); }
++            key_of[slot] = id;
++            slot_map[key][expert] = slot;
++            retained[slot] = keep;
++            last_use[slot] = tick;
++            if (keep) {
++                ++persistent_count;
++                ++layer_count[layer_of[key]];
++                selected_persistent.push_back(slot);
++            } else { transient.push_back(slot); ++bypasses; }
++            fills.push_back({ expert, slot });
++        }
++        for (int32_t slot : selected_persistent) { insert_heap(slot); }
++        return true;
++    }
++
++    template<class Fill>
++    void abort(int32_t key, const std::vector<Fill> & fills) noexcept {
++        for (const auto & fill : fills) {
++            if (fill.slot >= 0 && fill.slot < n_slots &&
++                key_of[fill.slot] == key * n_expert + fill.expert) {
++                invalidate(fill.slot, true);
++            }
++        }
++    }
++
++private:
++    int32_t persistent_limit = 0;
++    int32_t persistent_count = 0;
++    int32_t active_layers = 0;
++    uint64_t tick = 0;
++    uint64_t decay_window = 256;
++    uint32_t last_generation = 0;
++    uint32_t seen_generation = 0;
++    std::vector<uint16_t> frequency;
++    std::vector<uint32_t> frequency_generation;
++    std::vector<uint32_t> seen;
++    std::vector<uint64_t> last_use;
++    std::vector<uint64_t> byte_cost;
++    std::vector<bool> retained;
++    std::vector<int32_t> layer_of, layer_count, layer_keys, heap, position, free_slots;
++    std::vector<int32_t> transient, next_transient, selected_persistent, unique;
++
++    void decay(int32_t id, uint32_t generation) {
++        const uint32_t age = generation - frequency_generation[id];
++        frequency[id] = age >= 16 ? 0 : uint16_t(frequency[id] >> age);
++        frequency_generation[id] = generation;
++    }
++    uint64_t benefit(int32_t id) const {
++        const uint64_t cost = byte_cost[id / n_expert];
++        return frequency[id] && cost > std::numeric_limits<uint64_t>::max() / frequency[id]
++            ? std::numeric_limits<uint64_t>::max() : cost * frequency[id];
++    }
++    bool less(int32_t a, int32_t b) const {
++        const uint64_t sa = benefit(key_of[a]), sb = benefit(key_of[b]);
++        if (sa != sb) { return sa < sb; }
++        if (last_use[a] != last_use[b]) { return last_use[a] < last_use[b]; }
++        return a < b;
++    }
++    void swap_heap(size_t a, size_t b) {
++        std::swap(heap[a], heap[b]); position[heap[a]] = int32_t(a); position[heap[b]] = int32_t(b);
++    }
++    void up(size_t index) {
++        while (index && less(heap[index], heap[(index - 1) / 2])) {
++            const size_t parent = (index - 1) / 2; swap_heap(index, parent); index = parent;
++        }
++    }
++    void down(size_t index) {
++        for (;;) {
++            size_t child = index * 2 + 1;
++            if (child >= heap.size()) { return; }
++            if (child + 1 < heap.size() && less(heap[child + 1], heap[child])) { ++child; }
++            if (!less(heap[child], heap[index])) { return; }
++            swap_heap(index, child); index = child;
++        }
++    }
++    void insert_heap(int32_t slot) {
++        position[slot] = int32_t(heap.size()); heap.push_back(slot); up(heap.size() - 1);
++    }
++    void erase_heap(int32_t slot) {
++        const int32_t index = position[slot];
++        if (index < 0) { return; }
++        const int32_t replacement = heap.back();
++        heap.pop_back(); position[slot] = -1;
++        if (size_t(index) == heap.size()) { return; }
++        heap[index] = replacement; position[replacement] = index;
++        if (index && less(replacement, heap[(index - 1) / 2])) { up(index); }
++        else { down(index); }
++    }
++    void rebuild_heap() {
++        for (size_t index = heap.size() / 2; index > 0; --index) { down(index - 1); }
++    }
++    int32_t take_free() {
++        const int32_t slot = free_slots.back(); free_slots.pop_back(); return slot;
++    }
++    void invalidate(int32_t slot, bool release) noexcept {
++        const int32_t id = key_of[slot];
++        if (id < 0) { return; }
++        erase_heap(slot);
++        if (slot_map[id / n_expert]) { slot_map[id / n_expert][id % n_expert] = -1; }
++        if (retained[slot]) {
++            --persistent_count; --layer_count[layer_of[id / n_expert]];
++        }
++        retained[slot] = false;
++        key_of[slot] = -1;
++        invalidated_slots.push_back(slot);
++        ++evictions;
++        if (release) { free_slots.push_back(slot); }
++    }
++    bool admits(int32_t id, int32_t victim) const {
++        // Compare previous reuse, not the demand miss itself. Otherwise a
++        // repeated full scan gives each newcomer one extra count and still
++        // evicts the entire cache before the next pass can hit.
++        const uint64_t count = frequency[id] ? uint64_t(frequency[id] - 1) : 0;
++        const uint64_t cost = byte_cost[id / n_expert];
++        const uint64_t incoming = count && cost > std::numeric_limits<uint64_t>::max() / count
++            ? std::numeric_limits<uint64_t>::max() : cost * count;
++        const uint64_t existing = benefit(key_of[victim]);
++        if (incoming != existing) { return incoming > existing; }
++        const int32_t share = std::max(1, persistent_limit / std::max(1, active_layers));
++        const int32_t have = layer_count[layer_of[id / n_expert]];
++        const int32_t victim_have = layer_count[layer_of[key_of[victim] / n_expert]];
++        return have < share && victim_have > share;
++    }
++};
+diff --git a/src/llama-moe-budget.h b/src/llama-moe-budget.h
+new file mode 100644
+index 0000000..ed0e674
+--- /dev/null
++++ b/src/llama-moe-budget.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++
++namespace llama_moe_budget {
++constexpr uint64_t mib = uint64_t(1) << 20;
++constexpr uint64_t default_headroom = uint64_t(256) << 20;
++
++// managed_used includes the current cache. Only the extra allocation is charged
++// against free memory. Keep reserve in both the physical and managed budgets;
++// buffer alignment and a rebuilt graph can require more than the requested bank.
++// Zero quota means no explicit managed limit, not unlimited physical memory.
++inline uint64_t plan(uint64_t old_cache, uint64_t quota, uint64_t managed_used,
++                     uint64_t physical_free, uint64_t total_expert_bytes,
++                     uint64_t headroom = default_headroom) noexcept {
++    if (managed_used < old_cache || total_expert_bytes <= old_cache || physical_free <= headroom) {
++        return old_cache;
++    }
++    uint64_t available = physical_free - headroom;
++    if (quota) {
++        if (managed_used >= quota || quota - managed_used <= headroom) { return old_cache; }
++        available = std::min(available, quota - managed_used - headroom);
++    }
++    const uint64_t growth = std::min({ available, total_expert_bytes - old_cache,
++                                     std::numeric_limits<uint64_t>::max() - old_cache,
++                                     std::numeric_limits<uint64_t>::max() - managed_used });
++    const uint64_t target = old_cache + growth;
++    const uint64_t aligned = target - target % mib;
++    return aligned > old_cache ? aligned : old_cache;
++}
++}
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 34bc781..b4786a7 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,5 +1,10 @@
+ #include "llama-moe-cache.h"
+ #include "llama-runtime-activity.h"
++#include "llama-moe-runtime.h"
++#include "llama-moe-admission.h"
++#include "llama-expert-trace.h"
++#include "llama-moe-partition.h"
++#include "ggml-cuda-host-op.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -9,6 +14,10 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <tuple>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+@@ -258,6 +267,17 @@ struct llama_moe_cache::impl {
+         int64_t rows = 0;
+         int32_t slots = 0;
+         moe_cache_slru slru;
++        llama_moe_admission admission;
++        struct residency { const ggml_tensor * tensor=nullptr; size_t offset=0,size=0; };
++        std::vector<residency> resident_ranges;
++        bool adaptive = false;
++        bool plan(int32_t key, const int32_t * ids, size_t count, std::vector<moe_cache_slru::fill> & fills, size_t & hits) {
++            return adaptive ? admission.plan(key,ids,count,fills,hits) : slru.plan(key,ids,count,fills,hits);
++        }
++        void abort(int32_t key,const std::vector<moe_cache_slru::fill> & fills) {
++            if (adaptive) { admission.abort(key,fills); }
++            else { for (const auto & fill : fills) { slru.slot_map[key][fill.expert]=-1; slru.key_of[fill.slot]=-1; } }
++        }
+     };
+     struct stream_binding {
+         size_t group;
+@@ -270,6 +290,13 @@ struct llama_moe_cache::impl {
+     std::unordered_map<const ggml_tensor *, std::vector<llama_moe_cache::tile>> stream_weights;
+     std::unordered_map<const ggml_tensor *, stream_binding> stream_maps;
+     llama_moe_cache::statistics stream_stats;
++    struct route_snapshot { std::vector<int32_t> ids; };
++    std::unordered_map<const ggml_tensor *,route_snapshot> route_snapshots;
++    std::deque<std::vector<int32_t>> map_snapshots;
++    uint64_t evaluation = 0;
++    std::map<std::tuple<const ggml_tensor *,int64_t,int64_t>,ggml_tensor *> graph_selections;
++
++#include "llama-moe-executor.inl"
+ 
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+@@ -570,6 +597,12 @@ struct llama_moe_cache::impl {
+                 throw std::runtime_error("gpu-exclusive: expert tile maps exceed 64 MiB; increase the cache");
+             }
+             g.slru.init(int32_t(g.weights.size() * tile_count), w->ne[2], g.slots);
++            g.adaptive = llama_moe_runtime::option("WILDLLAMA_MOE_ADMISSION");
++            if (g.adaptive) {
++                const int scratch=std::min<int>(n_expert_used,std::max<int>(1,g.slots/4));
++                g.admission.init(int32_t(g.weights.size()*tile_count),w->ne[2],g.slots,scratch);
++                g.resident_ranges.resize(g.slots);
++            }
+         }
+         auto init = [](size_t count) {
+             ggml_init_params params = { count * ggml_tensor_overhead(), nullptr, true };
+@@ -595,6 +628,11 @@ struct llama_moe_cache::impl {
+                     ggml_format_name(map, "moe_stream.map.%zu.%d", ig, key);
+                     tiles.push_back({ cached, map, d.backend, row, rows, g.slots });
+                     stream_maps[map] = { ig, key, w, row, rows };
++                    if (g.adaptive) {
++                        const int physical_layer=llama_runtime_activity::layer(w->name);
++                        if (physical_layer>=0) { g.admission.set_layer(key,physical_layer); }
++                        g.admission.set_cost(key,rows*w->nb[1]);
++                    }
+                 }
+             }
+         }
+@@ -613,6 +651,9 @@ struct llama_moe_cache::impl {
+         for (const auto & entry : stream_maps) {
+             const auto & b = entry.second;
+             stream_groups[b.group].slru.slot_map[b.key] = static_cast<int32_t *>(entry.first->data);
++            if (stream_groups[b.group].adaptive) {
++                stream_groups[b.group].admission.slot_map[b.key] = static_cast<int32_t *>(entry.first->data);
++            }
+         }
+         if (model.hparams.no_alloc) {
+             for (const auto & g : stream_groups) {
+@@ -632,50 +673,35 @@ struct llama_moe_cache::impl {
+         LLAMA_LOG_INFO("gpu-exclusive: %.2f MiB bounded expert cache, %zu layouts, %zu output-row tiles\n", d.buf_size / 1048576.0, stream_groups.size(), stream_maps.size());
+     }
+ 
+-    bool copy_stream(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+-        const ggml_tensor * root = src->view_src ? src->view_src : src;
+-        const auto it = stream_maps.find(root);
+-        if (it == stream_maps.end()) { return false; }
+-        const stream_binding & b = it->second;
+-        auto & g = stream_groups[b.group];
+-        const ggml_tensor * lookup = nullptr;
+-        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+-            const auto * node = ggml_graph_node(graph, i);
+-            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) { lookup = node; break; }
+-        }
+-        if (!lookup || lookup->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(lookup->src[1])) {
+-            throw std::runtime_error("gpu-exclusive: invalid expert tile dependency");
+-        }
+-        if (!(lookup->flags & GGML_TENSOR_FLAG_COMPUTE)) { return true; }
+-        const ggml_tensor * sel = lookup->src[1];
+-        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+-            const auto * node = ggml_graph_node(graph, i);
+-            if (node == sel || node == sel->view_src) {
+-                throw std::runtime_error("gpu-exclusive: router selection must complete before expert tile upload");
+-            }
+-        }
+-        ids.resize(ggml_nelements(sel));
+-        {
+-        llama_runtime_activity::scope activity("routing", llama_runtime_activity::layer(b.weight->name));
+-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+-        // Also protects bank slots and host maps from reuse before the previous tile completes.
+-        ggml_backend_synchronize(backend);
+-        }
++    void prepare_stream_binding(ggml_backend_t backend,const stream_binding & b) {
++        auto & g=stream_groups[b.group];
+         for (int32_t id : ids) {
+             if (id < 0 || id >= b.weight->ne[2]) { throw std::runtime_error("gpu-exclusive: invalid selected expert ID"); }
+         }
+         size_t hits = 0;
+-        if (!g.slru.plan(b.key, ids.data(), ids.size(), fills, hits)) {
++        if (!g.plan(b.key, ids.data(), ids.size(), fills, hits)) {
+             throw std::runtime_error("gpu-exclusive: selected experts exceed tile slots");
+         }
+         bool complete = false;
+         struct guard_t {
+             stream_group & g; int32_t key; const std::vector<moe_cache_slru::fill> & fills; bool & complete;
+             ~guard_t() {
+-                if (!complete) { for (const auto & f : fills) { g.slru.slot_map[key][f.expert] = -1; g.slru.key_of[f.slot] = -1; } }
++                if (!complete) { g.abort(key,fills); }
+             }
+         } guard { g, b.key, fills, complete };
+         const size_t bytes = b.rows * b.weight->nb[1];
++        if (g.adaptive && model.ram_cache) {
++            for (const auto slot:g.admission.invalidated_slots) {
++                auto & previous=g.resident_ranges[slot];
++                if (previous.tensor) { model.ram_cache->device_residency(previous.tensor,previous.offset,previous.size,false); }
++                previous={};
++            }
++            for (const auto & fill:fills) {
++                auto & previous=g.resident_ranges[fill.slot];
++                if (previous.tensor) { model.ram_cache->device_residency(previous.tensor,previous.offset,previous.size,false); }
++                previous={};
++            }
++        }
+         bool copied = false;
+         if (model.ram_cache && model.ram_cache->contains(b.weight) && !fills.empty()) {
+             std::vector<llama_model_ram_copy> copies;
+@@ -699,8 +725,67 @@ struct llama_moe_cache::impl {
+         stream_stats.misses += fills.size();
+         stream_stats.h2d_bytes += fills.size() * bytes;
+         stream_stats.tiles++;
+-        ggml_backend_tensor_set_async(backend, dst, root->data, 0, ggml_nbytes(root));
+-        complete = true;
++        if (g.adaptive && model.ram_cache) {
++            for (const auto & fill:fills) {
++                auto & range=g.resident_ranges[fill.slot];
++                range={b.weight,fill.expert*b.weight->nb[2]+b.row*b.weight->nb[1],bytes};
++                model.ram_cache->device_residency(range.tensor,range.offset,range.size,true);
++            }
++        }
++        complete=true;
++    }
++
++    bool copy_stream(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
++        const ggml_tensor * root = src->view_src ? src->view_src : src;
++        const auto it = stream_maps.find(root);
++        if (it == stream_maps.end()) { return false; }
++        const stream_binding & b = it->second;
++        const ggml_tensor * lookup = nullptr;
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            const auto * node = ggml_graph_node(graph, i);
++            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) { lookup = node; break; }
++        }
++        if (!lookup || lookup->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(lookup->src[1])) {
++            throw std::runtime_error("gpu-exclusive: invalid expert tile dependency");
++        }
++        if (!(lookup->flags & GGML_TENSOR_FLAG_COMPUTE)) { return true; }
++        const ggml_tensor * sel = lookup->src[1];
++        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++            const auto * node = ggml_graph_node(graph, i);
++            if (node == sel || node == sel->view_src) {
++                throw std::runtime_error("gpu-exclusive: router selection must complete before expert tile upload");
++            }
++        }
++        const ggml_tensor * canonical=sel->view_src ? sel->view_src : sel;
++        auto found=route_snapshots.find(canonical);
++        const bool shared=llama_moe_runtime::option("WILDLLAMA_MOE_ROUTE_PLAN") || llama_expert_trace::enabled();
++        if (!shared || found==route_snapshots.end()) {
++        ids.resize(ggml_nelements(sel));
++        {
++        llama_runtime_activity::scope activity("routing", llama_runtime_activity::layer(b.weight->name));
++        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        // Also protects bank slots and host maps from reuse before the previous tile completes.
++        ggml_backend_synchronize(backend);
++        }
++        if (shared) { found=route_snapshots.emplace(canonical,route_snapshot{ids}).first; }
++        if (llama_expert_trace::enabled()) {
++            const int il=llama_runtime_activity::layer(b.weight->name);
++            uint64_t bytes=0;
++            if (il>=0 && il<int(model.layers.size())) {
++                for (const auto * weight:llama_moe_cache_layer_experts(model.layers[il])) { bytes+=weight->nb[2]; }
++            }
++            const uint32_t k=uint32_t(canonical->ne[1]>1 ? canonical->ne[0] : model.hparams.n_expert_used_max());
++            llama_expert_trace::record_route(evaluation,il,ids.data(),ids.size(),uint32_t(ids.size()/k),k,bytes);
++        }
++        } else { ids=found->second.ids; }
++        prepare_stream_binding(backend,b);
++        const void * mapping=root->data;
++        if (llama_moe_runtime::enabled()) {
++            map_snapshots.emplace_back(static_cast<const int32_t *>(root->data),
++                static_cast<const int32_t *>(root->data)+ggml_nelements(root));
++            mapping=map_snapshots.back().data();
++        }
++        ggml_backend_tensor_set_async(backend, dst, mapping, 0, ggml_nbytes(root));
+         return true;
+     }
+ 
+@@ -777,7 +862,12 @@ struct llama_moe_cache::impl {
+                     throw std::runtime_error("gpu-exclusive: unsupported host row-gather index layout");
+                 }
+                 std::vector<int32_t> token_ids(ggml_nelements(tokens));
+-                ggml_backend_tensor_get(tokens, token_ids.data(), 0, token_ids.size() * sizeof(int32_t));
++                const ggml_tensor * owner=tokens;
++                while (owner->view_src) { owner=owner->view_src; }
++                if (owner->buffer && !ggml_backend_buffer_is_host(owner->buffer)) {
++                    ggml_backend_tensor_get_async(backend,tokens,token_ids.data(),0,token_ids.size()*sizeof(int32_t));
++                    ggml_backend_synchronize(backend);
++                } else { ggml_backend_tensor_get(tokens,token_ids.data(),0,token_ids.size()*sizeof(int32_t)); }
+                 std::vector<llama_model_ram_copy> copies;
+                 for (size_t i = 0; i < token_ids.size(); ++i) {
+                     if (token_ids[i] < 0 || token_ids[i] >= w->ne[1]) { throw std::runtime_error("gpu-exclusive: invalid selected host row ID"); }
+@@ -918,7 +1008,17 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
+     pimpl(new impl(model, backends, bufts, size)) {
+ }
+ 
+-llama_moe_cache::~llama_moe_cache() = default;
++llama_moe_cache::~llama_moe_cache() {
++    if (pimpl->model.ram_cache && llama_moe_runtime::enabled()) {
++        auto guard=pimpl->model.ram_cache->acquire();
++        for (auto & group:pimpl->stream_groups) {
++            for (auto & range:group.resident_ranges) {
++                if (range.tensor) { pimpl->model.ram_cache->device_residency(range.tensor,range.offset,range.size,false); }
++            }
++        }
++    }
++    if (pimpl->evaluation && llama_expert_trace::enabled()) { llama_expert_trace::finish(); }
++}
+ 
+ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
+     return pimpl->backend(il);
+@@ -946,7 +1046,7 @@ size_t llama_moe_cache::graph_nodes(uint32_t tokens) const {
+     for (const auto & entry : pimpl->stream_weights) {
+         const auto & tiles = entry.second;
+         if (tiles.empty()) { continue; }
+-        const size_t batch = std::max<int64_t>(1, tiles[0].slots / pimpl->n_expert_used);
++        const size_t batch = llama_moe_runtime::enabled() ? token_batch(entry.first) : std::max<int64_t>(1,tiles[0].slots/pimpl->n_expert_used);
+         nodes += 16 * tiles.size() * ((tokens + batch - 1) / batch);
+     }
+     return nodes;
+@@ -958,9 +1058,45 @@ llama_moe_cache::statistics llama_moe_cache::get_stats() const {
+     res.misses += pimpl->stats_small.misses + pimpl->stats_large.misses;
+     res.h2d_bytes += pimpl->stats_small.bytes + pimpl->stats_large.bytes;
+     for (const auto & g : pimpl->groups) { res.evictions += g.slru.evictions; }
+-    for (const auto & g : pimpl->stream_groups) { res.evictions += g.slru.evictions; }
++    for (const auto & g : pimpl->stream_groups) { res.evictions += g.adaptive ? g.admission.evictions : g.slru.evictions; }
+     return res;
+ }
++void llama_moe_cache::begin_evaluation() {
++    if (!pimpl->map_snapshots.empty()) {
++        for (const auto & device:pimpl->devices) { ggml_backend_synchronize(device.backend); }
++        pimpl->map_snapshots.clear();
++    }
++    ++pimpl->evaluation;
++    pimpl->route_snapshots.clear();
++    pimpl->executor_begin();
++}
++ggml_tensor * llama_moe_cache::streamed_matmul(ggml_context * ctx,const ggml_tensor * weight,ggml_tensor * input,ggml_tensor * ids) const {
++    return pimpl->make_streamed_matmul(ctx,weight,input,ids);
++}
++void llama_moe_cache::begin_graph() const { pimpl->graph_selections.clear(); }
++ggml_tensor * llama_moe_cache::selected_route(ggml_context * ctx,ggml_tensor * ids,int64_t token,int64_t count) const {
++    const auto key=std::make_tuple(static_cast<const ggml_tensor *>(ids),token,count);
++    auto found=pimpl->graph_selections.find(key);
++    if (found!=pimpl->graph_selections.end()) { return found->second; }
++    auto * result=ggml_cont(ctx,ggml_view_2d(ctx,ids,ids->ne[0],count,ids->nb[1],token*ids->nb[1]));
++    pimpl->graph_selections.emplace(key,result);
++    return result;
++}
++int64_t llama_moe_cache::token_batch(const ggml_tensor * weight) const {
++    const int layer=llama_runtime_activity::layer(weight->name);
++    int64_t tokens=INT64_MAX;
++    for (const auto & entry:pimpl->stream_weights) {
++        if (llama_runtime_activity::layer(entry.first->name)!=layer) { continue; }
++        for (const auto & tile:entry.second) { tokens=std::min(tokens,std::max<int64_t>(1,tile.slots/pimpl->n_expert_used)); }
++    }
++    if (tokens==INT64_MAX) { return 1; }
++    bool complete=true;
++    for (const auto & entry:pimpl->stream_weights) {
++        if (llama_runtime_activity::layer(entry.first->name)!=layer) { continue; }
++        for (const auto & tile:entry.second) { complete &= tile.slots>=entry.first->ne[2]; }
++    }
++    return complete ? INT32_MAX : tokens;
++}
+ 
+ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+     return pimpl->copy(backend, src, dst, graph);
+@@ -980,5 +1116,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
+     if (pimpl->buf_host) {
+         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
+     }
++    if (pimpl->executor_workspace) {
++        res[ggml_backend_buffer_get_type(pimpl->executor_workspace.get())]+=pimpl->executor_workspace_size;
++    }
+     return res;
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 6f94b1e..7991b13 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -41,6 +41,11 @@ public:
+     const std::vector<tile> * get_tiles(const ggml_tensor * w) const;
+     size_t graph_nodes(uint32_t tokens) const;
+     statistics get_stats() const;
++    void begin_evaluation();
++    int64_t token_batch(const ggml_tensor * weight) const;
++    ggml_tensor * streamed_matmul(ggml_context * ctx, const ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const;
++    void begin_graph() const;
++    ggml_tensor * selected_route(ggml_context * ctx, ggml_tensor * ids, int64_t token, int64_t count) const;
+ 
+     // ggml_backend_sched copy callback, returns false if src is not a slot map
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+diff --git a/src/llama-moe-executor.inl b/src/llama-moe-executor.inl
+new file mode 100644
+index 0000000..25f8081
+--- /dev/null
++++ b/src/llama-moe-executor.inl
+@@ -0,0 +1,265 @@
++    // Included inside llama_moe_cache::impl. The parent graph keeps fixed shapes;
++    // only this provider's bounded child CUDA work changes with actual routing.
++    ggml_backend_ptr executor_backend;
++    ggml_backend_buffer_ptr executor_workspace;
++    size_t executor_workspace_size = 0;
++    size_t executor_output_size = 0;
++    size_t executor_ids_size = 0;
++    std::mutex executor_mutex;
++    std::unordered_map<const ggml_tensor *, std::vector<int32_t>> executor_routes;
++    std::vector<int32_t> executor_slot_ids;
++
++    static bool executor_enabled() {
++        const char * value = std::getenv("WILDLLAMA_MOE_DYNAMIC_PREFILL");
++        return llama_moe_runtime::enabled() && value && std::strcmp(value, "1") == 0;
++    }
++
++    static size_t executor_product(size_t a, size_t b) {
++        if (b && a > std::numeric_limits<size_t>::max() / b) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill workspace overflow");
++        }
++        return a * b;
++    }
++
++    static size_t executor_sum(size_t a, size_t b) {
++        if (a > std::numeric_limits<size_t>::max() - b) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill workspace overflow");
++        }
++        return a + b;
++    }
++
++    static size_t executor_align(size_t value, size_t alignment) {
++        if (!alignment) { throw std::runtime_error("gpu-exclusive: invalid CUDA alignment"); }
++        const size_t remainder = value % alignment;
++        return remainder ? executor_sum(value, alignment - remainder) : value;
++    }
++
++    static ggml_tensor * executor_alias(ggml_context * ctx, const ggml_tensor * source) {
++        ggml_backend_buffer_t buffer = source->buffer;
++        for (const ggml_tensor * root = source; !buffer && root->view_src;) {
++            root = root->view_src;
++            buffer = root->buffer;
++        }
++        if (!buffer || !source->data) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill input is not allocated");
++        }
++        auto * alias = ggml_new_tensor_4d(ctx, source->type,
++            source->ne[0], source->ne[1], source->ne[2], source->ne[3]);
++        std::memcpy(alias->nb, source->nb, sizeof(alias->nb));
++        alias->buffer = buffer;
++        alias->data = source->data;
++        alias->extra = source->extra;
++        // Do not attach the parent operation or its ancestors to the child graph.
++        return alias;
++    }
++
++    static void executor_view(ggml_tensor * view) {
++        if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill view initialization failed");
++        }
++    }
++
++    static void executor_cpu_unavailable(ggml_tensor *, int, int, void *) {
++        GGML_ABORT("gpu-exclusive: dynamic expert prefill requires its CUDA provider");
++    }
++
++    void executor_begin() {
++        std::lock_guard<std::mutex> guard(executor_mutex);
++        executor_routes.clear();
++    }
++
++    void executor_reserve(size_t output_bytes, size_t ids_bytes) {
++        const size_t alignment = ggml_backend_buft_get_alignment(devices[0].buft);
++        output_bytes = executor_align(std::max(output_bytes, executor_output_size), alignment);
++        ids_bytes = executor_align(std::max(ids_bytes, executor_ids_size), alignment);
++        const size_t needed = executor_sum(output_bytes, ids_bytes);
++        if (needed <= executor_workspace_size) {
++            executor_output_size = output_bytes;
++            executor_ids_size = ids_bytes;
++            return;
++        }
++        if (!executor_backend) {
++            executor_backend.reset(ggml_backend_dev_init(ggml_backend_get_device(devices[0].backend), nullptr));
++            if (!executor_backend) {
++                throw std::runtime_error("gpu-exclusive: cannot initialize dynamic prefill CUDA backend");
++            }
++        }
++        ggml_backend_synchronize(executor_backend.get());
++        executor_workspace.reset();
++        executor_workspace_size = 0;
++        executor_workspace.reset(ggml_backend_buft_alloc_buffer(devices[0].buft, needed));
++        if (!executor_workspace) {
++            throw std::runtime_error("gpu-exclusive: cannot allocate bounded dynamic prefill workspace");
++        }
++        ggml_backend_buffer_set_usage(executor_workspace.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
++        executor_output_size = output_bytes;
++        executor_ids_size = ids_bytes;
++        executor_workspace_size = ggml_backend_buffer_get_size(executor_workspace.get());
++    }
++
++    ggml_tensor * make_streamed_matmul(ggml_context * ctx, const ggml_tensor * weight,
++                                      ggml_tensor * input, ggml_tensor * selected) {
++        if (!executor_enabled() || !model.gpu_exclusive() || model.hparams.no_alloc || selected->ne[1] <= 1) {
++            return nullptr;
++        }
++        const auto found = stream_weights.find(weight);
++        if (found == stream_weights.end() || found->second.empty()) { return nullptr; }
++        if (devices.size() != 1 || input->ne[0] != weight->ne[0] || input->ne[2] != selected->ne[1] ||
++            input->ne[3] != 1 || (input->ne[1] != 1 && input->ne[1] != selected->ne[0]) ||
++            selected->type != GGML_TYPE_I32 || selected->ne[0] <= 0 || selected->ne[2] != 1 || selected->ne[3] != 1 ||
++            selected->nb[0] != sizeof(int32_t) || weight->ne[2] <= 0) {
++            throw std::runtime_error("gpu-exclusive: unsupported dynamic prefill tensor geometry");
++        }
++        auto * device = ggml_backend_get_device(devices[0].backend);
++        const auto * api = static_cast<const ggml_backend_cuda_host_op_api *>(
++            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_cuda_host_op_api"));
++        if (!api || api->version != 1 || !api->set) {
++            throw std::runtime_error("gpu-exclusive: CUDA dynamic prefill provider is unavailable");
++        }
++        const size_t count = executor_product(size_t(selected->ne[0]), size_t(selected->ne[1]));
++        size_t rows = 0;
++        for (const auto & tile : found->second) { rows = std::max(rows, size_t(tile.rows)); }
++        {
++            std::lock_guard<std::mutex> guard(executor_mutex);
++            executor_reserve(executor_product(executor_product(rows, count), sizeof(float)),
++                             executor_product(count, sizeof(int32_t)));
++        }
++        ggml_tensor * sources[] = { input, selected };
++        auto * result = ggml_custom_4d(ctx, GGML_TYPE_F32, weight->ne[1], selected->ne[0], selected->ne[1], 1,
++            sources, 2, executor_cpu_unavailable, 1, nullptr);
++        if (!api->set(result, executor_callback, this, const_cast<ggml_tensor *>(weight))) {
++            throw std::runtime_error("gpu-exclusive: cannot attach dynamic prefill CUDA provider");
++        }
++        ggml_format_name(result, "moe_dynamic.%s", weight->name);
++        return result;
++    }
++
++    static bool executor_callback(ggml_backend_dev_t device, ggml_tensor * output, void * data0, void * data1) noexcept {
++        auto * self = static_cast<impl *>(data0);
++        try {
++            return self->executor_compute(device, output, static_cast<const ggml_tensor *>(data1));
++        } catch (const std::exception & error) {
++            LLAMA_LOG_ERROR("gpu-exclusive: dynamic prefill failed: %s\n", error.what());
++        } catch (...) {
++            LLAMA_LOG_ERROR("gpu-exclusive: dynamic prefill failed\n");
++        }
++        if (self && self->executor_backend) { ggml_backend_synchronize(self->executor_backend.get()); }
++        return false;
++    }
++
++    bool executor_compute(ggml_backend_dev_t device, ggml_tensor * output, const ggml_tensor * weight) {
++        std::lock_guard<std::mutex> guard(executor_mutex);
++        if (!executor_backend || !executor_workspace || device != ggml_backend_get_device(executor_backend.get()) ||
++            !weight || !output || !output->src[0] || !output->src[1]) {
++            throw std::runtime_error("gpu-exclusive: invalid dynamic prefill execution state");
++        }
++        const auto * input = output->src[0];
++        const auto * selected = output->src[1];
++        const auto weight_tiles = stream_weights.find(weight);
++        if (weight_tiles == stream_weights.end() || weight_tiles->second.empty()) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill has no expert tiles");
++        }
++        const size_t k = size_t(selected->ne[0]), tokens = size_t(selected->ne[1]);
++        const size_t count = executor_product(k, tokens);
++        if (executor_product(count, sizeof(int32_t)) > executor_ids_size) {
++            throw std::runtime_error("gpu-exclusive: dynamic prefill IDs exceed reserved workspace");
++        }
++        const int layer = llama_runtime_activity::layer(weight->name);
++        size_t capacity = std::numeric_limits<size_t>::max();
++        for (const auto & entry : stream_weights) {
++            if (llama_runtime_activity::layer(entry.first->name) != layer) { continue; }
++            if (entry.first->ne[2] != weight->ne[2]) {
++                throw std::runtime_error("gpu-exclusive: inconsistent dynamic prefill expert counts");
++            }
++            for (const auto & tile : entry.second) { capacity = std::min(capacity, size_t(tile.slots)); }
++        }
++        auto route = executor_routes.find(selected);
++        if (route == executor_routes.end()) {
++            std::vector<int32_t> actual(count);
++            ggml_backend_tensor_get_2d(selected, actual.data(), 0, k * sizeof(int32_t), tokens,
++                                      selected->nb[1], k * sizeof(int32_t));
++            route = executor_routes.emplace(selected, std::move(actual)).first;
++            if (llama_expert_trace::enabled()) {
++                uint64_t bytes = 0;
++                if (layer >= 0 && layer < int(model.layers.size())) {
++                    for (const auto * tensor : llama_moe_cache_layer_experts(model.layers[layer])) { bytes += tensor->nb[2]; }
++                }
++                llama_expert_trace::record_route(evaluation, layer, route->second.data(), count,
++                    uint32_t(tokens), uint32_t(k), bytes);
++            }
++        }
++        const auto windows = llama_moe_partition::plan(route->second.data(), tokens, k, capacity, size_t(weight->ne[2]));
++        for (const auto & window : windows) {
++            const size_t begin = executor_product(window.begin, k), end = executor_sum(begin, executor_product(window.tokens, k));
++            ids.assign(route->second.begin() + begin, route->second.begin() + end);
++            for (const auto & tile : weight_tiles->second) {
++                const size_t output_bytes = executor_product(executor_product(size_t(tile.rows), ids.size()), sizeof(float));
++                if (output_bytes > executor_output_size) {
++                    throw std::runtime_error("gpu-exclusive: dynamic prefill output exceeds reserved workspace");
++                }
++                const auto binding = stream_maps.find(tile.slot_map);
++                if (binding == stream_maps.end()) {
++                    throw std::runtime_error("gpu-exclusive: dynamic prefill tile mapping is missing");
++                }
++                const ggml_init_params params = { 32 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true };
++                ggml_context_ptr ctx(ggml_init(params));
++                if (!ctx) { throw std::runtime_error("gpu-exclusive: dynamic prefill metadata allocation failed"); }
++                try {
++                    prepare_stream_binding(executor_backend.get(), binding->second);
++                    const auto & group = stream_groups[binding->second.group];
++                    const int32_t * mapping = group.adaptive ? group.admission.slot_map[binding->second.key] :
++                        group.slru.slot_map[binding->second.key];
++                    executor_slot_ids.resize(ids.size());
++                    for (size_t index = 0; index < ids.size(); ++index) {
++                        const int32_t slot = mapping[ids[index]];
++                        if (slot < 0 || slot >= tile.slots) {
++                            throw std::runtime_error("gpu-exclusive: dynamic prefill expert has no resident slot");
++                        }
++                        executor_slot_ids[index] = slot;
++                    }
++                    auto * input_alias = executor_alias(ctx.get(), input);
++                    auto * output_alias = executor_alias(ctx.get(), output);
++                    auto * weight_alias = executor_alias(ctx.get(), tile.weight);
++                    auto * input_view = ggml_view_3d(ctx.get(), input_alias, input->ne[0], input->ne[1], int64_t(window.tokens),
++                        input->nb[1], input->nb[2], executor_product(window.begin, input->nb[2]));
++                    executor_view(input_view);
++                    auto * slots = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, int64_t(k), int64_t(window.tokens));
++                    auto * workspace = static_cast<uint8_t *>(ggml_backend_buffer_get_base(executor_workspace.get()));
++                    if (ggml_backend_tensor_alloc(executor_workspace.get(), slots, workspace + executor_output_size) != GGML_STATUS_SUCCESS) {
++                        throw std::runtime_error("gpu-exclusive: dynamic prefill ID tensor allocation failed");
++                    }
++                    auto * part = ggml_mul_mat_id(ctx.get(), weight_alias, input_view, slots);
++                    const auto precision = model.prec_policy.prec_src1.find(weight);
++                    if (precision != model.prec_policy.prec_src1.end()) { ggml_prec_set_src(part, precision->second, 1); }
++                    if (weight->type == GGML_TYPE_NVFP4) { ggml_prec_set_acc(part, GGML_PREC_BF16); }
++                    if (ggml_backend_tensor_alloc(executor_workspace.get(), part, workspace) != GGML_STATUS_SUCCESS) {
++                        throw std::runtime_error("gpu-exclusive: dynamic prefill output tensor allocation failed");
++                    }
++                    const size_t offset = executor_sum(executor_product(window.begin, output->nb[2]),
++                                                       executor_product(size_t(tile.row), output->nb[0]));
++                    auto * destination = ggml_view_3d(ctx.get(), output_alias, tile.rows, int64_t(k), int64_t(window.tokens),
++                        output->nb[1], output->nb[2], offset);
++                    executor_view(destination);
++                    auto * copy = ggml_cpy(ctx.get(), part, destination);
++                    executor_view(copy);
++                    if (!ggml_backend_supports_op(executor_backend.get(), part) ||
++                        !ggml_backend_supports_op(executor_backend.get(), copy)) {
++                        throw std::runtime_error("gpu-exclusive: CUDA does not support a dynamic prefill operation");
++                    }
++                    auto * graph = ggml_new_graph_custom(ctx.get(), 32, false);
++                    ggml_build_forward_expand(graph, copy);
++                    ggml_backend_tensor_set_async(executor_backend.get(), slots, executor_slot_ids.data(), 0,
++                                                  executor_product(executor_slot_ids.size(), sizeof(int32_t)));
++                    if (ggml_backend_graph_compute_async(executor_backend.get(), graph) != GGML_STATUS_SUCCESS) {
++                        throw std::runtime_error("gpu-exclusive: dynamic prefill CUDA execution failed");
++                    }
++                    ggml_backend_synchronize(executor_backend.get());
++                } catch (...) {
++                    // Keep metadata, slot IDs and staging alive until queued GPU work finishes.
++                    ggml_backend_synchronize(executor_backend.get());
++                    throw;
++                }
++            }
++        }
++        return true;
++    }
+diff --git a/src/llama-moe-partition.h b/src/llama-moe-partition.h
+new file mode 100644
+index 0000000..2fa97ef
+--- /dev/null
++++ b/src/llama-moe-partition.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace llama_moe_partition {
++struct window {
++    size_t begin;
++    size_t tokens;
++    size_t unique;
++};
++
++// IDs are token-major (k consecutive IDs per token). Only window boundaries are
++// changed; token order, top-k order and the IDs themselves remain untouched.
++inline std::vector<window> plan(const int32_t * ids, size_t tokens, size_t k,
++                                size_t slot_capacity, size_t expert_count) {
++    if (!k || !slot_capacity || !expert_count) {
++        throw std::invalid_argument("expert partition dimensions must be positive");
++    }
++    const size_t maximum_ids = size_t(std::numeric_limits<std::ptrdiff_t>::max()) / sizeof(int32_t);
++    if (tokens > maximum_ids / k || expert_count > size_t(std::numeric_limits<int32_t>::max())) {
++        throw std::length_error("expert partition dimensions overflow supported indexing");
++    }
++    if (!tokens) { return {}; }
++    if (!ids) { throw std::invalid_argument("expert partition IDs are missing"); }
++    std::vector<uint32_t> seen(expert_count, 0);
++    std::vector<window> windows;
++    windows.reserve(std::min<size_t>(tokens, 64));
++    uint32_t generation = 1;
++    size_t begin = 0, unique = 0;
++    auto add = [&](size_t token) {
++        for (size_t selected = 0; selected < k; ++selected) {
++            const int32_t expert = ids[token * k + selected];
++            if (expert < 0 || size_t(expert) >= expert_count) {
++                throw std::invalid_argument("expert partition contains an invalid expert ID");
++            }
++            if (seen[expert] != generation) { seen[expert] = generation; ++unique; }
++        }
++    };
++    for (size_t token = 0; token < tokens; ++token) {
++        const size_t before = unique;
++        add(token);
++        if (unique <= slot_capacity) { continue; }
++        if (token == begin) {
++            throw std::invalid_argument("one token selects more experts than the cache can hold");
++        }
++        windows.push_back({ begin, token - begin, before });
++        begin = token;
++        unique = 0;
++        if (++generation == 0) { std::fill(seen.begin(), seen.end(), 0); generation = 1; }
++        add(token);
++        if (unique > slot_capacity) {
++            throw std::invalid_argument("one token selects more experts than the cache can hold");
++        }
++    }
++    windows.push_back({ begin, tokens - begin, unique });
++    return windows;
++}
++}
+diff --git a/src/llama-moe-runtime.h b/src/llama-moe-runtime.h
+new file mode 100644
+index 0000000..948a31b
+--- /dev/null
++++ b/src/llama-moe-runtime.h
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include <cstdlib>
++#include <cstring>
++
++namespace llama_moe_runtime {
++inline bool enabled() {
++    static const bool value = [] {
++        const char * env = std::getenv("WILDLLAMA_MOE_RUNTIME");
++        return env && std::strcmp(env, "1") == 0;
++    }();
++    return value;
++}
++inline bool option(const char * name) {
++    const char * env = std::getenv(name);
++    return enabled() && (!env || std::strcmp(env, "0") != 0);
++}
++}
+diff --git a/tests/test-cuda-host-op.cpp b/tests/test-cuda-host-op.cpp
+new file mode 100644
+index 0000000..2484ada
+--- /dev/null
++++ b/tests/test-cuda-host-op.cpp
+@@ -0,0 +1,125 @@
++#include "ggml-cpp.h"
++#include "ggml-cuda-host-op.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void enable(bool value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_MOE_RUNTIME", value ? "1" : "0");
++#else
++    setenv("WILDLLAMA_MOE_RUNTIME", value ? "1" : "0", 1);
++#endif
++}
++
++static void cpu_forbidden(ggml_tensor *, int, int, void *) {
++    fprintf(stderr, "FAIL: CUDA provider fell back to CPU\n");
++    std::abort();
++}
++
++struct provider_state {
++    ggml_backend_t child;
++    float input = 1;
++    unsigned calls = 0;
++    enum { normal, failure, exception } mode = normal;
++};
++
++static bool execute(ggml_backend_dev_t device, ggml_tensor * node, void * data0, void * data1) {
++    auto & state = *static_cast<provider_state *>(data0);
++    require(data1 == &state.calls, "provider opaque metadata changed");
++    require(device == ggml_backend_get_device(state.child), "provider received the wrong CUDA device");
++    ++state.calls;
++    if (state.mode == provider_state::failure) { return false; }
++    if (state.mode == provider_state::exception) { throw std::runtime_error("expected provider exception"); }
++    std::vector<float> input(ggml_nelements(node->src[0]));
++    ggml_backend_tensor_get(node->src[0], input.data(), 0, ggml_nbytes(node->src[0]));
++    for (float value : input) { require(value == 2*state.input, "provider saw unfinished parent-stream input"); }
++
++    ggml_context_ptr context(ggml_init({ 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
++    require(context != nullptr, "cannot create child graph metadata");
++    auto * borrowed = ggml_dup_tensor(context.get(), node->src[0]);
++    borrowed->buffer = node->src[0]->buffer;
++    borrowed->data = node->src[0]->data;
++    auto * result = ggml_scale(context.get(), borrowed, 3.0f);
++    result->buffer = node->buffer;
++    result->data = node->data;
++    auto * graph = ggml_new_graph(context.get());
++    ggml_build_forward_expand(graph, result);
++    require(ggml_backend_supports_op(state.child, result), "child operation is not CUDA supported");
++    // A separate backend owns the child graph and synchronizes its output.
++    // No inference arithmetic is performed by the host callback.
++    return ggml_backend_graph_compute(state.child, graph) == GGML_STATUS_SUCCESS;
++}
++
++int main() {
++    try {
++        enable(true);
++        ggml_backend_load_all();
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) {
++            fprintf(stderr, "SKIP: no available CUDA device\n");
++            return 77;
++        }
++        auto * api = static_cast<const ggml_backend_cuda_host_op_api *>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_host_op_api"));
++        require(api && api->version == 1, "CUDA host provider API unavailable");
++        auto * device = ggml_backend_reg_dev_get(registry, 0);
++        ggml_backend_ptr parent(ggml_backend_dev_init(device, nullptr));
++        ggml_backend_ptr child(ggml_backend_dev_init(device, nullptr));
++        require(parent && child, "cannot initialize CUDA backends");
++        ggml_context_ptr context(ggml_init({ 16*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true }));
++        require(context != nullptr, "cannot create parent graph");
++        auto * a = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 8192);
++        auto * scaled = ggml_scale(context.get(), a, 2.0f);
++        ggml_tensor * arguments[] = { scaled };
++        auto * provider = ggml_custom_4d(context.get(), GGML_TYPE_F32, a->ne[0], 1, 1, 1,
++                                       arguments, 1, cpu_forbidden, 1, nullptr);
++        auto * output = ggml_scale(context.get(), provider, 5.0f);
++        auto * unmarked = ggml_custom_4d(context.get(), GGML_TYPE_F32, a->ne[0], 1, 1, 1,
++                                       arguments, 1, cpu_forbidden, 1, nullptr);
++        auto * graph = ggml_new_graph(context.get());
++        auto * invalid = ggml_new_graph(context.get());
++        ggml_build_forward_expand(graph, output);
++        ggml_build_forward_expand(invalid, unmarked);
++        ggml_backend_buffer_ptr tensors(ggml_backend_alloc_ctx_tensors(context.get(), parent.get()));
++        require(tensors != nullptr, "cannot allocate parent tensors");
++        provider_state state { child.get() };
++        require(!api->supports(unmarked) && !ggml_backend_supports_op(parent.get(), unmarked), "unmarked custom node accepted");
++        require(!api->set(a, execute, &state, &state.calls), "non-custom node accepted");
++        require(!api->set(provider, nullptr, &state, &state.calls), "null provider accepted");
++        require(api->set(provider, execute, &state, &state.calls) && api->supports(provider), "provider registration failed");
++        require(ggml_backend_supports_op(parent.get(), provider), "registered provider is not CUDA supported");
++        enable(false);
++        require(!api->supports(provider) && !api->set(unmarked, execute, &state, &state.calls), "disabled runtime accepted a provider");
++        enable(true);
++        std::vector<float> values(8192), actual(8192);
++        for (int iteration=1; iteration<=6; ++iteration) {
++            state.input=float(iteration);
++            std::fill(values.begin(), values.end(), state.input);
++            ggml_backend_tensor_set(a, values.data(), 0, ggml_nbytes(a));
++            require(ggml_backend_graph_compute(parent.get(), graph) == GGML_STATUS_SUCCESS, "provider graph failed");
++            ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
++            for (float value : actual) { require(value == 30*state.input, "provider/child CUDA output changed"); }
++            require(state.calls == unsigned(iteration), "CUDA graph capture skipped the host provider");
++        }
++        state.mode=provider_state::failure;
++        require(ggml_backend_graph_compute(parent.get(), graph) == GGML_STATUS_FAILED, "false provider result did not propagate");
++        state.mode=provider_state::exception;
++        require(ggml_backend_graph_compute(parent.get(), graph) == GGML_STATUS_FAILED, "provider exception escaped its backend boundary");
++        state.mode=provider_state::normal;
++        require(ggml_backend_graph_compute(parent.get(), graph) == GGML_STATUS_SUCCESS, "provider backend remained unusable after failure");
++        require(ggml_backend_graph_compute(parent.get(), invalid) == GGML_STATUS_FAILED, "unmarked custom execution did not fail closed");
++        printf("PASS: CUDA host provider readiness, child arithmetic, capture exclusion, metadata and failure recovery\n");
++        return 0;
++    } catch (const std::exception & error) {
++        fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-cuda-upload.cpp b/tests/test-cuda-upload.cpp
+new file mode 100644
+index 0000000..c790045
+--- /dev/null
++++ b/tests/test-cuda-upload.cpp
+@@ -0,0 +1,102 @@
++#include "ggml-cpp.h"
++#include "ggml-cuda-upload.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        ggml_backend_load_all();
++        auto * registry = ggml_backend_reg_by_name("CUDA");
++        if (!registry || !ggml_backend_reg_dev_count(registry)) {
++            fprintf(stderr, "SKIP: no available CUDA device\n");
++            return 77;
++        }
++        auto * device = ggml_backend_reg_dev_get(registry, 0);
++        auto * api = static_cast<const ggml_backend_cuda_upload_api *>(
++            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_upload_api"));
++        require(api && api->version == 1, "CUDA upload API unavailable");
++        require(!api->create(nullptr), "null backend accepted");
++        ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
++        require(backend != nullptr, "cannot initialize CUDA backend");
++        ggml_context_ptr context(ggml_init({ 24*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false), nullptr, true }));
++        require(context != nullptr, "cannot initialize tensor context");
++        constexpr int width = 256;
++        constexpr size_t bytes = width*width*sizeof(float);
++        auto * a = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, width, width);
++        auto * b = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, width, width);
++        auto * first = ggml_mul_mat(context.get(), a, b);
++        auto * second = ggml_mul_mat(context.get(), a, b);
++        auto * graph_first = ggml_new_graph_custom(context.get(), 16, false);
++        auto * graph_second = ggml_new_graph_custom(context.get(), 16, false);
++        ggml_build_forward_expand(graph_first, first);
++        ggml_build_forward_expand(graph_second, second);
++        ggml_backend_buffer_ptr tensors(ggml_backend_alloc_ctx_tensors(context.get(), backend.get()));
++        require(tensors != nullptr, "cannot allocate CUDA tensors");
++        auto * host_type = ggml_backend_dev_host_buffer_type(device);
++        require(host_type && ggml_backend_buft_is_host(host_type), "pinned host buffer type unavailable");
++        ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(host_type, 2*bytes));
++        require(host && ggml_backend_buffer_get_type(host.get()) == host_type, "pinned host allocation fell back");
++        auto * source = static_cast<float *>(ggml_backend_buffer_get_base(host.get()));
++        auto * source_second = source + width*width;
++        std::fill(source, source_second, 1.0f);
++        std::fill(source_second, source_second + width*width, 2.0f);
++        std::vector<float> ones(width*width, 1.0f);
++        ggml_backend_tensor_set(b, ones.data(), 0, bytes);
++        struct queue_owner {
++            const ggml_backend_cuda_upload_api * api;
++            void * queue;
++            ~queue_owner() { if (queue) { api->free(queue); } }
++        } upload { api, api->create(backend.get()) };
++        require(upload.queue != nullptr, "cannot create bounded CUDA upload queue");
++        require(api->wait_host(upload.queue, 0) && api->wait_host(upload.queue, 1), "initial unrecorded slot wait failed");
++        require(!api->copy(upload.queue, a, source, 0, bytes), "copy accepted outside a batch");
++        require(api->begin(upload.queue, backend.get()), "cannot begin first upload");
++        require(!api->begin(upload.queue, backend.get()), "nested upload accepted");
++        require(!api->record(upload.queue, 2), "invalid staging slot accepted");
++        require(!api->copy(upload.queue, a, source, bytes, sizeof(float)), "out-of-bounds upload accepted");
++        require(api->copy(upload.queue, a, source, 0, bytes), "first upload failed");
++        require(api->record(upload.queue, 0), "cannot record first source lifetime");
++        require(api->end(upload.queue, backend.get()), "cannot publish first upload dependency");
++        require(ggml_backend_graph_compute_async(backend.get(), graph_first) == GGML_STATUS_SUCCESS, "first asynchronous graph failed");
++
++        // begin() fences the first graph before reusing a, while the source
++        // event permits reusing pinned host memory independently of compute.
++        require(api->begin(upload.queue, backend.get()), "cannot begin second upload");
++        require(api->copy(upload.queue, a, source_second, 0, bytes), "second upload failed");
++        require(api->record(upload.queue, 1), "cannot record second source lifetime");
++        require(api->end(upload.queue, backend.get()), "cannot publish second upload dependency");
++        require(api->wait_host(upload.queue, 0), "first source lifetime wait failed");
++        std::fill(source, source_second, -99.0f);
++        require(ggml_backend_graph_compute_async(backend.get(), graph_second) == GGML_STATUS_SUCCESS, "second asynchronous graph failed");
++        ggml_backend_synchronize(backend.get());
++        std::vector<float> actual(width*width);
++        ggml_backend_tensor_get(first, actual.data(), 0, bytes);
++        for (float value : actual) { require(value == width, "upload overwrote a live compute consumer"); }
++        ggml_backend_tensor_get(second, actual.data(), 0, bytes);
++        for (float value : actual) { require(value == 2*width, "compute did not wait for uploaded weights"); }
++        require(api->wait_host(upload.queue, 1), "second source lifetime wait failed");
++
++        // The queue destructor must finish a final source borrow even when the
++        // caller has no recorded slot/end because a higher-level batch failed.
++        std::fill(source, source_second, 3.0f);
++        require(api->begin(upload.queue, backend.get()), "cannot begin cleanup upload");
++        require(api->copy(upload.queue, a, source, 0, bytes), "cleanup upload failed");
++        api->free(upload.queue);
++        upload.queue = nullptr;
++        std::fill(source, source_second, -100.0f);
++        ggml_backend_tensor_get(a, actual.data(), 0, bytes);
++        for (float value : actual) { require(value == 3.0f, "queue cleanup released a borrowed source too early"); }
++        printf("PASS: CUDA upload dependencies, source slots, bounds and cleanup\n");
++    } catch (const std::exception & error) {
++        fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/test-moe-admission.cpp b/tests/test-moe-admission.cpp
+new file mode 100644
+index 0000000..c52a4a7
+--- /dev/null
++++ b/tests/test-moe-admission.cpp
+@@ -0,0 +1,139 @@
++#include "../src/llama-moe-admission.h"
++
++#include <cstdio>
++#include <list>
++#include <random>
++#include <stdexcept>
++#include <unordered_map>
++#include <vector>
++
++namespace {
++struct fill { int32_t expert, slot; };
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++struct fixture {
++    llama_moe_admission cache;
++    std::vector<std::vector<int32_t>> maps;
++    fixture(int keys, int experts, int slots, int scratch) : maps(keys, std::vector<int32_t>(experts, -1)) {
++        cache.init(keys, experts, slots, scratch);
++        for (int key = 0; key < keys; ++key) { cache.slot_map[key] = maps[key].data(); }
++    }
++    size_t access(int key, const std::vector<int32_t> & ids) {
++        std::vector<fill> fills;
++        size_t hits;
++        require(cache.plan(key, ids.data(), ids.size(), fills, hits), "route rejected");
++        for (int expert : ids) {
++            const int slot = maps[key][expert];
++            require(slot >= 0 && slot < cache.n_slots, "selected expert has no slot");
++            require(cache.key_of[slot] == key * cache.n_expert + expert, "selected expert overwritten");
++        }
++        require(cache.persistent_slots() <= cache.persistent_capacity(), "persistent capacity exceeded");
++        return hits;
++    }
++};
++
++void cyclic_scan() {
++    fixture f(48, 16, 32, 4);
++    std::list<int> lru;
++    size_t retained_hits = 0, lru_hits = 0;
++    for (int token = 0; token < 12; ++token) {
++        for (int layer = 0; layer < 48; ++layer) {
++            retained_hits += f.access(layer, { 1, 3 });
++            for (int expert : { 1, 3 }) {
++                const int id = layer * 16 + expert;
++                auto previous = std::find(lru.begin(), lru.end(), id);
++                if (previous != lru.end()) { ++lru_hits; lru.erase(previous); }
++                lru.push_back(id);
++                if (lru.size() > 32) { lru.pop_front(); }
++            }
++        }
++    }
++    require(lru_hits == 0, "baseline did not reproduce cyclic eviction");
++    require(retained_hits > 200, "admission did not retain reusable cyclic experts");
++    std::printf("cyclic48: admission_hits=%zu lru_hits=%zu\n", retained_hits, lru_hits);
++}
++
++void wide_routes_and_rollback() {
++    fixture f(4, 32, 12, 2);
++    for (int i = 0; i < 8; ++i) { f.access(i % 4, { 1, 2, 3 }); }
++    std::vector<int32_t> wide;
++    for (int i = 0; i < 12; ++i) { wide.push_back(i); }
++    f.access(3, wide);
++    auto before = f.cache.key_of;
++    std::vector<fill> fills;
++    size_t hits;
++    wide.push_back(12);
++    require(!f.cache.plan(1, wide.data(), wide.size(), fills, hits), "oversized route accepted");
++    require(f.cache.key_of == before, "rejected route mutated residency");
++    const int32_t selected[] = { 14, 15, 16 };
++    require(f.cache.plan(2, selected, 3, fills, hits), "new route rejected");
++    f.cache.abort(2, fills);
++    for (const auto & item : fills) { require(f.maps[2][item.expert] == -1, "failed upload stayed published"); }
++    f.access(2, { 14, 15, 16 });
++    for (int i = 0; i < 50; ++i) { f.access(i % 4, { 1, 4, 7, 10 }); }
++}
++
++void changing_workload_and_random_invariants() {
++    fixture f(48, 64, 64, 8);
++    for (int i = 0; i < 100; ++i) { f.access(i % 4, { 0, 1, 2, 3 }); }
++    size_t recent_hits = 0;
++    for (int i = 0; i < 2000; ++i) {
++        const size_t hits = f.access(44 + i % 4, { 40, 41, 42, 43 });
++        if (i > 1800) { recent_hits += hits; }
++    }
++    require(recent_hits > 700, "new hot workload failed to displace old history");
++    std::mt19937 random(20261025);
++    for (int i = 0; i < 20000; ++i) {
++        std::vector<int32_t> ids;
++        const size_t count = 1 + random() % 64;
++        for (size_t j = 0; j < count; ++j) { ids.push_back(random() % 64); }
++        f.access(random() % 48, ids);
++        for (int slot = 0; slot < 64; ++slot) {
++            const int id = f.cache.key_of[slot];
++            if (id >= 0) { require(f.maps[id / 64][id % 64] == slot, "reverse map mismatch"); }
++        }
++    }
++}
++
++void residency_invalidations() {
++    fixture f(4, 32, 8, 2);
++    std::vector<fill> fills;
++    size_t hits;
++    const int32_t first[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
++    require(f.cache.plan(0, first, 8, fills, hits), "initial hint route failed");
++    require(f.cache.invalidated_slots.empty(), "initial empty slots reported eviction");
++    std::vector<int32_t> scratch;
++    for (int slot = 0; slot < 8; ++slot) {
++        if (!f.cache.is_retained(slot)) { scratch.push_back(slot); }
++    }
++    require(scratch.size() == 2, "initial route did not use bounded scratch");
++    const int32_t second[] = { 10 };
++    require(f.cache.plan(1, second, 1, fills, hits), "replacement hint route failed");
++    for (int slot : scratch) {
++        require(std::find(f.cache.invalidated_slots.begin(), f.cache.invalidated_slots.end(), slot) !=
++                f.cache.invalidated_slots.end(), "unused released scratch slot left a residency hint");
++    }
++    const size_t before_abort = f.cache.invalidated_slots.size();
++    require(fills.size() == 1, "new hint route unexpectedly hit");
++    const int32_t failed_slot = fills[0].slot;
++    f.cache.abort(1, fills);
++    require(f.cache.invalidated_slots.size() == before_abort + 1 &&
++            f.cache.invalidated_slots.back() == failed_slot, "failed upload did not invalidate its hint");
++    const int32_t invalid[] = { -1 };
++    require(!f.cache.plan(1, invalid, 1, fills, hits), "invalid hint route accepted");
++    require(f.cache.invalidated_slots.empty(), "rejected route retained prior invalidation hints");
++}
++}
++
++int main() {
++    try {
++        cyclic_scan();
++        wide_routes_and_rollback();
++        changing_workload_and_random_invariants();
++        residency_invalidations();
++        std::puts("PASS: expert admission, cyclic retention, wide routes, rollback and changing workloads");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-budget.cpp b/tests/test-moe-budget.cpp
+new file mode 100644
+index 0000000..f06da13
+--- /dev/null
++++ b/tests/test-moe-budget.cpp
+@@ -0,0 +1,79 @@
++#include "../src/llama-moe-budget.h"
++
++#include <cstdio>
++#include <limits>
++#include <random>
++#include <stdexcept>
++
++namespace {
++constexpr uint64_t mib = llama_moe_budget::mib;
++constexpr uint64_t gib = mib * 1024;
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++
++void examples() {
++    using llama_moe_budget::plan;
++    require(plan(gib, 12*gib, 6*gib + gib/4, 8*gib, 80*gib) == 6*gib + gib/2,
++            "managed quota slack was not computed from current allocation");
++    require(plan(gib, 12*gib, 6*gib, 3*gib, 80*gib) == 3*gib + 3*gib/4,
++            "physical free memory did not bound growth");
++    require(plan(gib, 0, 6*gib, 3*gib, 80*gib) == 3*gib + 3*gib/4,
++            "zero quota ignored the physical budget");
++    require(plan(gib, 0, 6*gib, 20*gib, gib + gib/2) == gib + gib/2,
++            "expert bytes did not cap capacity");
++    require(plan(gib, 12*gib, 6*gib, 256*mib, 80*gib) == gib,
++            "growth consumed physical headroom");
++    require(plan(gib, 12*gib, 12*gib - 256*mib, 20*gib, 80*gib) == gib,
++            "growth consumed managed headroom");
++    require(plan(gib, 12*gib, 13*gib, 20*gib, 80*gib) == gib,
++            "an over-quota runner grew");
++    require(plan(gib, 12*gib, gib - 1, 20*gib, 80*gib) == gib,
++            "inconsistent accounting grew the cache");
++    require(plan(gib + 7, 0, 2*gib, 256*mib, 80*gib) == gib + 7,
++            "a no-growth plan changed the current allocation");
++    require(plan(gib, 0, 2*gib, 256*mib + mib - 1, 80*gib) == gib,
++            "sub-MiB slack grew an aligned cache");
++    require(plan(gib, 0, 2*gib, 256*mib + mib, 80*gib) == gib + mib,
++            "one safe MiB was not admitted");
++    require(plan(0, 0, 0, mib, 8*mib, 0) == mib, "empty cache could not use an explicit budget");
++    require(plan(gib, 0, 6*gib, 20*gib, gib - 1) == gib, "planner unexpectedly shrank the cache");
++}
++
++void saturation_and_properties() {
++    using llama_moe_budget::plan;
++    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
++    require(plan(maximum, maximum, maximum, maximum, maximum) == maximum, "saturated current cache changed");
++    require(plan(maximum - 2*mib, 0, maximum - mib, maximum, maximum, 0) == maximum - maximum % mib - mib,
++            "saturated growth overflowed");
++    require(plan(0, maximum, maximum - 1, maximum, maximum, maximum) == 0,
++            "saturated headroom underflowed");
++    std::mt19937_64 random(20261025);
++    for (int test = 0; test < 100000; ++test) {
++        const uint64_t old = random(), quota = test % 5 ? random() : 0;
++        const uint64_t used = random(), free = random(), total = random(), reserve = random();
++        const uint64_t target = plan(old, quota, used, free, total, reserve);
++        require(target >= old, "plan shrank an existing cache");
++        if (target == old) { continue; }
++        require(target % mib == 0 && target <= total, "grown target broke alignment or expert capacity");
++        require(used >= old && free > reserve, "growth used invalid accounting");
++        const uint64_t growth = target - old;
++        require(growth <= maximum - used, "growth overflowed managed accounting");
++        require(growth <= free - reserve, "growth consumed physical headroom");
++        if (quota) {
++            require(used < quota && quota - used > reserve, "growth used an exhausted quota");
++            require(growth <= quota - used - reserve, "growth consumed quota headroom");
++        }
++    }
++}
++}
++
++int main() {
++    try {
++        examples();
++        saturation_and_properties();
++        std::puts("PASS: expert cache budgets, alignment, headroom and overflow boundaries");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-partition.cpp b/tests/test-moe-partition.cpp
+new file mode 100644
+index 0000000..f158a66
+--- /dev/null
++++ b/tests/test-moe-partition.cpp
+@@ -0,0 +1,108 @@
++#include "../src/llama-moe-partition.h"
++
++#include <cstdio>
++#include <limits>
++#include <random>
++#include <set>
++#include <stdexcept>
++#include <vector>
++
++namespace {
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++template<class Function>
++void rejects(Function function) {
++    bool rejected = false;
++    try { function(); }
++    catch (const std::invalid_argument &) { rejected = true; }
++    catch (const std::length_error &) { rejected = true; }
++    require(rejected, "invalid partition input was accepted");
++}
++
++void repeated_and_disjoint() {
++    using llama_moe_partition::plan;
++    std::vector<int32_t> ids;
++    for (int token = 0; token < 32; ++token) {
++        for (int expert = 0; expert < 10; ++expert) { ids.push_back(expert); }
++    }
++    auto same = plan(ids.data(), 32, 10, 10, 512);
++    require(same.size() == 1 && same[0].begin == 0 && same[0].tokens == 32 && same[0].unique == 10,
++            "repeated experts did not share the full prompt window");
++    ids = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
++    auto separate = plan(ids.data(), 6, 2, 4, 16);
++    require(separate.size() == 3, "disjoint experts did not split at capacity");
++    for (size_t i = 0; i < separate.size(); ++i) {
++        require(separate[i].begin == i*2 && separate[i].tokens == 2 && separate[i].unique == 4,
++                "disjoint window boundary is wrong");
++    }
++    const int32_t duplicates[] = { 3, 3, 3, 3, 3, 3 };
++    auto duplicate = plan(duplicates, 2, 3, 1, 4);
++    require(duplicate.size() == 1 && duplicate[0].tokens == 2 && duplicate[0].unique == 1,
++            "within-token duplicates incorrectly consumed slots");
++    require(plan(nullptr, 0, 10, 10, 512).empty(), "empty prompt produced windows");
++}
++
++void boundaries() {
++    using llama_moe_partition::plan;
++    const int32_t valid[] = { 0, 1, 2, 3 };
++    const int32_t negative[] = { -1 };
++    const int32_t high[] = { 4 };
++    rejects([&] { plan(valid, 1, 0, 4, 4); });
++    rejects([&] { plan(valid, 1, 1, 0, 4); });
++    rejects([&] { plan(valid, 1, 1, 4, 0); });
++    rejects([&] { plan(nullptr, 1, 1, 4, 4); });
++    rejects([&] { plan(valid, 1, 4, 3, 4); });
++    rejects([&] { plan(negative, 1, 1, 4, 4); });
++    rejects([&] { plan(high, 1, 1, 4, 4); });
++    rejects([&] { plan(valid, std::numeric_limits<size_t>::max(), 2, 4, 4); });
++    rejects([&] { plan(valid, 2, std::numeric_limits<size_t>::max(), 4, 4); });
++    rejects([&] { plan(valid, 1, 1, 4, std::numeric_limits<size_t>::max()); });
++    auto exact = plan(valid, 1, 4, 4, 4);
++    require(exact.size() == 1 && exact[0].unique == 4, "exact-capacity token was rejected");
++}
++
++void randomized_maximality() {
++    std::mt19937 random(20261025);
++    for (int test = 0; test < 10000; ++test) {
++        const size_t tokens = 1 + random() % 100;
++        const size_t experts = 1 + random() % 128;
++        const size_t k = 1 + random() % 12;
++        const size_t capacity = std::max(k, size_t(1 + random() % experts));
++        std::vector<int32_t> ids(tokens * k);
++        for (auto & id : ids) { id = int32_t(random() % experts); }
++        const auto original = ids;
++        const auto windows = llama_moe_partition::plan(ids.data(), tokens, k, capacity, experts);
++        size_t next = 0;
++        for (const auto & window : windows) {
++            require(window.begin == next && window.tokens > 0, "tokens were skipped, repeated or reordered");
++            std::set<int32_t> selected;
++            const size_t end = window.begin + window.tokens;
++            require(end <= tokens, "window exceeded prompt length");
++            for (size_t token = window.begin; token < end; ++token) {
++                for (size_t i = 0; i < k; ++i) { selected.insert(ids[token*k + i]); }
++            }
++            require(selected.size() == window.unique && selected.size() <= capacity,
++                    "window union exceeds capacity or reports the wrong size");
++            if (end != tokens) {
++                for (size_t i = 0; i < k; ++i) { selected.insert(ids[end*k + i]); }
++                require(selected.size() > capacity, "window was not greedily maximal");
++            }
++            next = end;
++        }
++        require(next == tokens, "partition did not cover the prompt");
++        require(ids == original, "partition changed expert IDs or their order");
++    }
++}
++}
++
++int main() {
++    try {
++        repeated_and_disjoint();
++        boundaries();
++        randomized_maximality();
++        std::puts("PASS: exact expert unions, maximal prompt windows and token-order preservation");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-ram-pool.cpp b/tests/test-moe-ram-pool.cpp
+new file mode 100644
+index 0000000..ad80338
+--- /dev/null
++++ b/tests/test-moe-ram-pool.cpp
+@@ -0,0 +1,250 @@
++#include "../src/llama-model-ram.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <future>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void enable(const char * name) {
++#ifdef _WIN32
++    _putenv_s(name, "1");
++#else
++    setenv(name, "1", 1);
++#endif
++}
++
++static void test_bounded_hint_scan(const char * directory) {
++    constexpr size_t page=65536, budget=128*page;
++    struct fixture {
++        std::filesystem::path path;
++        ~fixture() { std::error_code error; std::filesystem::remove(path,error); }
++    } file { std::filesystem::path(directory)/("moe-hint-probe-"+std::to_string(std::random_device{}())+".bin") };
++    std::vector<uint8_t> raw(129*page);
++    for (size_t i=0; i<raw.size(); ++i) { raw[i]=uint8_t(i*29+i/193); }
++    {
++        std::ofstream stream(file.path,std::ios::binary);
++        stream.write(reinterpret_cast<const char *>(raw.data()),raw.size());
++        require(stream.good(),"cannot write bounded hint fixture");
++    }
++    llama_files files;
++    files.emplace_back(new llama_file(file.path.string().c_str(),"rb"));
++    ggml_context_ptr context(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    require(context!=nullptr,"cannot create bounded hint context");
++    auto * weights=ggml_new_tensor_1d(context.get(),GGML_TYPE_I8,raw.size());
++    llama_model_ram_cache cache(budget,files,true);
++    cache.bind(weights,0,0);
++    std::vector<uint8_t> result(page);
++    auto guard=cache.acquire();
++    // Separate fills make probation order deterministic despite out-of-order
++    // I/O completion. The hinted page lies beyond the bounded search prefix.
++    for (size_t index=0; index<128; ++index) {
++        require(cache.prefetch({{weights,index*page,page}}),"cannot fill bounded hint cache");
++    }
++    cache.device_residency(weights,100*page,page,true);
++    require(cache.prefetch({{weights,128*page,page}}),"cannot evict through bounded hint fallback");
++    const auto before=cache.stats(guard);
++    cache.read(weights,100*page,result.data(),page);
++    require(cache.stats(guard).bytes_read==before.bytes_read &&
++            !memcmp(result.data(),raw.data()+100*page,page),
++            "cooperative eviction searched past its bounded prefix");
++    cache.read(weights,0,result.data(),page);
++    require(cache.stats(guard).bytes_read>before.bytes_read && !memcmp(result.data(),raw.data(),page),
++            "bounded cooperative search did not fall back to the SLRU victim");
++    cache.device_residency(weights,100*page,page,false);
++    require(cache.stats(guard).resident<=budget && cache.stats(guard).peak<=budget,
++            "bounded hint selection exceeded its physical quota");
++}
++
++int main(int argc, char ** argv) {
++    try {
++        if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "--gpu")) {
++            throw std::runtime_error("usage: test-moe-ram-pool DIRECTORY [--gpu]");
++        }
++        enable("WILDLLAMA_MOE_RUNTIME");
++        enable("WILDLLAMA_MOE_RAM_POOL");
++        enable("WILDLLAMA_MOE_COOPERATIVE_CACHE");
++        enable("WILDLLAMA_MOE_UPLOAD_OVERLAP");
++        const bool gpu = argc == 3;
++        ggml_backend_load_all();
++        ggml_backend_ptr backend(ggml_backend_init_by_type(gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++        if (gpu && !backend) { fprintf(stderr, "SKIP: no available GPU device\n"); return 77; }
++        require(backend != nullptr, "test backend unavailable");
++        constexpr size_t page = 65536, budget = 2*page, size = 16*page, prefix = 31;
++        struct fixture {
++            std::filesystem::path path;
++            ~fixture() { std::error_code error; std::filesystem::remove(path, error); }
++        } file { std::filesystem::path(argv[1]) / ("moe-ram-pool-" + std::to_string(std::random_device{}()) + ".bin") };
++        std::vector<uint8_t> raw(size + prefix);
++        for (size_t i = 0; i < raw.size(); ++i) { raw[i] = uint8_t(i*37 + i/251); }
++        auto write_fixture = [&] {
++            std::ofstream stream(file.path, std::ios::binary | std::ios::trunc);
++            stream.write(reinterpret_cast<const char *>(raw.data()), raw.size());
++            require(stream.good(), "cannot write pool fixture");
++        };
++        write_fixture();
++        llama_files files;
++        files.emplace_back(new llama_file(file.path.string().c_str(), "rb"));
++        ggml_context_ptr source(ggml_init({ 4*ggml_tensor_overhead(), nullptr, true }));
++        ggml_context_ptr target(ggml_init({ 4*ggml_tensor_overhead(), nullptr, true }));
++        require(source && target, "cannot create test contexts");
++        auto * weights = ggml_new_tensor_1d(source.get(), GGML_TYPE_I8, size);
++        auto * alias = ggml_dup_tensor(source.get(), weights);
++        auto * destination = ggml_new_tensor_1d(target.get(), GGML_TYPE_I8, size);
++        ggml_backend_buffer_ptr output(ggml_backend_alloc_ctx_tensors(target.get(), backend.get()));
++        require(output != nullptr, "cannot allocate test destination");
++        llama_model_ram_cache cache(budget, files, true);
++        cache.bind(weights, 0, prefix);
++        cache.bind(alias, 0, prefix);
++        require(weights->data == alias->data && cache.contains(alias), "tied pooled weights lost their identity");
++        cache.set_diagnostics(true);
++        std::vector<uint8_t> result(size), expected(size);
++        auto check_budget = [&](const llama_model_ram_stats & stats) {
++            require(stats.limit == budget && stats.resident <= budget && stats.peak <= budget,
++                    "pool committed physical pages exceed the weight quota");
++        };
++        {
++            auto guard = cache.acquire();
++            cache.read(weights, 0, result.data(), budget);
++            require(!memcmp(result.data(), raw.data()+prefix, budget), "first pool fill changed bytes");
++        }
++        const auto filled = cache.stats();
++        check_budget(filled);
++        require(filled.resident == budget && filled.peak == budget, "pool did not account for committed reusable slots");
++        {
++            auto guard = cache.acquire();
++            cache.read(alias, 17, result.data(), page-31);
++            require(!memcmp(result.data(), raw.data()+prefix+17, page-31), "warm unaligned pool read changed bytes");
++            require(cache.stats(guard).bytes_read == filled.bytes_read, "warm pooled alias reread disk data");
++            for (size_t pass=0; pass<64; ++pass) {
++                const size_t offset = ((pass*7)%15)*page + page-37;
++                cache.read(weights, offset, result.data(), page+11);
++                require(!memcmp(result.data(), raw.data()+prefix+offset, page+11), "evicted pooled pages reloaded incorrectly");
++                check_budget(cache.stats(guard));
++            }
++        }
++        const auto cycled = cache.stats();
++        require(cycled.evicted_pages > 0 && cycled.misses > filled.misses && cycled.hits > filled.hits,
++                "pool cycling did not exercise eviction, misses and hits");
++        require(cycled.commit_us == filled.commit_us, "pool recommitted memory while reusing existing slots");
++        {
++            auto guard = cache.acquire();
++            std::fill(expected.begin(), expected.end(), 0xd3);
++            ggml_backend_tensor_set(destination, expected.data(), 0, size);
++            const std::vector<llama_model_ram_copy> copies = {
++                { weights, destination, 3*page+17, page+5, page-31 },
++                { weights, destination, 12*page+53, 4*page+11, page-61 },
++                { alias, destination, 3*page+17, 7*page+19, page-31 },
++            };
++            require(cache.copy_batch(backend.get(), copies), "pooled batched transfer failed");
++            for (const auto & copy : copies) {
++                std::copy_n(raw.data()+prefix+copy.src_offset, copy.size, expected.data()+copy.dst_offset);
++            }
++            ggml_backend_synchronize(backend.get());
++            ggml_backend_tensor_get(destination, result.data(), 0, size);
++            require(result == expected, "pooled batch gather or destination gaps changed bytes");
++            require(cache.copy(backend.get(), weights, destination, 0, 0, size), "oversized chunked pool copy failed");
++            ggml_backend_synchronize(backend.get());
++            ggml_backend_tensor_get(destination, result.data(), 0, size);
++            require(!memcmp(result.data(), raw.data()+prefix, size), "chunked pool copy changed bytes");
++            const auto before = cache.stats(guard);
++            require(!cache.copy_batch(backend.get(), { { weights, destination, 0, 0, 3*page } }),
++                    "batch larger than the physical pool was accepted");
++            require(cache.stats(guard).bytes_read == before.bytes_read, "oversized pool batch performed partial I/O");
++            bool rejected=false;
++            try { cache.read(weights, size-1, result.data(), 2); }
++            catch (const std::exception &) { rejected=true; }
++            require(rejected, "out-of-bounds pooled read accepted");
++            rejected=false;
++            try { cache.read(weights, SIZE_MAX, result.data(), 2); }
++            catch (const std::exception &) { rejected=true; }
++            require(rejected, "overflowing pooled read accepted");
++            ggml_tensor node = {};
++            node.op=GGML_OP_MUL_MAT;
++            node.flags=GGML_TENSOR_FLAG_COMPUTE;
++            for (auto & dimension : node.ne) { dimension=1; }
++            node.src[0]=weights;
++            require(cache.needs_prepare(&node) && !cache.prepare(&node) && std::strstr(cache.error(), "streaming copy"),
++                    "pooled weights were exposed as directly readable CPU tensors");
++        }
++        {
++            auto guard = cache.acquire();
++            cache.read(weights,size-budget,result.data(),budget);
++            cache.read(weights, 0, result.data(), budget);
++            cache.device_residency(weights, page, page, true);
++            cache.read(weights, 2*page, result.data(), page);
++            const auto before = cache.stats(guard);
++            cache.read(weights, 0, result.data(), page);
++            require(cache.stats(guard).bytes_read == before.bytes_read,
++                    "cooperative eviction discarded CPU-only page before GPU-resident shadow");
++            cache.read(weights, page, result.data(), page);
++            require(cache.stats(guard).bytes_read > before.bytes_read,
++                    "cooperative eviction did not reclaim the GPU-resident shadow");
++            cache.device_residency(weights, page, page, false);
++
++            cache.read(weights,size-budget,result.data(),budget);
++            cache.read(weights,0,result.data(),budget);
++            cache.read(weights,0,result.data(),page);
++            cache.device_residency(weights,0,page,true);
++            cache.read(weights,2*page,result.data(),page);
++            const auto protected_before=cache.stats(guard);
++            cache.read(weights,0,result.data(),page);
++            require(cache.stats(guard).bytes_read==protected_before.bytes_read,
++                    "device hint displaced a protected page while probation had a victim");
++            cache.read(weights,page,result.data(),page);
++            require(cache.stats(guard).bytes_read>protected_before.bytes_read,
++                    "SLRU probation victim was not selected before protected GPU shadow");
++            cache.device_residency(weights,0,page,false);
++        }
++        auto concurrent_reader = [&](size_t start) {
++            std::vector<uint8_t> bytes(page+17);
++            for (size_t i=0; i<12; ++i) {
++                const size_t offset=((start+i*3)%15)*page+7;
++                auto guard=cache.acquire();
++                cache.read(alias,offset,bytes.data(),bytes.size());
++                require(!memcmp(bytes.data(),raw.data()+prefix+offset,bytes.size()), "shared pool reader received another reader's bytes");
++                check_budget(cache.stats(guard));
++            }
++        };
++        auto one=std::async(std::launch::async,concurrent_reader,0);
++        auto two=std::async(std::launch::async,concurrent_reader,7);
++        one.get(); two.get();
++        {
++            auto guard=cache.acquire();
++            cache.read(weights,size-budget,result.data(),budget);
++            std::filesystem::resize_file(file.path,prefix);
++            bool rejected=false;
++            try { cache.copy_batch(backend.get(),{{weights,destination,0,0,page}}); }
++            catch (const std::exception &) { rejected=true; }
++            require(rejected, "truncated pooled transfer accepted");
++            check_budget(cache.stats(guard));
++            write_fixture();
++            require(cache.copy_batch(backend.get(),{{weights,destination,0,0,page}}),
++                    "pool or upload queue remained unusable after failed I/O");
++            ggml_backend_synchronize(backend.get());
++            ggml_backend_tensor_get(destination,result.data(),0,page);
++            require(!memcmp(result.data(),raw.data()+prefix,page), "recovered pooled transfer changed bytes");
++            check_budget(cache.stats(guard));
++        }
++        const auto final=cache.stats();
++        require(final.commit_us == filled.commit_us, "pool grew commitment after its slots were fully allocated");
++        test_bounded_hint_scan(argv[1]);
++        printf("PASS pooled RAM: exact reads/copies, reuse without recommit, cooperative eviction, shared readers, bounds and I/O recovery (%s)\n",
++               gpu ? "GPU" : "CPU");
++        return 0;
++    } catch (const std::exception & error) {
++        fprintf(stderr,"FAIL: %s\n",error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-prepare-async.cpp b/tests/test-prepare-async.cpp
+new file mode 100644
+index 0000000..2c770e6
+--- /dev/null
++++ b/tests/test-prepare-async.cpp
+@@ -0,0 +1,169 @@
++#include "ggml-backend-impl.h"
++#include "ggml-cpp.h"
++#include "ggml-impl.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <stdexcept>
++#include <string>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void set_runtime(const char * value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_MOE_RUNTIME", value ? value : "");
++#else
++    if (value) { setenv("WILDLLAMA_MOE_RUNTIME", value, 1); }
++    else { unsetenv("WILDLLAMA_MOE_RUNTIME"); }
++#endif
++}
++
++struct deferred_backend {
++    ggml_backend_t cpu;
++    std::deque<ggml_cgraph> queued;
++    unsigned synchronizations = 0;
++    bool failed = false;
++};
++
++static void synchronize(ggml_backend_t backend) {
++    auto & state = *static_cast<deferred_backend *>(backend->context);
++    ++state.synchronizations;
++    while (!state.queued.empty()) {
++        auto graph = state.queued.front();
++        state.queued.pop_front();
++        state.failed |= ggml_backend_graph_compute(state.cpu, &graph) != GGML_STATUS_SUCCESS;
++    }
++}
++
++static enum ggml_status enqueue(ggml_backend_t backend, ggml_cgraph * graph) {
++    auto & state = *static_cast<deferred_backend *>(backend->context);
++    // Node arrays belong to the scheduler and remain alive until synchronize.
++    state.queued.push_back(*graph);
++    return GGML_STATUS_SUCCESS;
++}
++
++struct observation {
++    deferred_backend * state;
++    ggml_tensor * sum;
++    ggml_tensor * output;
++    ggml_tensor * b;
++    bool prepare;
++    bool evaluate;
++    bool prepared = false;
++    bool evaluated = false;
++};
++
++static bool prepare(ggml_tensor * tensor, bool ask, void * data) {
++    auto & test = *static_cast<observation *>(data);
++    if (ask) { return test.prepare && tensor == test.output; }
++    require(test.state->queued.empty(), "preparation ran before previous consumers completed");
++    float values[8];
++    ggml_backend_tensor_get(test.sum, values, 0, sizeof(values));
++    for (float value : values) { require(value == 3.0f, "preparation saw unfinished graph output"); }
++    for (float & value : values) { value = 4.0f; }
++    ggml_backend_tensor_set(test.b, values, 0, sizeof(values));
++    test.prepared = true;
++    return true;
++}
++
++static bool evaluate(ggml_tensor * tensor, bool ask, void * data) {
++    auto & test = *static_cast<observation *>(data);
++    if (ask) { return test.evaluate && tensor == test.output; }
++    require(test.state->queued.empty(), "evaluation ran before its results completed");
++    float values[8];
++    ggml_backend_tensor_get(test.output, values, 0, sizeof(values));
++    for (float value : values) { require(value == 5.0f, "evaluation saw unfinished graph output"); }
++    test.evaluated = true;
++    return true;
++}
++
++static void run_case(ggml_backend_t cpu, bool enabled, bool prepare_output, bool evaluate_output) {
++    set_runtime(enabled ? "1" : "0");
++    deferred_backend deferred { cpu, {} };
++    ggml_backend_i iface = {};
++    iface.get_name = [](ggml_backend_t) { return "deferred-test"; };
++    iface.synchronize = synchronize;
++    iface.graph_compute = enqueue;
++    ggml_backend mock { cpu->guid, iface, ggml_backend_get_device(cpu), &deferred };
++    ggml_backend_t backends[] = { &mock };
++    ggml_context_ptr inputs(ggml_init({ 4*ggml_tensor_overhead(), nullptr, true }));
++    ggml_context_ptr context(ggml_init({ 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true }));
++    require(inputs && context, "cannot create test contexts");
++    auto * a = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, 8);
++    auto * b = ggml_new_tensor_1d(inputs.get(), GGML_TYPE_F32, 8);
++    ggml_set_input(a);
++    ggml_set_input(b);
++    // External input buffers cannot be reused as scheduler intermediates. The
++    // output sentinel must not overwrite either source before the first graph.
++    ggml_backend_buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(inputs.get(), cpu));
++    require(input_buffer != nullptr, "cannot allocate external test inputs");
++    auto * sum = ggml_add(context.get(), a, b);
++    auto * output = ggml_add(context.get(), sum, b);
++    ggml_set_output(sum);
++    ggml_set_output(output);
++    auto * graph = ggml_new_graph(context.get());
++    ggml_build_forward_expand(graph, output);
++    ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends, nullptr, 1, 128, false, true));
++    require(scheduler != nullptr && ggml_backend_sched_alloc_graph(scheduler.get(), graph), "cannot allocate test graph");
++    float values[8];
++    for (float & value : values) { value = 1.0f; }
++    ggml_backend_tensor_set(a, values, 0, sizeof(values));
++    for (float & value : values) { value = 2.0f; }
++    ggml_backend_tensor_set(b, values, 0, sizeof(values));
++    for (float & value : values) { value = -99.0f; }
++    ggml_backend_tensor_set(output, values, 0, sizeof(values));
++    observation test { &deferred, sum, output, b, prepare_output, evaluate_output };
++    ggml_backend_sched_set_prepare_callback(scheduler.get(), prepare, &test);
++    if (evaluate_output) { ggml_backend_sched_set_eval_callback(scheduler.get(), evaluate, &test); }
++    deferred.synchronizations = 0;
++    require(ggml_backend_sched_graph_compute_async(scheduler.get(), graph) == GGML_STATUS_SUCCESS, "async test graph failed");
++    const unsigned expected = !enabled || prepare_output || evaluate_output ? 1 : 0;
++    require(deferred.synchronizations == expected, "unexpected graph-view synchronization count");
++    require(test.prepared == prepare_output && test.evaluated == evaluate_output, "callbacks were omitted");
++    if (enabled && !evaluate_output) {
++        require(!deferred.queued.empty(), "preparation-only callback forced synchronous graph completion");
++    }
++    ggml_backend_sched_synchronize(scheduler.get());
++    require(!deferred.failed && deferred.queued.empty(), "deferred execution failed to drain");
++    ggml_backend_tensor_get(output, values, 0, sizeof(values));
++    for (float value : values) {
++        if (value != (prepare_output ? 7.0f : 5.0f)) {
++            float va[8],vb[8],vs[8];
++            ggml_backend_tensor_get(a,va,0,sizeof(va));
++            ggml_backend_tensor_get(b,vb,0,sizeof(vb));
++            ggml_backend_tensor_get(sum,vs,0,sizeof(vs));
++            fprintf(stderr,"case runtime=%d prepare=%d evaluate=%d result=%g a=%g b=%g sum=%g flags=%d/%d sync=%u data=%p/%p/%p/%p\n",
++                    int(enabled),int(prepare_output),int(evaluate_output),value,va[0],vb[0],vs[0],sum->flags,output->flags,
++                    deferred.synchronizations,a->data,b->data,sum->data,output->data);
++            throw std::runtime_error("graph result changed");
++        }
++    }
++}
++
++int main() {
++    const char * value = std::getenv("WILDLLAMA_MOE_RUNTIME");
++    const bool existed = value != nullptr;
++    const std::string previous = value ? value : "";
++    struct restore {
++        bool existed;
++        const std::string & value;
++        ~restore() { set_runtime(existed ? value.c_str() : nullptr); }
++    } environment { existed, previous };
++    try {
++        ggml_backend_load_all();
++        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++        require(cpu != nullptr, "CPU backend unavailable");
++        run_case(cpu.get(), false, false, false);
++        run_case(cpu.get(), true, false, false);
++        run_case(cpu.get(), true, false, true);
++        run_case(cpu.get(), true, true, false);
++        printf("PASS: async preparation preserves explicit host barriers and deferred outputs\n");
++    } catch (const std::exception & error) {
++        fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++    return 0;
++}

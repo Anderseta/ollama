@@ -7,7 +7,7 @@ param(
     [string]$CudaVersion = '',
     [string]$CudaArchitectures = '120',
     [int]$Parallel = 4,
-    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component')
+    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-expert-trace')
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-integrity.ps1')
@@ -77,6 +77,11 @@ if(!$SkipConfigure) {
         "-DOLLAMA_RUNNER_DIR=$runnerDirectory" "-DCMAKE_CUDA_FLAGS=-t 2"
     if($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 }
+$sourceRoots = @($nativeDirectory, (Join-Path $repoRoot 'llama\compat'),
+    (Join-Path $repoRoot 'llama\server'))
+$sourceFiles = @((Join-Path $repoRoot 'LLAMA_CPP_VERSION'),
+    (Join-Path $PSScriptRoot 'CMakeLists.txt'), (Join-Path $PSScriptRoot 'build-windows.ps1'),
+    (Join-Path $PSScriptRoot 'build-integrity.ps1'))
 if($Build) {
     New-Item -ItemType Directory -Force -Path $integrityDirectory | Out-Null
     if(Test-Path -LiteralPath $taintMarker -PathType Leaf) {
@@ -90,11 +95,14 @@ if($Build) {
             $taint | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $taintMarker -Encoding utf8
         }
     }
-    $sourceRoots = @($nativeDirectory, (Join-Path $repoRoot 'llama\compat'),
-        (Join-Path $repoRoot 'llama\server'))
-    $sourceFiles = @((Join-Path $repoRoot 'LLAMA_CPP_VERSION'),
-        (Join-Path $PSScriptRoot 'CMakeLists.txt'), (Join-Path $PSScriptRoot 'build-windows.ps1'),
-        (Join-Path $PSScriptRoot 'build-integrity.ps1'))
+    $dependencyRecords = @(Get-GpuFirstNinjaDependencies -Ninja $ninja -OutputDirectory $outputDirectory)
+    $dependencyRepair = Repair-GpuFirstHeaderDependencies -BuildRoot $buildDirectory -OutputDirectory $outputDirectory -Records $dependencyRecords -NativeSource $nativeDirectory
+    if($dependencyRepair.RemovedCount) {
+        Write-Output "Invalidated $($dependencyRepair.RemovedCount) stale host objects with zero recorded header dependencies. CUDA objects and valid nonzero records are preserved."
+    }
+    if($dependencyRepair.CudaZeroRecords) {
+        throw "Build blocked: Ninja reports $($dependencyRepair.CudaZeroRecords) CUDA objects with zero dependencies. CUDA objects were preserved; repair dependency output and explicitly rebuild them."
+    }
     if(!$InstallRoot -and $Targets.Count -eq 1 -and $Targets[0] -eq 'test-gpu-exclusive-op') {
         # This isolated target links ggml only. Unrelated model/PLE edits are
         # not its build inputs and must not taint the full CUDA runtime cache.
@@ -127,6 +135,11 @@ if($Build) {
     Assert-GpuFirstStableSources -Before $before -After $after -MarkerPath $taintMarker -BeforePath $beforePath -AfterPath $afterPath
     if($nativeBuildException) { throw $nativeBuildException }
     if($nativeBuildExitCode -ne 0) { throw 'Native build failed' }
+    if($InstallRoot -or $Targets -contains 'llama-server' -or $Targets -contains 'llama-quantize' -or
+       $Targets -contains 'test-gpu-exclusive' -or $Targets -contains 'test-server-component') {
+        $dependencyRecords = @(Get-GpuFirstNinjaDependencies -Ninja $ninja -OutputDirectory $outputDirectory)
+        Assert-GpuFirstHeaderDependencies -BuildRoot $buildDirectory -OutputDirectory $outputDirectory -Records $dependencyRecords
+    }
     # Keep the marker through failed retries; remove it only after a complete,
     # successful build with identical before/after source hashes.
     if(Test-Path -LiteralPath $taintMarker -PathType Leaf) { Remove-Item -LiteralPath $taintMarker }
@@ -138,6 +151,9 @@ if($InstallRoot) {
     if(Test-Path -LiteralPath $taintMarker -PathType Leaf) {
         throw "Installation blocked by tainted build marker: $taintMarker. Run a stable -Build first."
     }
+    $dependencyRecords = @(Get-GpuFirstNinjaDependencies -Ninja $ninja -OutputDirectory $outputDirectory)
+    Assert-GpuFirstHeaderDependencies -BuildRoot $buildDirectory -OutputDirectory $outputDirectory -Records $dependencyRecords
+    Assert-GpuFirstBuiltSources -SnapshotPath (Join-Path $integrityDirectory 'last-successful-sources.json') -SourceRoots $sourceRoots -SourceFiles $sourceFiles
     $installDirectory = [IO.Path]::GetFullPath($InstallRoot)
     & $cmake --install $outputDirectory --prefix $installDirectory --component llama-server
     if($LASTEXITCODE -ne 0) { throw 'CUDA runtime installation failed' }

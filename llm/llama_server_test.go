@@ -2640,6 +2640,63 @@ func TestAppendDraftArgs(t *testing.T) {
 	}
 }
 
+func TestAppendDraftArgsExplicitMode(t *testing.T) {
+	tests := []struct {
+		mode string
+		want []string
+	}{
+		{
+			mode: "draft-mtp",
+			want: []string{"base", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-backend-sampling", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "draft-eagle3",
+			want: []string{"base", "--spec-type", "draft-eagle3", "--spec-draft-n-max", "3", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "draft-simple",
+			want: []string{"base", "--spec-type", "draft-simple", "--spec-draft-n-max", "3", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "draft-dflash",
+			want: []string{"base", "--spec-type", "draft-dflash", "--spec-draft-n-max", "3", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "draft-dspark",
+			want: []string{"base", "--spec-type", "draft-dspark", "--spec-draft-n-max", "3", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "auto",
+			want: []string{"base", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-backend-sampling", "--spec-draft-model", "sidecar.gguf"},
+		},
+		{
+			mode: "none",
+			want: []string{"base", "--spec-type", "none"},
+		},
+		{
+			mode: "ngram-simple",
+			want: []string{"base", "--spec-type", "ngram-simple", "--spec-draft-n-max", "3"},
+		},
+		{
+			mode: "ngram-mod",
+			want: []string{"base", "--spec-type", "ngram-mod", "--spec-draft-n-max", "3"},
+		},
+		{
+			mode: "ngram-cache",
+			want: []string{"base", "--spec-type", "ngram-cache", "--spec-draft-n-max", "3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			opts := api.Options{Runner: api.Runner{SpeculativeType: tt.mode, DraftNumPredict: 3}}
+			got := appendDraftArgs([]string{"base"}, draftTypeMTP, "sidecar.gguf", opts)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("appendDraftArgs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExternalDraftType(t *testing.T) {
 	tests := []struct {
 		name    string

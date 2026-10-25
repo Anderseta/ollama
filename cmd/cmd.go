@@ -2674,6 +2674,7 @@ func NewCLI() *cobra.Command {
 	}
 
 	serveCmd.Flags().Int("moe-ram-limit-mib", 0, "Maximum RAM for resident MoE model weights in MiB; excludes KV and buffers (0 disables)")
+	serveCmd.Flags().Bool("moe-runtime", false, "Enable experimental coordinated MoE caches and transfers")
 	serveCmd.Flags().Bool("gpu-exclusive", false, "Require CUDA inference; unsupported operations fail instead of using CPU compute")
 	serveCmd.Flags().Bool("gpu-diagnostics", false, "Enable detailed native GPU execution diagnostics")
 	serveCmd.Flags().Int("gpu-vram-limit-mib", 0, "GPU-exclusive native allocation budget in MiB (0 uses available VRAM)")

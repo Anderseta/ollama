@@ -10,6 +10,7 @@ import (
 // GPUExecutionConfig is the effective opt-in native execution policy.
 // VRAMLimitMiB limits this runner's native allocations, not other GPU processes.
 type GPUExecutionConfig struct {
+	Runtime      bool
 	Exclusive    bool
 	Diagnostics  bool
 	VRAMLimitMiB int
@@ -19,6 +20,21 @@ type GPUExecutionConfig struct {
 // runner environment value removes the inherited native setting.
 func ResolveGPUExecution(opts Options) (GPUExecutionConfig, error) {
 	var cfg GPUExecutionConfig
+	if opts.MOERuntime != nil {
+		cfg.Runtime = *opts.MOERuntime
+	} else {
+		raw, exists := opts.RunnerEnv["WILDLLAMA_MOE_RUNTIME"]
+		if !exists {
+			raw = envconfig.Var("OLLAMA_MOE_RUNTIME")
+		}
+		if raw != "" {
+			enabled, err := strconv.ParseBool(raw)
+			if err != nil {
+				return cfg, fmt.Errorf("moe_runtime must be a boolean: %w", err)
+			}
+			cfg.Runtime = enabled
+		}
+	}
 	if opts.GPUExclusive != nil {
 		cfg.Exclusive = *opts.GPUExclusive
 	} else {
@@ -72,6 +88,9 @@ func gpuExecutionEnv(opts Options, server, native string) string {
 // Ordinary requests keep their nil defaults for compatibility with old options.
 func NormalizeGPUExecution(opts Options) (Options, GPUExecutionConfig, error) {
 	cfg, err := ResolveGPUExecution(opts)
+	if err == nil && cfg.Runtime {
+		opts.MOERuntime = &cfg.Runtime
+	}
 	if err == nil && cfg.Exclusive {
 		opts.GPUExclusive = &cfg.Exclusive
 	}

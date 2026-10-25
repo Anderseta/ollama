@@ -598,6 +598,7 @@ type Options struct {
 
 // Runner options which must be set when the model is loaded into memory
 type Runner struct {
+	MOERuntime      *bool             `json:"moe_runtime,omitempty"`
 	GPUExclusive    *bool             `json:"gpu_exclusive,omitempty"`
 	GPUDiagnostics  *bool             `json:"gpu_diagnostics,omitempty"`
 	GPUVRAMLimitMiB *int              `json:"gpu_vram_limit_mib,omitempty"`
@@ -1141,7 +1142,7 @@ func (opts *Options) FromMap(m map[string]any) error {
 	for key, val := range m {
 		if key == "speculative_type" && val != nil {
 			value, ok := val.(string)
-			if !ok || !slices.Contains([]string{"", "auto", "none", "ngram-simple", "ngram-mod", "ngram-cache"}, value) {
+			if !ok || !slices.Contains([]string{"", "auto", "none", "draft-mtp", "draft-eagle3", "ngram-simple", "ngram-mod", "ngram-cache"}, value) {
 				return fmt.Errorf("unsupported speculative_type")
 			}
 		}

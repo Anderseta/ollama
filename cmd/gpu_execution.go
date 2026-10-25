@@ -9,6 +9,15 @@ import (
 )
 
 func configureGPUExecution(cmd *cobra.Command) error {
+	if cmd.Flags().Changed("moe-runtime") {
+		enabled, err := cmd.Flags().GetBool("moe-runtime")
+		if err != nil {
+			return err
+		}
+		if err := os.Setenv("OLLAMA_MOE_RUNTIME", strconv.FormatBool(enabled)); err != nil {
+			return err
+		}
+	}
 	if cmd.Flags().Changed("gpu-diagnostics") {
 		enabled, err := cmd.Flags().GetBool("gpu-diagnostics")
 		if err != nil {

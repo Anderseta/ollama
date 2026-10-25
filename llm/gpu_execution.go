@@ -63,6 +63,13 @@ func gpuNativeEnvironment(opts api.Options, key string) string {
 	return envconfig.Var(key)
 }
 
+func setMOERuntimeEnvironment(environment map[string]string, enabled bool) {
+	environment["WILDLLAMA_MOE_RUNTIME"] = "0"
+	if enabled {
+		environment["WILDLLAMA_MOE_RUNTIME"] = "1"
+	}
+}
+
 func appendGPUExecutionArgs(params []string, opts api.Options) ([]string, error) {
 	cfg, err := api.ResolveGPUExecution(opts)
 	if err != nil {

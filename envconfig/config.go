@@ -275,6 +275,7 @@ func Uint(key string, defaultValue uint) func() uint {
 var (
 	// NumParallel sets the number of parallel model requests. NumParallel can be configured via the OLLAMA_NUM_PARALLEL environment variable.
 	NumParallel     = Uint("OLLAMA_NUM_PARALLEL", 1)
+	MOERuntime      = Bool("OLLAMA_MOE_RUNTIME")
 	GPUExclusive    = Bool("OLLAMA_GPU_EXCLUSIVE")
 	GPUDiagnostics  = Bool("OLLAMA_GPU_DIAGNOSTICS")
 	GPUVRAMLimitMiB = Uint64("OLLAMA_GPU_VRAM_LIMIT_MIB", 0)
@@ -321,6 +322,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_FLASH_ATTENTION":      {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":        {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
 		"OLLAMA_MOE_RAM_LIMIT_MIB":    {"OLLAMA_MOE_RAM_LIMIT_MIB", Var("OLLAMA_MOE_RAM_LIMIT_MIB"), "Locked host model-weight budget for MoE GGUFs (MiB); excludes KV and compute, 0 disables"},
+		"OLLAMA_MOE_RUNTIME":          {"OLLAMA_MOE_RUNTIME", Var("OLLAMA_MOE_RUNTIME"), "Enable experimental coordinated MoE caches and transfers (default false)"},
 		"OLLAMA_GPU_EXCLUSIVE":        {"OLLAMA_GPU_EXCLUSIVE", Var("OLLAMA_GPU_EXCLUSIVE"), "Require native CUDA inference without CPU compute fallback (default false)"},
 		"OLLAMA_GPU_DIAGNOSTICS":      {"OLLAMA_GPU_DIAGNOSTICS", Var("OLLAMA_GPU_DIAGNOSTICS"), "Enable detailed native GPU execution diagnostics (default false)"},
 		"OLLAMA_GPU_VRAM_LIMIT_MIB":   {"OLLAMA_GPU_VRAM_LIMIT_MIB", Var("OLLAMA_GPU_VRAM_LIMIT_MIB"), "GPU-exclusive runner allocation budget in MiB; 0 uses available VRAM"},

@@ -43,6 +43,7 @@ type RuntimeMemory struct {
 	SSDBytes       uint64 `json:"ssd_bytes"`
 	H2DBytes       uint64 `json:"h2d_bytes"`
 	UpdatedAt      int64  `json:"updated_at"`
+	cudaObserved   bool
 }
 
 type runtimeEvent struct {
@@ -170,6 +171,7 @@ func (w *StatusWriter) observeActivityLine(line string, now int64) {
 				a.Memory.SSDBytes, a.Memory.H2DBytes = event.Memory.SSDBytes, event.Memory.H2DBytes
 			} else if event.Stage == "cuda" {
 				a.Memory.VRAMBytes, a.Memory.VRAMLimitBytes = event.Memory.VRAMBytes, event.Memory.VRAMLimitBytes
+				a.Memory.cudaObserved = true
 			} else {
 				return
 			}
@@ -218,6 +220,21 @@ func (w *StatusWriter) ActivitySnapshot() RuntimeActivity {
 		value.Operation = &operation
 	}
 	return value
+}
+
+// managedVRAM reports successful live allocations in the native CUDA allocator.
+// This includes expert caches and graph pools, but excludes the driver and other
+// processes. An observed zero quota still provides a valid allocation count.
+func (w *StatusWriter) managedVRAM() (uint64, bool) {
+	if w == nil {
+		return 0, false
+	}
+	w.activityMu.Lock()
+	defer w.activityMu.Unlock()
+	if w.activity.Memory == nil || !w.activity.Memory.cudaObserved {
+		return 0, false
+	}
+	return w.activity.Memory.VRAMBytes, true
 }
 
 // Optional so non-llama.cpp backends retain their existing interface.

@@ -909,9 +909,14 @@ const (
 func appendDraftArgs(params []string, draftType, draftModelPath string, opts api.Options) []string {
 	if opts.SpeculativeType != "" && opts.SpeculativeType != "auto" {
 		draftType = opts.SpeculativeType
-		draftModelPath = ""
-		if draftType == "none" {
+		switch draftType {
+		case "none":
 			return append(params, "--spec-type", "none")
+		case "draft-simple", draftTypeMTP, draftTypeEagle3, "draft-dflash", "draft-dspark":
+			// An explicit draft algorithm still needs its configured sidecar.
+		default:
+			// Self-speculative algorithms use the target without a draft model.
+			draftModelPath = ""
 		}
 	}
 	if draftType == "" && draftModelPath == "" {
@@ -983,7 +988,8 @@ func NewLlamaServerRunner(
 		opts.RunnerEnv = validated
 	}
 	var err error
-	opts, _, err = api.NormalizeGPUExecution(opts)
+	var execution api.GPUExecutionConfig
+	opts, execution, err = api.NormalizeGPUExecution(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1073,6 +1079,7 @@ func NewLlamaServerRunner(
 	for key, value := range opts.RunnerEnv {
 		serverEnvs[key] = value
 	}
+	setMOERuntimeEnvironment(serverEnvs, execution.Runtime)
 	// Only resolved CLI flags carry these policies; clear inherited native aliases
 	// so an explicit API false cannot accidentally re-enable the mode in the child.
 	serverEnvs["LLAMA_ARG_GPU_EXCLUSIVE"] = ""
@@ -2903,6 +2910,7 @@ func (s *llamaServerRunner) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo 
 	if len(s.gpus) == 0 {
 		return nil
 	}
+	managed, observed := s.status.managedVRAM()
 	s.memoryMu.RLock()
 	defer s.memoryMu.RUnlock()
 
@@ -2910,6 +2918,9 @@ func (s *llamaServerRunner) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo 
 	for i, gpu := range s.gpus {
 		infos[i] = gpu
 		used := s.vramByDevice[gpu.Name]
+		if observed && len(s.gpus) == 1 {
+			used = managed
+		}
 
 		// Our accounting: total minus what we allocated
 		var accountedFree uint64
@@ -2935,8 +2946,9 @@ func (s *llamaServerRunner) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo 
 	return infos
 }
 
-// MemorySize returns total and GPU memory usage parsed from llama-server's
-// post-load log output. Full model-layer offload is reported as 100% GPU.
+// MemorySize uses native CUDA allocation accounting when available, otherwise
+// post-load buffer logs. CUDA accounting includes graph pools and the current
+// expert cache, but not driver allocations or other processes.
 func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 	s.memoryMu.RLock()
 	memTotal := s.memTotal
@@ -2949,7 +2961,12 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 	gpuLayerOverflow := s.gpuLayerOverflow
 	s.memoryMu.RUnlock()
 
-	if memTotal > 0 {
+	managed, observed := s.status.managedVRAM()
+	if observed {
+		memTotal = memTotal - min(memTotal, memGPU) + managed
+		memGPU = managed
+	}
+	if memTotal > 0 || observed {
 		total, vram = memTotal, memGPU
 		// With mmap, llama-server reports each CPU_Mapped model buffer as the
 		// file-offset span of its CPU-resident tensors. During partial offload
@@ -3017,15 +3034,21 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
 //	MTL0_Mapped model buffer size =  1918.35 MiB
 //	ROCm0 model buffer size =  1918.35 MiB
 type memoryParsingWriter struct {
-	inner   io.Writer
-	runner  *llamaServerRunner
-	buffers map[memoryBufferKey]memoryBuffer
+	inner              io.Writer
+	runner             *llamaServerRunner
+	buffers            map[memoryBufferKey]memoryBuffer
+	tail               []byte
+	discardingLine     bool
+	kvCacheGroup       string
+	hasContextBuffers  bool
+	boundedExpertCache uint64
 }
 
 type memoryBufferKey struct {
-	component string
-	backend   string
-	kind      string
+	component  string
+	backend    string
+	kind       string
+	cacheGroup string
 }
 
 type memoryBuffer struct {
@@ -3042,6 +3065,7 @@ var deviceFreeRegex = regexp.MustCompile(`using device (\S+)\s+\(.*\)\s+-\s+(\d+
 // bufferSizeRegex matches llama-server buffer size lines and captures the
 // component so repeated fit/probe values can be replaced by the final load.
 var bufferSizeRegex = regexp.MustCompile(`(?m)(?:^|\n)[^\n:]*?([A-Za-z_][A-Za-z0-9_]*):\s+(\S+)\s+(model|KV|compute|output|RS)\s+buffer size\s*=\s*([\d.]+)\s*MiB`)
+var boundedExpertCacheRegex = regexp.MustCompile(`gpu-exclusive:\s+([\d.]+)\s+MiB bounded expert cache`)
 
 var (
 	offloadedLayersRegex      = regexp.MustCompile(`offloaded\s+(\d+)/(\d+)\s+layers to GPU`)
@@ -3083,49 +3107,109 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 		func() {
 			w.runner.memoryMu.Lock()
 			defer w.runner.memoryMu.Unlock()
-			if match := moeRAMWeightLimitRegex.FindSubmatch(b); match != nil {
-				if limit, err := strconv.ParseUint(string(match[1]), 10, 64); err == nil {
-					w.runner.moeRAMWeightLimit = limit
-				}
-			}
-
-			if match := deviceFreeRegex.FindSubmatch(b); match != nil {
-				devName := string(match[1])
-				if mib, err := strconv.ParseUint(string(match[2]), 10, 64); err == nil {
-					w.runner.systemFreeAtLoad[devName] = mib * 1024 * 1024
-				}
-			}
-			for _, match := range offloadedLayersRegex.FindAllSubmatch(b, -1) {
-				loaded, loadedErr := strconv.ParseUint(string(match[1]), 10, 64)
-				total, totalErr := strconv.ParseUint(string(match[2]), 10, 64)
-				if loadedErr == nil && totalErr == nil {
-					w.runner.gpuLayers = loaded
-					w.runner.totalLayers = total
-				}
-			}
-			for _, match := range fitOverflowingLayersRegex.FindAllSubmatch(b, -1) {
-				overflowing, err := strconv.ParseUint(string(match[1]), 10, 64)
-				if err == nil && overflowing > 0 {
-					w.runner.gpuLayerOverflow += int(overflowing)
-				}
-			}
-			for _, match := range bufferSizeRegex.FindAllSubmatch(b, -1) {
-				backendName := string(match[2])
-				if mib, err := strconv.ParseFloat(string(match[4]), 64); err == nil {
-					if w.buffers == nil {
-						w.buffers = make(map[memoryBufferKey]memoryBuffer)
+			// Preserve log order across pipe writes and fit/probe contexts.
+			const maxLine = 32 * 1024
+			for remaining := b; len(remaining) > 0; {
+				i := bytes.IndexByte(remaining, '\n')
+				if i < 0 {
+					if !w.discardingLine && len(w.tail)+len(remaining) <= maxLine {
+						w.tail = append(w.tail, remaining...)
+					} else {
+						w.tail, w.discardingLine = nil, true
 					}
-					w.buffers[memoryBufferKey{
-						component: string(match[1]),
-						backend:   backendName,
-						kind:      string(match[3]),
-					}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
-					w.updateRunnerMemoryLocked()
+					break
 				}
+				if !w.discardingLine && len(w.tail)+i <= maxLine {
+					w.tail = append(w.tail, remaining[:i]...)
+					w.observeMemoryLineLocked(w.tail)
+				}
+				w.tail, w.discardingLine = nil, false
+				remaining = remaining[i+1:]
 			}
 		}()
 	}
 	return w.inner.Write(b)
+}
+
+func (w *memoryParsingWriter) resetContextMemoryLocked() {
+	for key := range w.buffers {
+		if key.kind == "KV" {
+			delete(w.buffers, key)
+		}
+	}
+	w.kvCacheGroup, w.hasContextBuffers, w.boundedExpertCache = "", false, 0
+	w.updateRunnerMemoryLocked()
+}
+
+func (w *memoryParsingWriter) observeMemoryLineLocked(b []byte) {
+	if bytes.Contains(b, []byte("llama_context: constructing llama_context")) {
+		w.resetContextMemoryLocked()
+	}
+	// The indexer is another allocation from the same KV implementation. A
+	// stable group distinguishes even equal-sized caches without adding repeats.
+	if bytes.Contains(b, []byte("creating indexer KV cache")) {
+		w.kvCacheGroup = "indexer"
+	}
+	if match := moeRAMWeightLimitRegex.FindSubmatch(b); match != nil {
+		if limit, err := strconv.ParseUint(string(match[1]), 10, 64); err == nil {
+			w.runner.moeRAMWeightLimit = limit
+		}
+	}
+	if match := deviceFreeRegex.FindSubmatch(b); match != nil {
+		devName := string(match[1])
+		if mib, err := strconv.ParseUint(string(match[2]), 10, 64); err == nil {
+			if w.runner.systemFreeAtLoad == nil {
+				w.runner.systemFreeAtLoad = make(map[string]uint64)
+			}
+			w.runner.systemFreeAtLoad[devName] = mib * 1024 * 1024
+		}
+	}
+	for _, match := range offloadedLayersRegex.FindAllSubmatch(b, -1) {
+		loaded, loadedErr := strconv.ParseUint(string(match[1]), 10, 64)
+		total, totalErr := strconv.ParseUint(string(match[2]), 10, 64)
+		if loadedErr == nil && totalErr == nil {
+			w.runner.gpuLayers = loaded
+			w.runner.totalLayers = total
+		}
+	}
+	for _, match := range fitOverflowingLayersRegex.FindAllSubmatch(b, -1) {
+		overflowing, err := strconv.ParseUint(string(match[1]), 10, 64)
+		if err == nil && overflowing > 0 {
+			w.runner.gpuLayerOverflow += int(overflowing)
+		}
+	}
+	for _, match := range bufferSizeRegex.FindAllSubmatch(b, -1) {
+		if mib, err := strconv.ParseFloat(string(match[4]), 64); err == nil {
+			kind := string(match[3])
+			if kind == "model" && w.hasContextBuffers {
+				// The final model load also replaces fit/probe KV buffers when
+				// an older payload omits the context construction line.
+				w.resetContextMemoryLocked()
+			}
+			group := ""
+			if kind == "KV" {
+				group, w.hasContextBuffers = w.kvCacheGroup, true
+			}
+			if w.buffers == nil {
+				w.buffers = make(map[memoryBufferKey]memoryBuffer)
+			}
+			w.buffers[memoryBufferKey{
+				component:  string(match[1]),
+				backend:    string(match[2]),
+				kind:       kind,
+				cacheGroup: group,
+			}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
+			w.updateRunnerMemoryLocked()
+		}
+	}
+	if match := boundedExpertCacheRegex.FindSubmatch(b); match != nil {
+		if mib, err := strconv.ParseFloat(string(match[1]), 64); err == nil {
+			// Auto sizing replaces the initial bank. Keep it separate from
+			// the scheduler's compute buffers, which remain live as well.
+			w.boundedExpertCache = uint64(mib * 1024 * 1024)
+			w.updateRunnerMemoryLocked()
+		}
+	}
 }
 
 func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
@@ -3154,6 +3238,18 @@ func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 		}
 	}
 
+	total += w.boundedExpertCache
+	gpu += w.boundedExpertCache
+	if len(w.runner.gpus) == 1 {
+		byDevice[w.runner.gpus[0].Name] += w.boundedExpertCache
+	} else if len(byDevice) == 1 {
+		// Bounded streaming is single-device. Without a unique device, do
+		// not invent a distribution for this older aggregate log format.
+		for name := range byDevice {
+			byDevice[name] += w.boundedExpertCache
+		}
+	}
+
 	w.runner.memTotal = total
 	w.runner.memGPU = gpu
 	w.runner.memModelFileBacked = modelFileBacked
@@ -3162,9 +3258,11 @@ func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 }
 
 // VRAMByGPU returns the VRAM used by this runner on the specified device.
-// The values are parsed from llama-server's buffer size log output during model load
-// (model tensors + KV cache + compute buffers).
+// A single device uses observed native CUDA allocations, including graph pools.
+// Otherwise per-device buffer log accounting is retained: an aggregate native
+// snapshot cannot safely be distributed among multiple GPUs.
 func (s *llamaServerRunner) VRAMByGPU(id ml.DeviceID) uint64 {
+	managed, observed := s.status.managedVRAM()
 	s.memoryMu.RLock()
 	defer s.memoryMu.RUnlock()
 
@@ -3173,6 +3271,9 @@ func (s *llamaServerRunner) VRAMByGPU(id ml.DeviceID) uint64 {
 	// --list-devices stdout, which matches the buffer log prefix.
 	for _, gpu := range s.gpus {
 		if gpu.DeviceID == id {
+			if observed && len(s.gpus) == 1 {
+				return managed
+			}
 			return s.vramByDevice[gpu.Name]
 		}
 	}

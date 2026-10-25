@@ -240,6 +240,10 @@ def main():
     parser.add_argument("--gpu-exclusive", action="store_true")
     parser.add_argument("--gpu-vram-limit-mib", type=int, default=0)
     parser.add_argument("--gpu-diagnostics", action="store_true")
+    parser.add_argument("--moe-runtime", action="store_true")
+    parser.add_argument("--moe-dynamic-prefill", action="store_true")
+    parser.add_argument("--fixed-expert-cache", action="store_true")
+    parser.add_argument("--expert-trace-path", type=Path)
     parser.add_argument("--graph-input-debug", action="store_true")
     parser.add_argument("--hold-seconds", type=float, default=0,
                         help="Keep the successful model loaded for observation after all timed requests")
@@ -273,7 +277,7 @@ def main():
     if report_file.exists() or log_file.exists():
         raise ValueError("Refusing to overwrite benchmark results; select another label")
     binary = payload / "ollama.exe"
-    if args.gpu_exclusive or args.gpu_diagnostics or args.gpu_vram_limit_mib:
+    if args.gpu_exclusive or args.gpu_diagnostics or args.gpu_vram_limit_mib or args.moe_runtime:
         # Older API servers can ignore unknown JSON options. Require the new
         # executable flags so a legacy run cannot be mislabeled GPU-exclusive.
         help_text = run_output([str(binary), "serve", "--help"])
@@ -282,6 +286,8 @@ def main():
             required.append("--gpu-diagnostics")
         if args.gpu_vram_limit_mib:
             required.append("--gpu-vram-limit-mib")
+        if args.moe_runtime:
+            required.append("--moe-runtime")
         if any(flag not in help_text for flag in required):
             raise ValueError("This payload does not advertise the requested GPU-first options")
     report = {"label": args.label, "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -322,9 +328,21 @@ def main():
         # Strict mode rejects explicit CPU tensor placement and explicit partial offload.
         env.pop("LLAMA_ARG_OVERRIDE_TENSOR")
         env["LLAMA_ARG_N_GPU_LAYERS"] = "all"
+    env["OLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
+    env["WILDLLAMA_MOE_RUNTIME"] = "1" if args.moe_runtime else "0"
+    env["WILDLLAMA_MOE_DYNAMIC_PREFILL"] = "1" if args.moe_dynamic_prefill else "0"
+    env["WILDLLAMA_MOE_CACHE_AUTO"] = "0" if args.fixed_expert_cache else "1"
+    if args.expert_trace_path:
+        trace_path = args.expert_trace_path.resolve()
+        if trace_path.exists():
+            raise ValueError("Refusing to overwrite expert trace")
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        env["WILDLLAMA_EXPERT_TRACE"] = str(trace_path)
+    else:
+        env.pop("WILDLLAMA_EXPERT_TRACE", None)
     if args.graph_input_debug:
         env["LLAMA_GRAPH_INPUT_DEBUG"] = "1"
-    report["runner_environment"] = {k: v for k, v in env.items() if k.startswith(("OLLAMA_", "LLAMA_"))}
+    report["runner_environment"] = {k: v for k, v in env.items() if k.startswith(("OLLAMA_", "LLAMA_", "WILDLLAMA_"))}
     report["manifest_sha256"] = {str(p.relative_to(lab / "models")): sha256(p)
         for directory in ("manifests", "manifests-v2")
         for p in sorted((lab / "models" / directory).rglob("*")) if p.is_file()}
@@ -426,7 +444,8 @@ def main():
             print(json.dumps({"started": args.label, "pid": process.pid, "port": args.port}), flush=True)
             for run in range(args.rounds):
                 options = {"num_ctx": args.context, "num_batch": 0, "moe_ram_limit_mib": args.moe_ram_mib,
-                           "num_predict": args.predict, "temperature": 0, "seed": 42}
+                           "num_predict": args.predict, "temperature": 0, "seed": 42,
+                           "moe_runtime": args.moe_runtime}
                 if args.gpu_exclusive:
                     options.update(gpu_exclusive=True, gpu_vram_limit_mib=args.gpu_vram_limit_mib)
                 elif args.gpu_vram_limit_mib:

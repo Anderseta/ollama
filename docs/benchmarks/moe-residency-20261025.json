@@ -1,0 +1,886 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-25",
+  "artifact": "coordinated_moe_runtime_short_validation",
+  "model": {
+    "name": "qwen3.8-flash-next-uncensored:q4_k_m",
+    "manifest_sha256": "bee26cfee476e3762c23027d1d23b92acdf125eafb82ba36d1fcb11c05278242",
+    "weights_context_top_k_unchanged": true
+  },
+  "hardware": {
+    "os": "Windows",
+    "cpu": "AMD Ryzen 5 2600",
+    "installed_ram_gib_approximately": 32,
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_vram_gib_nominal": 16,
+    "driver": "621.01",
+    "model_storage": "SATA SSD"
+  },
+  "methodology": {
+    "source_paths_are_repository_relative": true,
+    "rounds_per_run": 2,
+    "output_tokens_per_round": 32,
+    "prompt_type": "synthetic counting task; raw prompt and output omitted",
+    "cold": "New server/runner; OS page cache was not flushed",
+    "warm": "Repeated prompt; 28 prompt tokens cached",
+    "sampling": {
+      "temperature": 0,
+      "seed": 42,
+      "thinking": false
+    },
+    "ssd": "Cumulative rounded MiB from the final moe_ram snapshot immediately before each prompt timing line; request delta subtracts preceding boundary; cold begins at zero and includes initialization/prefill",
+    "h2d": "Cumulative bytes from the last RAM activity snapshot before each prompt timing line; sampled endpoints can lag completion, so request deltas are approximate",
+    "cuda_memory": "Maximum live managed-byte activity snapshot, not a dedicated allocator-peak reading or OS-wide GPU residency",
+    "nvml_memory": "Maximum sampled physical-device used memory, including all processes, display and driver allocations; not attributable to the runner alone",
+    "deprecated_ps": "The pre-correction API size_vram estimate undercounts runtime allocations/cache growth and is not an actual VRAM measurement",
+    "limitations": [
+      "Short nonstatistical runs",
+      "No sustained-throughput claim",
+      "No general language-quality claim",
+      "Automatic cache budgeting changes GPU cache capacity and is separate from the fixed-budget comparison",
+      "OS/resource sampling can miss transient peaks"
+    ]
+  },
+  "all_ten_short_outputs_identical": true,
+  "fixed_budget_warm_observed_change_percent": 21.422646448819638,
+  "corrective_change": "Bound cooperative residency hints to 64 pages per queue and retain SLRU probation-before-protected eviction order; the ablation identifies the combined component, not each subcorrection independently",
+  "longer_natural_prompt_validation": "completed; see longer_natural_validation; texts differ and trajectories are not controlled",
+  "runs": [
+    {
+      "label": "runtime-control-count32",
+      "role": "reference",
+      "completed": true,
+      "source_report": ".build/gpu-first-moe/reports/runtime-control-count32-results.json",
+      "source_report_sha256": "698144e5691d8ba852c8521ddc7756583492a4cfc555a36ff21486215c9aef2f",
+      "source_log": ".build/gpu-first-moe/reports/runtime-control-count32-server.log",
+      "source_log_sha256": "892c9aad1f60999e2fe26fb4bdebc8b584486d56a8ee47d66c0f2a8bc81a9f98",
+      "configuration": {
+        "context": 131072,
+        "moe_ram_mib": 6144,
+        "gpu_vram_limit_mib": 12288,
+        "moe_gpu_cache_mib": 1024,
+        "moe_runtime": false,
+        "moe_dynamic_prefill": false,
+        "fixed_expert_cache": true,
+        "gpu_diagnostics": false
+      },
+      "explicit_component_switches": {
+        "WILDLLAMA_MOE_RUNTIME": "0",
+        "WILDLLAMA_MOE_DYNAMIC_PREFILL": "0",
+        "WILDLLAMA_MOE_CACHE_AUTO": "0"
+      },
+      "payload_sha256": {
+        "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+        "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+        "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+        "lib/ollama/llama.dll": "8b4f2f857ac0ead9cf0475ab7294ccfc8282eeecfca0156b489512c7d0059cb6",
+        "ollama.exe": "ca05142e4e4cfd639fb7ae4e8a67db5b5ff47cde6cc6f5489a48e0df00306e91"
+      },
+      "requests": [
+        {
+          "case": "runner-cold",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.6084233281748541,
+          "decode_steps_per_second": 0.58941009916939,
+          "time_to_first_output_seconds": 71.95300000000134,
+          "elapsed_seconds": 124.5619999999999,
+          "cached_prompt_tokens": 0,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 34969.38,
+          "ssd_read_mib_per_output_token_from_rounded_log": 1092.793125,
+          "h2d_delta_bytes_from_sampled_endpoints": 71197081424,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 2121.8383736610413,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 1856,
+            "ram": {
+              "source_line": 1855,
+              "ssd_mib": 34969.38,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 1853,
+              "bytes": 71197081424
+            }
+          }
+        },
+        {
+          "case": "warm-1",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.6782946003446881,
+          "decode_steps_per_second": 0.6570978940839166,
+          "time_to_first_output_seconds": 8.953000000001339,
+          "elapsed_seconds": 56.125,
+          "cached_prompt_tokens": 28,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 13744.72,
+          "ssd_read_mib_per_output_token_from_rounded_log": 429.5225,
+          "h2d_delta_bytes_from_sampled_endpoints": 51368292992,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1530.8944282531738,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 2637,
+            "ram": {
+              "source_line": 2636,
+              "ssd_mib": 48714.1,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 2632,
+              "bytes": 122565374416
+            }
+          }
+        }
+      ],
+      "memory": {
+        "ram_weight_max_observed_activity_bytes": 6442450944,
+        "ram_weight_peak_mib_from_rounded_log": 6144.0,
+        "cuda_managed_max_observed_activity_bytes": 6711565184,
+        "nvml_global_max_sampled_used_bytes": 10437685248,
+        "deprecated_ps_size_vram_estimate_bytes_do_not_use_as_actual": 3889441012
+      }
+    },
+    {
+      "label": "runtime-fixed-count32",
+      "role": "rejected_performance_regression",
+      "completed": true,
+      "source_report": ".build/gpu-first-moe/reports/runtime-fixed-count32-results.json",
+      "source_report_sha256": "7a11b158bbf5e0e6248494ce7605eb32473e9ad6ecb3daa8aabb05b8dfa7dd47",
+      "source_log": ".build/gpu-first-moe/reports/runtime-fixed-count32-server.log",
+      "source_log_sha256": "4d3b24d59537a48b9f422d5990a20512f4be6baa4581f559c5530649cb08b988",
+      "configuration": {
+        "context": 131072,
+        "moe_ram_mib": 6144,
+        "gpu_vram_limit_mib": 12288,
+        "moe_gpu_cache_mib": 1024,
+        "moe_runtime": true,
+        "moe_dynamic_prefill": true,
+        "fixed_expert_cache": true,
+        "gpu_diagnostics": false
+      },
+      "explicit_component_switches": {
+        "WILDLLAMA_MOE_RUNTIME": "1",
+        "WILDLLAMA_MOE_DYNAMIC_PREFILL": "1",
+        "WILDLLAMA_MOE_CACHE_AUTO": "0"
+      },
+      "payload_sha256": {
+        "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+        "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+        "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+        "lib/ollama/llama.dll": "8b4f2f857ac0ead9cf0475ab7294ccfc8282eeecfca0156b489512c7d0059cb6",
+        "ollama.exe": "ca05142e4e4cfd639fb7ae4e8a67db5b5ff47cde6cc6f5489a48e0df00306e91"
+      },
+      "requests": [
+        {
+          "case": "runner-cold",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.31076364757160985,
+          "decode_steps_per_second": 0.301052283584997,
+          "time_to_first_output_seconds": 79.84399999999914,
+          "elapsed_seconds": 182.8119999999999,
+          "cached_prompt_tokens": 0,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 44720.23,
+          "ssd_read_mib_per_output_token_from_rounded_log": 1397.5071875,
+          "h2d_delta_bytes_from_sampled_endpoints": 59805900624,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1782.3547310829163,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 2262,
+            "ram": {
+              "source_line": 2261,
+              "ssd_mib": 44720.23,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 2257,
+              "bytes": 59805900624
+            }
+          }
+        },
+        {
+          "case": "warm-1",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.392538852115563,
+          "decode_steps_per_second": 0.3802720129869517,
+          "time_to_first_output_seconds": 8.656000000000859,
+          "elapsed_seconds": 90.1869999999999,
+          "cached_prompt_tokens": 28,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 20099.43,
+          "ssd_read_mib_per_output_token_from_rounded_log": 628.1071875,
+          "h2d_delta_bytes_from_sampled_endpoints": 37553099392,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1119.1695747375488,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 3354,
+            "ram": {
+              "source_line": 3353,
+              "ssd_mib": 64819.66,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 3351,
+              "bytes": 97359000016
+            }
+          }
+        }
+      ],
+      "memory": {
+        "ram_weight_max_observed_activity_bytes": 6442450944,
+        "ram_weight_peak_mib_from_rounded_log": 6144.0,
+        "cuda_managed_max_observed_activity_bytes": 6716416384,
+        "nvml_global_max_sampled_used_bytes": 9465978880,
+        "deprecated_ps_size_vram_estimate_bytes_do_not_use_as_actual": 3888916724
+      }
+    },
+    {
+      "label": "runtime-no-coop-count32",
+      "role": "diagnostic_ablation",
+      "completed": true,
+      "source_report": ".build/gpu-first-moe/reports/runtime-no-coop-count32-results.json",
+      "source_report_sha256": "27a4363c2ba489fe404ed2df8a4ea77303c40ed02a1834225541ed9f1fdd5ac5",
+      "source_log": ".build/gpu-first-moe/reports/runtime-no-coop-count32-server.log",
+      "source_log_sha256": "8b0bedd508ad482d1a1bd6dd8ead57653979610a404dd356ccbfc8c423a45489",
+      "configuration": {
+        "context": 131072,
+        "moe_ram_mib": 6144,
+        "gpu_vram_limit_mib": 12288,
+        "moe_gpu_cache_mib": 1024,
+        "moe_runtime": true,
+        "moe_dynamic_prefill": true,
+        "fixed_expert_cache": true,
+        "gpu_diagnostics": false
+      },
+      "explicit_component_switches": {
+        "WILDLLAMA_MOE_RUNTIME": "1",
+        "WILDLLAMA_MOE_DYNAMIC_PREFILL": "1",
+        "WILDLLAMA_MOE_CACHE_AUTO": "0",
+        "WILDLLAMA_MOE_COOPERATIVE_CACHE": "0"
+      },
+      "payload_sha256": {
+        "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+        "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+        "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+        "lib/ollama/llama.dll": "8b4f2f857ac0ead9cf0475ab7294ccfc8282eeecfca0156b489512c7d0059cb6",
+        "ollama.exe": "ca05142e4e4cfd639fb7ae4e8a67db5b5ff47cde6cc6f5489a48e0df00306e91"
+      },
+      "requests": [
+        {
+          "case": "runner-cold",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.6891188478484159,
+          "decode_steps_per_second": 0.6675838838531529,
+          "time_to_first_output_seconds": 69.51600000000144,
+          "elapsed_seconds": 115.95300000000134,
+          "cached_prompt_tokens": 0,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 34768.71,
+          "ssd_read_mib_per_output_token_from_rounded_log": 1086.5221875,
+          "h2d_delta_bytes_from_sampled_endpoints": 59804159824,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1782.3028512001038,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 1624,
+            "ram": {
+              "source_line": 1623,
+              "ssd_mib": 34768.71,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 1619,
+              "bytes": 59804159824
+            }
+          }
+        },
+        {
+          "case": "warm-1",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.843526761136919,
+          "decode_steps_per_second": 0.8171665498513904,
+          "time_to_first_output_seconds": 7.70299999999952,
+          "elapsed_seconds": 45.64099999999962,
+          "cached_prompt_tokens": 28,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 13136.81,
+          "ssd_read_mib_per_output_token_from_rounded_log": 410.5253125,
+          "h2d_delta_bytes_from_sampled_endpoints": 37370110592,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1113.7160835266113,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 2269,
+            "ram": {
+              "source_line": 2268,
+              "ssd_mib": 47905.52,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 2264,
+              "bytes": 97174270416
+            }
+          }
+        }
+      ],
+      "memory": {
+        "ram_weight_max_observed_activity_bytes": 6442450944,
+        "ram_weight_peak_mib_from_rounded_log": 6144.0,
+        "cuda_managed_max_observed_activity_bytes": 6716416384,
+        "nvml_global_max_sampled_used_bytes": 9554046976,
+        "deprecated_ps_size_vram_estimate_bytes_do_not_use_as_actual": 3888916724
+      }
+    },
+    {
+      "label": "runtime-fixed-bounded-count32",
+      "role": "corrected_fixed_budget_short_check",
+      "completed": true,
+      "source_report": ".build/gpu-first-moe/reports/runtime-fixed-bounded-count32-results.json",
+      "source_report_sha256": "97fc0383335b5e338b74a3daccdc04a38617503e3b31eaa817472f7d30848254",
+      "source_log": ".build/gpu-first-moe/reports/runtime-fixed-bounded-count32-server.log",
+      "source_log_sha256": "e81f0dff846fdae1f2e19f274eb7d782938ccdc64092f3e9e309ebab099f9481",
+      "configuration": {
+        "context": 131072,
+        "moe_ram_mib": 6144,
+        "gpu_vram_limit_mib": 12288,
+        "moe_gpu_cache_mib": 1024,
+        "moe_runtime": true,
+        "moe_dynamic_prefill": true,
+        "fixed_expert_cache": true,
+        "gpu_diagnostics": false
+      },
+      "explicit_component_switches": {
+        "WILDLLAMA_MOE_RUNTIME": "1",
+        "WILDLLAMA_MOE_DYNAMIC_PREFILL": "1",
+        "WILDLLAMA_MOE_CACHE_AUTO": "0"
+      },
+      "payload_sha256": {
+        "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+        "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+        "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+        "lib/ollama/llama.dll": "2c7d7cb7db3708d545edb3e378e1762ee4a6558b3a5f682512fe7a3e4cd95a7d",
+        "ollama.exe": "ca05142e4e4cfd639fb7ae4e8a67db5b5ff47cde6cc6f5489a48e0df00306e91"
+      },
+      "requests": [
+        {
+          "case": "runner-cold",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.6855995114589282,
+          "decode_steps_per_second": 0.6641745267258367,
+          "time_to_first_output_seconds": 72.39099999999962,
+          "elapsed_seconds": 119.0619999999999,
+          "cached_prompt_tokens": 0,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 34768.71,
+          "ssd_read_mib_per_output_token_from_rounded_log": 1086.5221875,
+          "h2d_delta_bytes_from_sampled_endpoints": 59793612624,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1781.9885201454163,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 1640,
+            "ram": {
+              "source_line": 1639,
+              "ssd_mib": 34768.71,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 1635,
+              "bytes": 59793612624
+            }
+          }
+        },
+        {
+          "case": "warm-1",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.8236032544579649,
+          "decode_steps_per_second": 0.7978656527561535,
+          "time_to_first_output_seconds": 7.79700000000048,
+          "elapsed_seconds": 46.64099999999962,
+          "cached_prompt_tokens": 28,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 13136.81,
+          "ssd_read_mib_per_output_token_from_rounded_log": 410.5253125,
+          "h2d_delta_bytes_from_sampled_endpoints": 37352907392,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1113.2033882141113,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 2300,
+            "ram": {
+              "source_line": 2299,
+              "ssd_mib": 47905.52,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 2294,
+              "bytes": 97146520016
+            }
+          }
+        }
+      ],
+      "memory": {
+        "ram_weight_max_observed_activity_bytes": 6442450944,
+        "ram_weight_peak_mib_from_rounded_log": 6144.0,
+        "cuda_managed_max_observed_activity_bytes": 6716416384,
+        "nvml_global_max_sampled_used_bytes": 8383442944,
+        "deprecated_ps_size_vram_estimate_bytes_do_not_use_as_actual": 3888916724
+      }
+    },
+    {
+      "label": "runtime-auto-bounded-count32",
+      "role": "corrected_automatic_budget_short_check",
+      "completed": true,
+      "source_report": ".build/gpu-first-moe/reports/runtime-auto-bounded-count32-results.json",
+      "source_report_sha256": "d83e0c2c1468f4c9e5254b95d84cc86ec5afc563949484f49eb2f29b0fdcfd4b",
+      "source_log": ".build/gpu-first-moe/reports/runtime-auto-bounded-count32-server.log",
+      "source_log_sha256": "5404b14b0da17310e7b6686e120d4632bff3c1e8bba6efc26fc48df14fea7aa2",
+      "configuration": {
+        "context": 131072,
+        "moe_ram_mib": 6144,
+        "gpu_vram_limit_mib": 12288,
+        "moe_gpu_cache_mib": 1024,
+        "moe_runtime": true,
+        "moe_dynamic_prefill": true,
+        "fixed_expert_cache": false,
+        "gpu_diagnostics": false
+      },
+      "explicit_component_switches": {
+        "WILDLLAMA_MOE_RUNTIME": "1",
+        "WILDLLAMA_MOE_DYNAMIC_PREFILL": "1",
+        "WILDLLAMA_MOE_CACHE_AUTO": "1"
+      },
+      "payload_sha256": {
+        "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+        "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+        "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+        "lib/ollama/llama.dll": "2c7d7cb7db3708d545edb3e378e1762ee4a6558b3a5f682512fe7a3e4cd95a7d",
+        "ollama.exe": "ca05142e4e4cfd639fb7ae4e8a67db5b5ff47cde6cc6f5489a48e0df00306e91"
+      },
+      "requests": [
+        {
+          "case": "runner-cold",
+          "eval_count": 32,
+          "api_tokens_per_second": 0.9820138637034725,
+          "decode_steps_per_second": 0.9513259304627391,
+          "time_to_first_output_seconds": 67.9380000000001,
+          "elapsed_seconds": 100.51599999999962,
+          "cached_prompt_tokens": 0,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 30111.24,
+          "ssd_read_mib_per_output_token_from_rounded_log": 940.97625,
+          "h2d_delta_bytes_from_sampled_endpoints": 37500723024,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 1117.6086373329163,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 1443,
+            "ram": {
+              "source_line": 1442,
+              "ssd_mib": 30111.24,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 1440,
+              "bytes": 37500723024
+            }
+          }
+        },
+        {
+          "case": "warm-1",
+          "eval_count": 32,
+          "api_tokens_per_second": 1.860299960579081,
+          "decode_steps_per_second": 1.802165586810985,
+          "time_to_first_output_seconds": 5.765999999999622,
+          "elapsed_seconds": 22.96899999999914,
+          "cached_prompt_tokens": 28,
+          "done": true,
+          "done_reason": "length",
+          "output_matches_control": true,
+          "output_sha256": "59d7b4a2aa26ca4ada3f46ca1487a4acf396e558271a296ea5be884d5648eea2",
+          "ssd_read_delta_mib_from_rounded_log": 6369.18,
+          "ssd_read_mib_per_output_token_from_rounded_log": 199.036875,
+          "h2d_delta_bytes_from_sampled_endpoints": 9868132992,
+          "h2d_mib_per_output_token_from_sampled_endpoints": 294.0932807922363,
+          "h2d_is_approximate": true,
+          "source_boundary": {
+            "timing_source_line": 1826,
+            "ram": {
+              "source_line": 1825,
+              "ssd_mib": 36480.42,
+              "peak_mib": 6144.0
+            },
+            "h2d": {
+              "source_line": 1823,
+              "bytes": 47368856016
+            }
+          }
+        }
+      ],
+      "memory": {
+        "ram_weight_max_observed_activity_bytes": 6442450944,
+        "ram_weight_peak_mib_from_rounded_log": 6144.0,
+        "cuda_managed_max_observed_activity_bytes": 12658688384,
+        "nvml_global_max_sampled_used_bytes": 15558647808,
+        "deprecated_ps_size_vram_estimate_bytes_do_not_use_as_actual": 3888916724
+      },
+      "expert_cache_observed_mib": 6688.38,
+      "expert_cache_initial_aligned_mib": 1021.39,
+      "expert_cache_source_log_lines": [
+        462,
+        474,
+        475
+      ]
+    }
+  ],
+  "longer_natural_validation": {
+    "method": "One runner-cold 128-token natural explanatory request per configuration; same prompt, payload, model, sampling and total quotas; OS page cache not flushed",
+    "prompt_type": "Synthetic natural explanation of B+ tree lookup on SSD; raw prompt/output omitted",
+    "same_prompt": true,
+    "same_final_payload": true,
+    "live_memory_reporting_correction_present": true,
+    "outputs_identical": false,
+    "first_differing_word_one_based": 2,
+    "both_outputs_reached_token_limit": true,
+    "quality_proof": false,
+    "same_routing_trajectory": false,
+    "api_decode_rate_observed_change_percent": 55.53514109492359,
+    "total_elapsed_observed_reduction_percent": 27.067285370231087,
+    "limitations": [
+      "One nonstatistical end-to-end pair",
+      "Automatic cache changes expert bank capacity within unchanged total CUDA quota",
+      "Text differs from the second word; routing trajectories can differ",
+      "CUDA batching/kernel rounding is a possible explanation for divergence, not an established cause",
+      "Both outputs truncated at 128 tokens; no completeness or quality guarantee",
+      "Managed counters and global NVML have different scopes; sampled endpoint traffic remains approximate"
+    ],
+    "runs": [
+      {
+        "label": "runtime-control-prose128",
+        "completed": true,
+        "source_report": ".build/gpu-first-moe/reports/runtime-control-prose128-results.json",
+        "source_report_sha256": "91301e3c45af41c5ebdb6c2d07e8825e3dfef5e1aa508dd921b8f4fe2ad84a68",
+        "source_log": ".build/gpu-first-moe/reports/runtime-control-prose128-server.log",
+        "source_log_sha256": "9bcfaa04f26d01e1e8a6f54cef9bb6cb308b7bf37244a9899b210e572e13ea25",
+        "configuration": {
+          "context": 131072,
+          "moe_ram_mib": 6144,
+          "gpu_vram_limit_mib": 12288,
+          "moe_gpu_cache_mib": 1024,
+          "moe_runtime": false,
+          "moe_dynamic_prefill": false,
+          "fixed_expert_cache": true,
+          "gpu_diagnostics": false,
+          "predict": 128,
+          "rounds": 1
+        },
+        "payload_sha256": {
+          "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+          "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+          "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+          "lib/ollama/llama.dll": "2c7d7cb7db3708d545edb3e378e1762ee4a6558b3a5f682512fe7a3e4cd95a7d",
+          "ollama.exe": "fa3f781d57a7af656aa85f3d4949901c30c7e976ef61197b1df77863625ce032"
+        },
+        "model_manifest_sha256": "bee26cfee476e3762c23027d1d23b92acdf125eafb82ba36d1fcb11c05278242",
+        "case": "runner-cold",
+        "eval_count": 128,
+        "api_tokens_per_second": 0.5143291291748859,
+        "decode_steps_per_second": 0.510310932853207,
+        "time_to_first_output_seconds": 119.4369999999999,
+        "elapsed_seconds": 368.2970000000005,
+        "prompt_eval_seconds": 98.379398,
+        "eval_seconds": 248.86788,
+        "cached_prompt_tokens": 0,
+        "done": true,
+        "done_reason": "length",
+        "output_sha256": "f5209421875e0ec11cc84e9b6febe280fb350ccc1ac084ff9ca2634eb8c64d90",
+        "output_token_limit_reached": true,
+        "source_boundary": {
+          "timing_source_line": 4912,
+          "ram": {
+            "source_line": 4911,
+            "ssd_mib": 103156.98,
+            "peak_mib": 6144.0
+          },
+          "h2d": {
+            "source_line": 4909,
+            "bytes": 231545875256
+          }
+        },
+        "ssd_read_mib_per_output_token_from_rounded_log": 805.91390625,
+        "h2d_mib_per_output_token_from_sampled_endpoint_approximate": 1725.1512054800987,
+        "memory": {
+          "ram_weight_max_observed_activity_bytes": 6442450944,
+          "cuda_managed_max_observed_activity_bytes": 6711565184,
+          "nvml_global_max_sampled_used_bytes": 8411451392,
+          "corrected_ps_live_managed_size_vram_bytes": 6711565184,
+          "ps_matches_last_cuda_activity": true
+        },
+        "final_expert_cache_observed_mib": 1021.39
+      },
+      {
+        "label": "runtime-auto-prose128",
+        "completed": true,
+        "source_report": ".build/gpu-first-moe/reports/runtime-auto-prose128-results.json",
+        "source_report_sha256": "bf2008358b68179ae69ba0adad175dcdbce2c7aa46a6a2cd46f847ed8f6a901c",
+        "source_log": ".build/gpu-first-moe/reports/runtime-auto-prose128-server.log",
+        "source_log_sha256": "e800d0d5694ff4e73977745b625a8db5d3ae20ab0f501fa18e388f469d3421a6",
+        "configuration": {
+          "context": 131072,
+          "moe_ram_mib": 6144,
+          "gpu_vram_limit_mib": 12288,
+          "moe_gpu_cache_mib": 1024,
+          "moe_runtime": true,
+          "moe_dynamic_prefill": true,
+          "fixed_expert_cache": false,
+          "gpu_diagnostics": false,
+          "predict": 128,
+          "rounds": 1
+        },
+        "payload_sha256": {
+          "lib/ollama/cuda_v12/ggml-cuda.dll": "8884ac90928d10680f11ffb1144051b3b34f4af70ee1fb8034154967537aaff0",
+          "lib/ollama/ggml-base.dll": "938b6db9e30c6c500c6bafff3d0433eed465896866e122d88cd2146bbbe5d058",
+          "lib/ollama/llama-server-impl.dll": "871d30ad11209f6cd486f0f415d6fe3670780ac80156444a7253e511f951925d",
+          "lib/ollama/llama.dll": "2c7d7cb7db3708d545edb3e378e1762ee4a6558b3a5f682512fe7a3e4cd95a7d",
+          "ollama.exe": "fa3f781d57a7af656aa85f3d4949901c30c7e976ef61197b1df77863625ce032"
+        },
+        "model_manifest_sha256": "bee26cfee476e3762c23027d1d23b92acdf125eafb82ba36d1fcb11c05278242",
+        "case": "runner-cold",
+        "eval_count": 128,
+        "api_tokens_per_second": 0.7999625367544506,
+        "decode_steps_per_second": 0.7937128294360565,
+        "time_to_first_output_seconds": 108.60900000000038,
+        "elapsed_seconds": 268.6090000000004,
+        "prompt_eval_seconds": 85.219575,
+        "eval_seconds": 160.007493,
+        "cached_prompt_tokens": 0,
+        "done": true,
+        "done_reason": "length",
+        "output_sha256": "520e48ca79ed5c6b4ff82447ef4a184a41789de42fef5dd3807e22743939d17f",
+        "output_token_limit_reached": true,
+        "source_boundary": {
+          "timing_source_line": 3492,
+          "ram": {
+            "source_line": 3491,
+            "ssd_mib": 84323.03,
+            "peak_mib": 6144.0
+          },
+          "h2d": {
+            "source_line": 3489,
+            "bytes": 106691296056
+          }
+        },
+        "ssd_read_mib_per_output_token_from_rounded_log": 658.773671875,
+        "h2d_mib_per_output_token_from_sampled_endpoint_approximate": 794.9121002554893,
+        "memory": {
+          "ram_weight_max_observed_activity_bytes": 6442450944,
+          "cuda_managed_max_observed_activity_bytes": 12658688384,
+          "nvml_global_max_sampled_used_bytes": 14631505920,
+          "corrected_ps_live_managed_size_vram_bytes": 12658688384,
+          "ps_matches_last_cuda_activity": true
+        },
+        "final_expert_cache_observed_mib": 6688.38
+      }
+    ]
+  },
+  "expert_overlap_diagnostic": {
+    "source_trace": ".build/gpu-first-moe/reports/runtime-flash-overlap-20261025-173615.jsonl",
+    "source_trace_sha256": "ad368635c4f9bc639597d8d1a2e93a02c4b041d23c268cfa5cc7fd65cba55489",
+    "source_analysis": ".build/gpu-first-moe/reports/runtime-flash-window-bound.json",
+    "source_analysis_sha256": "0034081e91af728845b2cb03b0e1315e9ebd9d8e970548a64aa35dbe1c3b4799",
+    "analysis_reused_without_recalculation": true,
+    "termination": "Runner forcibly terminated; no completion footer; valid prefix explicitly analyzed",
+    "methodology": {
+      "only_single_token_routes": true,
+      "required_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47
+      ],
+      "duplicate_identity": "Same model/evaluation/layer accepted only with identical expert order, k and byte size; conflicting duplicate rejected",
+      "windows": "Consecutive complete evaluation frames only; no bridging incomplete frames/prefill; overlapping windows of 1 through 8 tokens",
+      "weighting": "Sum of expert-bundle bytes times distinct selected experts, separately for every layer",
+      "flags": {
+        "allow_incomplete": true,
+        "drop_first_complete": false,
+        "p": 0.67
+      },
+      "p_hypothesis": "Constant conditional acceptance; expected emitted tokens=sum(p**j for j=0..k); observed true-token union for window k+1, one fallback/bonus token assumed",
+      "no_gpu_build_model_download_or_draft_inference": true
+    },
+    "diagnostic": {
+      "trace_complete": false,
+      "explicit_incomplete_prefix": true,
+      "discarded_unterminated_final_record": false,
+      "route_records": 863,
+      "duplicate_identical_evaluation_layers": 0,
+      "ignored_multi_token_records": 141,
+      "complete_48_layer_decode_frames_before_drop": 15,
+      "incomplete_or_mixed_decode_frames": 2,
+      "frames_used": 15,
+      "frame_eval_range": [
+        4,
+        18
+      ],
+      "dropped_first_complete_frame_model_eval": null,
+      "warmup_identification": "Trace v1 has no warmup/request marker; no automatic discard",
+      "oracle_all_accepted": [
+        {
+          "tokens": 1,
+          "overlapping_windows": 15,
+          "mean_union_bytes": 1572864000.0,
+          "mean_no_reuse_bytes": 1572864000.0,
+          "oracle_union_relative_traffic": 1.0
+        },
+        {
+          "tokens": 2,
+          "overlapping_windows": 14,
+          "mean_union_bytes": 2423895771.428571,
+          "mean_no_reuse_bytes": 3145728000.0,
+          "oracle_union_relative_traffic": 0.7705357142857143
+        },
+        {
+          "tokens": 3,
+          "overlapping_windows": 13,
+          "mean_union_bytes": 3153864861.5384617,
+          "mean_no_reuse_bytes": 4718592000.0,
+          "oracle_union_relative_traffic": 0.6683910924145299
+        },
+        {
+          "tokens": 4,
+          "overlapping_windows": 12,
+          "mean_union_bytes": 3735133866.6666665,
+          "mean_no_reuse_bytes": 6291456000.0,
+          "oracle_union_relative_traffic": 0.5936835394965277
+        },
+        {
+          "tokens": 5,
+          "overlapping_windows": 11,
+          "mean_union_bytes": 4246369745.4545455,
+          "mean_no_reuse_bytes": 7864320000.0,
+          "oracle_union_relative_traffic": 0.5399538352272727
+        },
+        {
+          "tokens": 6,
+          "overlapping_windows": 10,
+          "mean_union_bytes": 4691650560.0,
+          "mean_no_reuse_bytes": 9437184000.0,
+          "oracle_union_relative_traffic": 0.49714518229166665
+        },
+        {
+          "tokens": 7,
+          "overlapping_windows": 9,
+          "mean_union_bytes": 5095924622.222222,
+          "mean_no_reuse_bytes": 11010048000.0,
+          "oracle_union_relative_traffic": 0.46284308862433865
+        },
+        {
+          "tokens": 8,
+          "overlapping_windows": 8,
+          "mean_union_bytes": 5468889600.0,
+          "mean_no_reuse_bytes": 12582912000.0,
+          "oracle_union_relative_traffic": 0.4346282958984375
+        }
+      ],
+      "p_acceptance_hypothesis": [
+        {
+          "draft_tokens_k": 1,
+          "assumed_conditional_acceptance_p": 0.67,
+          "expected_emitted_tokens": 1.67,
+          "observed_actual_route_union_bytes": 2423895771.428571,
+          "optimistic_union_cost_per_expected_token_relative": 0.922797262617622
+        },
+        {
+          "draft_tokens_k": 2,
+          "assumed_conditional_acceptance_p": 0.67,
+          "expected_emitted_tokens": 2.1189,
+          "observed_actual_route_union_bytes": 3153864861.5384617,
+          "optimistic_union_cost_per_expected_token_relative": 0.9463274705005378
+        },
+        {
+          "draft_tokens_k": 3,
+          "assumed_conditional_acceptance_p": 0.67,
+          "expected_emitted_tokens": 2.419663,
+          "observed_actual_route_union_bytes": 3735133866.6666665,
+          "optimistic_union_cost_per_expected_token_relative": 0.981431777064042
+        }
+      ],
+      "limitations": [
+        "Observed true-token routes, not actual draft predictions or rejected-token routes",
+        "Routed expert bundle bytes only; ignores shared/fixed weights, draft cost, KV, compute, existing residency and eviction policy",
+        "Oracle assumes whole-window union reused perfectly once; not exact SSD/H2D traffic or tokens/s",
+        "p model assumes constant conditional acceptance and one fallback token; optimistic route surrogate, not a performance prediction",
+        "Overlapping windows are dependent observations; incomplete prefixes are not full-run evidence"
+      ],
+      "trace_sha256": "ad368635c4f9bc639597d8d1a2e93a02c4b041d23c268cfa5cc7fd65cba55489"
+    },
+    "interpretation": "Workload-specific raw expert-overlap diagnostic; not a TPS/SSD-policy prediction, actual draft acceptance measurement, quality result or verdict against MTP"
+  }
+}

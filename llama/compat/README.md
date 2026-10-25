@@ -35,13 +35,18 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
 - `005-live-runtime-activity.patch` - sampled load, context, generation and
   weight-transfer observations for the optional HTTP activity endpoint.
   See `docs/runtime-activity.md` for protocol and memory-counter scopes.
+- `006-moe-residency-pipeline.patch` - opt-in coordinated expert residency,
+  reusable host slots, CUDA upload scheduling, shared route plans and dynamic
+  prompt windows. See `docs/moe-residency-pipeline.md` for activation, memory
+  scopes and experimental limitations.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under
   this directory by numeric filename order.
 
 The compatibility source files stay in this directory and are linked into the
-fetched llama.cpp targets. The patch file only adds call sites.
+fetched llama.cpp targets. Patch 001 adds compatibility call sites; the later
+runtime patches also add native sources and validation executables.
 
 ## Load-Time Hooks
 
