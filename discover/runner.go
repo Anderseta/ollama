@@ -36,6 +36,9 @@ var defaultIntegratedROCmGFXTargets = map[string]struct{}{
 func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo {
 	deviceMu.Lock()
 	defer deviceMu.Unlock()
+	if ctx.Err() != nil {
+		return nil
+	}
 	startDiscovery := time.Now()
 	msg := "overall device VRAM discovery took"
 	defer func() {
@@ -262,6 +265,13 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 			libDirs[""] = struct{}{}
 		}
 
+		// A cancelled bootstrap is not evidence that the machine has no GPU.
+		// Discard partial discovery so the next live request can initialize it.
+		if ctx.Err() != nil {
+			devices = nil
+			libDirs = nil
+			return nil
+		}
 		bootstrapped = true
 	} else {
 		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
@@ -496,7 +506,7 @@ func bootstrapDevicesWithMetalRetry(firstAttemptCtx, retryParentCtx context.Cont
 		return bootstrapDevicesWithStatusWatchdog(ctx, ollamaLibDirs, extraEnvs)
 	}
 
-	devices, status, err := runDiscovery(firstAttemptCtx, extraEnvs)
+	devices, status, err := retryEmptyCUDABootstrap(firstAttemptCtx, ollamaLibDirs, extraEnvs, runDiscovery)
 	if err == nil {
 		recordPersistentRunnerEnv(devices, extraEnvs)
 		return devices
