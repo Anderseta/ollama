@@ -1,0 +1,493 @@
+{
+  "schema": 1,
+  "date": "2026-10-25",
+  "branch": "gpu-first-moe-inference",
+  "units": "Bytes unless named otherwise; 1 GiB = 2^30 bytes, 1 GB = 10^9 bytes.",
+  "evidence_scope": "Executed local laboratory observations, not a universal compatibility or quality guarantee. Compact extracts; raw artifacts remain in the original workspace build directory.",
+  "source_report_sha256": {
+    "benchmark-count32-comparison.json": "4269858cbc0912fa26f4c46e2c1e952b7587d958e92bd88cbc54ff68ae07cb42",
+    "candidate-diagnostics-final-summary.json": "fe4dd7e2c4c1feab9c879d696ef7b237f2a42ae2981810704972af007d3911b0",
+    "memory-validation-final-20261025.json": "2d94c34c4c24af808e288f869c7b4013f49d2947b1184be0b1e9e6cbb4eb4037",
+    "gpu-fixtures-final-summary.json": "26ff0717309e16b08d3edd5f9113855743b6cccafb7c3f0c7d182894c407ad34",
+    "final-patch-replay.json": "259c23d3d4a3cc6f35112be22bc15bc77e3ce874605c2a9393a244cddc3f8de8"
+  },
+  "count32_comparison": {
+    "comparison_type": "single paired exploratory run; no repetitions/statistical significance",
+    "cold_definition": "New server/runner; OS page cache was not flushed",
+    "hardware": "Ryzen 5 2600; RTX 5060 Ti 16 GiB; 32 GiB host RAM; model on Lexar NS100 SATA SSD",
+    "memory_scopes": {
+      "working_set": "Sum over lab process tree; shared pages can be counted more than once.",
+      "private_usage_commit": "Sum of private committed virtual memory; includes pages not currently physically resident. Not total physical RAM use.",
+      "nvml_device_used": "Whole physical device, including desktop, driver, other processes; not the runner allocator quota.",
+      "available_physical_ram": "Whole-machine free/available physical RAM, not model managed cache."
+    },
+    "runs": {
+      "baseline-count32-a": {
+        "source_report": "baseline-count32-a-results.json",
+        "configuration": {
+          "model": "qwen3.8-flash-next-uncensored:q4_k_m",
+          "rounds": 2,
+          "predict": 32,
+          "prompt": "Conte de 1 até 100, separando os números por vírgulas.",
+          "context": 131072,
+          "moe_ram_mib": 6144,
+          "moe_gpu_cache_mib": 1024,
+          "fit_margin_mib": 4096,
+          "gpu_exclusive": false,
+          "gpu_vram_limit_mib": 0,
+          "gpu_diagnostics": false
+        },
+        "payload_sha256": {
+          "lib\\ollama\\ggml-cuda.dll": "f6f9f226b8739227abc9f6a68b80c6c1fa54d5b7bcf4341d7332aef7e27a4e68",
+          "lib\\ollama\\llama-server-impl.dll": "7c72eb0fb7481fa89092fe3d35b6690edf38a45d96ea35e0f6c96c67e2808441",
+          "lib\\ollama\\llama.dll": "d1a5d0d14412383eed4d4fd52032c60eaa7b877c768afab088b3dcf1306f9ca3",
+          "ollama.exe": "8879f1f157194ee4cb41826a507e0ee233329272b196dcb7985cd8a327b2beba"
+        },
+        "memory": {
+          "process_tree_working_set_peak_bytes": 7097528320,
+          "process_tree_private_commit_peak_bytes": 17177444352,
+          "whole_device_nvml_used_peak_bytes": 11878121472,
+          "minimum_whole_machine_available_ram_bytes": 5941329920,
+          "sample_count": 202
+        },
+        "results": [
+          {
+            "case": "runner-cold",
+            "elapsed_s": 148.875,
+            "ttft_s": 94.65600000000268,
+            "tokens_s": 0.5902190920936371,
+            "decode_steps_s": 0.5717747454657109,
+            "load_s": 27.6625383,
+            "prompt_eval_s": 66.989667,
+            "eval_s": 54.217155,
+            "eval_count": 32,
+            "cached_tokens": 0
+          },
+          {
+            "case": "warm-1",
+            "elapsed_s": 57.875,
+            "ttft_s": 9.827999999994063,
+            "tokens_s": 0.6659436876769056,
+            "decode_steps_s": 0.6451329474370023,
+            "load_s": 0.005159,
+            "prompt_eval_s": 9.801144,
+            "eval_s": 48.052111,
+            "eval_count": 32,
+            "cached_tokens": 28
+          }
+        ]
+      },
+      "candidate-count32-a": {
+        "source_report": "candidate-count32-a-results.json",
+        "configuration": {
+          "model": "qwen3.8-flash-next-uncensored:q4_k_m",
+          "rounds": 2,
+          "predict": 32,
+          "prompt": "Conte de 1 até 100, separando os números por vírgulas.",
+          "context": 131072,
+          "moe_ram_mib": 6144,
+          "moe_gpu_cache_mib": 1024,
+          "fit_margin_mib": 4096,
+          "gpu_exclusive": true,
+          "gpu_vram_limit_mib": 12288,
+          "gpu_diagnostics": false
+        },
+        "payload_sha256": {
+          "lib\\ollama\\cuda_v12\\ggml-cuda.dll": "a10b47c8168de9daebc061ed756ebe0016e2e301626f9202d569ad5d72f5b2ea",
+          "lib\\ollama\\llama-server-impl.dll": "c768f22aedb68382e2470d123bc171f6d6f25581e4568ec2a49c22e04a6b916a",
+          "lib\\ollama\\llama.dll": "ddf602ca00400b3cda697cbe0a701923f690c3b67b0e20ac89821e524729c146",
+          "ollama.exe": "52791cd9f7e220733e3cdcdfcfc0efa019dc62836e76051e38ed60b37ce23eec"
+        },
+        "memory": {
+          "process_tree_working_set_peak_bytes": 7102910464,
+          "process_tree_private_commit_peak_bytes": 15762366464,
+          "whole_device_nvml_used_peak_bytes": 9445576704,
+          "minimum_whole_machine_available_ram_bytes": 13706629120,
+          "sample_count": 184
+        },
+        "results": [
+          {
+            "case": "runner-cold",
+            "elapsed_s": 131.20300000000134,
+            "ttft_s": 79.82800000000134,
+            "tokens_s": 0.6227590889937529,
+            "decode_steps_s": 0.6032978674626981,
+            "load_s": 18.9785532,
+            "prompt_eval_s": 60.842436,
+            "eval_s": 51.384236,
+            "eval_count": 32,
+            "cached_tokens": 0
+          },
+          {
+            "case": "warm-1",
+            "elapsed_s": 54.57800000000134,
+            "ttft_s": 8.953000000001339,
+            "tokens_s": 0.7014475334342775,
+            "decode_steps_s": 0.6795272980144563,
+            "load_s": 0.0067646,
+            "prompt_eval_s": 8.945864,
+            "eval_s": 45.619948,
+            "eval_count": 32,
+            "cached_tokens": 28
+          }
+        ]
+      }
+    },
+    "comparisons": [
+      {
+        "case": "runner-cold",
+        "texts_identical": true,
+        "eval_count": 32,
+        "elapsed_reduction_percent": 11.870361041140997,
+        "ttft_reduction_percent": 15.665145368493194,
+        "api_tokens_per_second_gain_percent": 5.513206423853423,
+        "decode_interval_rate_gain_percent": 5.513206423853423
+      },
+      {
+        "case": "warm-1",
+        "texts_identical": true,
+        "eval_count": 32,
+        "elapsed_reduction_percent": 5.696760259176948,
+        "ttft_reduction_percent": 8.903133903065253,
+        "api_tokens_per_second_gain_percent": 5.331358553937848,
+        "decode_interval_rate_gain_percent": 5.331358553937848
+      }
+    ],
+    "throughput_definition": {
+      "api_tokens_per_second": "eval_count / eval_duration (API convention)",
+      "decode_intervals_per_second": "(eval_count - 1) / eval_duration; useful when first token belongs to prompt evaluation",
+      "timing_scope": "Client elapsed and TTFT are wall-clock observations; load/prompt/eval are API-reported intervals, not additive guarantees."
+    },
+    "limitations": [
+      "One pair of 32-token runs, each cold then warm; no OS page-cache flush.",
+      "Baseline started with less available system RAM and more whole-device VRAM already in use.",
+      "Byte-identical text for this prompt does not establish general numerical equivalence or all-model quality.",
+      "These reports preserve hashes of the exact benchmark payload; later discovery retry, diagnostic-only host additions and SSM generic-kernel fix require new hashes and are not retroactively benchmarked."
+    ]
+  },
+  "final_functional_smoke": {
+    "label": "candidate-diagnostics-final",
+    "started_utc": "2026-10-25T06:03:08.658994+00:00",
+    "finished_utc": "2026-10-25T06:04:55.492031+00:00",
+    "ok": true,
+    "stopped": true,
+    "configuration": {
+      "port": 11448,
+      "model": "qwen3.8-flash-next-uncensored:q4_k_m",
+      "predict": 2,
+      "context": 131072,
+      "moe_ram_mib": 6144,
+      "moe_gpu_cache_mib": 1024,
+      "gpu_exclusive": true,
+      "gpu_vram_limit_mib": 12288,
+      "gpu_diagnostics": true,
+      "hold_seconds": 45.0
+    },
+    "payload_sha256": {
+      "lib\\ollama\\cuda_v12\\ggml-cuda.dll": "28bd9039ca4a50106ce03a0d86859018a7d945b7f3a593bc41bf2d24de0b61ed",
+      "lib\\ollama\\llama-server-impl.dll": "ab07b3038a71700c884a8cc70d058c8341b47b9204e38a690f3ed864eb85af21",
+      "lib\\ollama\\llama.dll": "5fbbab94315c92cf42fc079eb1cab4d00aa97b354c3cf44edb47599ae8603d0f",
+      "ollama.exe": "28dede1e7959fcd3f3f06c53bf3f686059ee7aad100b9e327f8dbb51efcb8270"
+    },
+    "process_memory_observation": {
+      "method": "Toolhelp32Snapshot + K32GetProcessMemoryInfo",
+      "scope": "Laboratory server PID and its currently observed descendants only",
+      "working_set_semantics": "Sum of process working sets; shared pages can be counted more than once, so this is not unique physical RAM",
+      "private_usage_semantics": "Sum of PrivateUsage commit charge, including potentially nonresident pages; not physical RAM or model-weight residency",
+      "interval_s": 1,
+      "observed_peak_working_set_sum_bytes": 7160504320,
+      "observed_peak_private_usage_commit_sum_bytes": 15598407680,
+      "samples": 102
+    },
+    "device_memory_observation": {
+      "method": "NVML nvmlDeviceGetMemoryInfo (ctypes, no extra package)",
+      "scope": "All processes, display and driver allocations on each physical GPU; this is not the runner's managed allocation quota",
+      "interval_s": 1,
+      "initialization_error": null,
+      "observed_peak_used_bytes": [
+        9601634304
+      ]
+    },
+    "min_available_ram_bytes": 11388977152,
+    "cold_definition": "New server/runner; OS page cache is not flushed",
+    "purpose": "Functional smoke of final payload and diagnostics, not a sustained throughput benchmark; includes 45-second observation hold.",
+    "diagnostic_scope_notes": [
+      "Layer wall time includes serialized tagged graph segments, IO and diagnostic synchronization barriers; not pure CUDA kernel time.",
+      "SSD, H2D, expert and operator counters are request deltas of shared model/context state.",
+      "Managed RAM peak is model-lifetime; CUDA allocation peak is physical-device allocator lifetime.",
+      "Process working sets are summed and may double-count shared pages; private commit is not resident physical RAM.",
+      "NVML is whole-device global use, including desktop, other programs and driver allocations."
+    ],
+    "requests": [
+      {
+        "case": "runner-cold",
+        "text": "OK",
+        "eval_count": 2,
+        "elapsed_s": 56.98399999999674,
+        "ttft_s": 53.98399999999674,
+        "cpu_heavy_ops_submitted": 0,
+        "gpu_heavy_ops_submitted": 11814,
+        "layer_records": 49,
+        "layer_wall_ms_sum": 36619.643,
+        "layer_segments_sum": 156,
+        "slowest_layers": [
+          {
+            "layer": 0,
+            "wall_ms": 1485.817,
+            "segments": 6
+          },
+          {
+            "layer": 22,
+            "wall_ms": 1301.048,
+            "segments": 3
+          },
+          {
+            "layer": 21,
+            "wall_ms": 1093.56,
+            "segments": 3
+          },
+          {
+            "layer": 17,
+            "wall_ms": 1061.143,
+            "segments": 3
+          },
+          {
+            "layer": 38,
+            "wall_ms": 1048.258,
+            "segments": 3
+          }
+        ],
+        "expert_usage": {
+          "scope": "canonical_ffn_router_selections_per_layer_not_weight_tile_accesses",
+          "selections": 8950,
+          "distinct_layer_experts": 3139,
+          "dropped_selections": 0,
+          "top_limit": 32
+        },
+        "ram": {
+          "limit_bytes": 6442450944,
+          "resident_bytes": 6442450944,
+          "peak_bytes": 6442450944,
+          "hits": 42990,
+          "misses": 181309,
+          "evicted_pages": 125345,
+          "io_buffer_bytes": 4210688,
+          "upload_buffer_bytes": 4194304
+        },
+        "cuda_managed": {
+          "peak_scope": "physical_device_allocator_lifetime",
+          "enabled": true,
+          "limit_bytes": 12884901888,
+          "used_bytes": 6711565184,
+          "peak_bytes": 6711565184,
+          "driver_headroom_bytes": 67108864,
+          "denied_allocations_total": 0
+        },
+        "cuda_execution": {
+          "enabled": true,
+          "scope": "execution_stream_intervals_not_kernel_only",
+          "stream_ms": 863.3187795169652,
+          "samples": 738,
+          "pending": 0,
+          "dropped": 0
+        },
+        "ssd": {
+          "bytes": 11939487744,
+          "reads": 13970
+        },
+        "h2d": {
+          "bytes": 13965434168,
+          "calls": 13106,
+          "syncs": 447,
+          "slot_waits": 7701
+        },
+        "timings": {
+          "enabled": true,
+          "scope": "overlapping_host_intervals",
+          "io_submit_ms": 576.527,
+          "io_wait_ms": 24410.461,
+          "host_copy_ms": 3104.084,
+          "commit_ms": 6021.49,
+          "release_ms": 840.205,
+          "h2d_ms": 2211.855,
+          "h2d_wait_ms": 344.295
+        }
+      },
+      {
+        "case": "warm-1",
+        "text": "OK",
+        "eval_count": 2,
+        "elapsed_s": 1.2029999999940628,
+        "ttft_s": 0.7969999999986612,
+        "cpu_heavy_ops_submitted": 0,
+        "gpu_heavy_ops_submitted": 7868,
+        "layer_records": 49,
+        "layer_wall_ms_sum": 1109.7510000000002,
+        "layer_segments_sum": 104,
+        "slowest_layers": [
+          {
+            "layer": 43,
+            "wall_ms": 31.427,
+            "segments": 2
+          },
+          {
+            "layer": 46,
+            "wall_ms": 30.029,
+            "segments": 2
+          },
+          {
+            "layer": 23,
+            "wall_ms": 29.624,
+            "segments": 2
+          },
+          {
+            "layer": 40,
+            "wall_ms": 28.038,
+            "segments": 2
+          },
+          {
+            "layer": 27,
+            "wall_ms": 28.008,
+            "segments": 2
+          }
+        ],
+        "expert_usage": {
+          "scope": "canonical_ffn_router_selections_per_layer_not_weight_tile_accesses",
+          "selections": 2370,
+          "distinct_layer_experts": 1262,
+          "dropped_selections": 0,
+          "top_limit": 32
+        },
+        "ram": {
+          "limit_bytes": 6442450944,
+          "resident_bytes": 6442450944,
+          "peak_bytes": 6442450944,
+          "hits": 76564,
+          "misses": 0,
+          "evicted_pages": 0,
+          "io_buffer_bytes": 4210688,
+          "upload_buffer_bytes": 4194304
+        },
+        "cuda_managed": {
+          "peak_scope": "physical_device_allocator_lifetime",
+          "enabled": true,
+          "limit_bytes": 12884901888,
+          "used_bytes": 6711565184,
+          "peak_bytes": 6711565184,
+          "driver_headroom_bytes": 67108864,
+          "denied_allocations_total": 0
+        },
+        "cuda_execution": {
+          "enabled": true,
+          "scope": "execution_stream_intervals_not_kernel_only",
+          "stream_ms": 227.9895359314978,
+          "samples": 494,
+          "pending": 0,
+          "dropped": 0
+        },
+        "ssd": {
+          "bytes": 0,
+          "reads": 0
+        },
+        "h2d": {
+          "bytes": 4754488912,
+          "calls": 4443,
+          "syncs": 300,
+          "slot_waits": 2346
+        },
+        "timings": {
+          "enabled": true,
+          "scope": "overlapping_host_intervals",
+          "io_submit_ms": 0.0,
+          "io_wait_ms": 0.0,
+          "host_copy_ms": 622.027,
+          "commit_ms": 0.0,
+          "release_ms": 0.0,
+          "h2d_ms": 801.263,
+          "h2d_wait_ms": 92.724
+        }
+      }
+    ]
+  },
+  "memory_tests": {
+    "all_passed": true,
+    "tests": [
+      {
+        "name": "cuda-budget",
+        "exit": 0,
+        "expected_exit": 0,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.6650971,
+        "log": "memory-validation-final-20261025-cuda-budget.log"
+      },
+      {
+        "name": "cuda-unified-rejection",
+        "exit": 1,
+        "expected_exit": 1,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.1960418,
+        "log": "memory-validation-final-20261025-cuda-unified-rejection.log"
+      },
+      {
+        "name": "ram-metrics-cpu",
+        "exit": 0,
+        "expected_exit": 0,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.3019996,
+        "log": "memory-validation-final-20261025-ram-metrics-cpu.log"
+      },
+      {
+        "name": "ram-metrics-cuda",
+        "exit": 0,
+        "expected_exit": 0,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.4284587,
+        "log": "memory-validation-final-20261025-ram-metrics-cuda.log"
+      },
+      {
+        "name": "ram-cache-cpu",
+        "exit": 0,
+        "expected_exit": 0,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.314104,
+        "log": "memory-validation-final-20261025-ram-cache-cpu.log"
+      },
+      {
+        "name": "ram-cache-cuda",
+        "exit": 0,
+        "expected_exit": 0,
+        "expected_marker": true,
+        "passed": true,
+        "wall_seconds": 0.3968103,
+        "log": "memory-validation-final-20261025-ram-cache-cuda.log"
+      }
+    ]
+  },
+  "model_matrix": {
+    "original_counts": {
+      "streaming": 19,
+      "pass": 8,
+      "fail_numerical": 9,
+      "fail_unsupported": 2,
+      "resident_diagnostics": 7
+    },
+    "scaled_threshold": 0.0002,
+    "unsupported_reason": "Original Nemotron Mamba2 fixture has d_state=16; CUDA SSM_SCAN supports only 96/128/256. SSM_CONV192 now supported.",
+    "additional_synthetic_state128_cases": 2,
+    "additional_synthetic_state128_passes": 2,
+    "notes": "Original numerical failures retained; see scripts/gpu-first/fixtures.md for architecture and provenance details."
+  },
+  "patch_replay": {
+    "files": 57,
+    "mismatches": [],
+    "fresh_apply_passed": true,
+    "second_apply_passed": true,
+    "patch_sha256": "5bce41f1be9133933e70a793229d031af50e771e86799b9f047b2ec58475c36c",
+    "pinned_head": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e"
+  }
+}

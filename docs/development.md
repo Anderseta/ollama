@@ -18,6 +18,12 @@ go run . serve
 
 ## Native build model
 
+The experimental GPU-exclusive MoE path has an isolated local build and numerical
+regression workflow in [GPU-first inference](gpu-first-moe-inference.md) and
+[memory validation](gpu-first-memory-validation.md). It uses the same pinned
+llama.cpp compatibility patch stack; its laboratory listener and model manifests
+are separate from production.
+
 For a fresh checkout, or after changing native code, build from the repository root. On macOS arm64, this builds Metal inference. On all other platforms this builds CPU-only inference. It builds the Go binary at the repository root and installs the native runtime payload under `build/lib/ollama`.
 
 ```shell

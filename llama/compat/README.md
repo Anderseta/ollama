@@ -25,6 +25,13 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
   small tensor repacking primitives.
 - `001-llama-cpp-hooks.patch` - small additive call-site edits in llama.cpp files.
   It currently touches `src/llama-model-loader.cpp` and `tools/mtmd/clip.cpp`.
+- `002-moe-ram-limit.patch` - bounded selective host-weight cache and expert
+  transfer hooks. See `docs/moe-ram-limit.md`.
+- `003-runtime-performance.patch` - the existing runtime and speculative
+  decoding improvements layered on the selective cache.
+- `004-gpu-first-moe.patch` - opt-in CUDA execution enforcement, bounded expert
+  tiling, selective token rows, CUDA allocation quotas and optional diagnostics.
+  See `docs/gpu-first-moe-inference.md` and the memory-validation document.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under
