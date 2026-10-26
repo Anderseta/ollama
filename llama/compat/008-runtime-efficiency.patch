@@ -1,0 +1,1177 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,6 +11,7 @@
+ #include "llama-impl.h"
+ #include "llama-batch.h"
+ #include "llama-io.h"
++#include "llama-state-transfer.h"
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+@@ -3243,13 +3244,12 @@
+ class llama_io_write_host : public llama_io_write_buffer_i {
+ public:
+     llama_io_write_host(
+-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
++            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> & backends)
++        : backends(backends), ptr(p), buf_size(len) {}
+ 
+     void commit() override {
+-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+-        for (const auto & winfo : winfos) {
+-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+-        }
++        llama_state_transfer_context(backends).get(winfos);
++
+         winfos.clear();
+     }
+ 
+@@ -3281,6 +3281,7 @@
+     }
+ 
+ private:
++    const std::vector<ggml_backend_ptr> & backends;
+     uint8_t * ptr;
+     size_t buf_size = 0;
+     size_t size_written = 0;
+@@ -3296,13 +3297,12 @@
+ 
+ class llama_io_read_host : public llama_io_read_buffer_i {
+ public:
+-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
++    llama_io_read_host(const uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> & backends)
++        : backends(backends), ptr(p), buf_size(len) {}
+ 
+     void commit() override {
+-        // flush the reads
+-        for (const auto & rinfo : rinfos) {
+-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+-        }
++        llama_state_transfer_context(backends).set(rinfos);
++
+         rinfos.clear();
+     }
+ 
+@@ -3338,6 +3338,7 @@
+     }
+ 
+ private:
++    const std::vector<ggml_backend_ptr> & backends;
+     const uint8_t * ptr;
+     size_t buf_size = 0;
+     size_t size_read = 0;
+@@ -3742,7 +3743,7 @@
+ }
+ 
+ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+-    llama_io_write_host io(dst, size);
++    llama_io_write_host io(dst, size, backends);
+     try {
+         const size_t written = state_write_data(io);
+         io.commit();
+@@ -3754,7 +3755,7 @@
+ }
+ 
+ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+-    llama_io_read_host io(src, size);
++    llama_io_read_host io(src, size, backends);
+     bool committing = false;
+     try {
+         const size_t read = state_read_data(io);
+@@ -3789,7 +3790,7 @@
+     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+     } else {
+-        io = std::make_unique<llama_io_write_host>(dst, size);
++        io = std::make_unique<llama_io_write_host>(dst, size, backends);
+     }
+ 
+     bool committing = false;
+@@ -3816,7 +3817,7 @@
+     try {
+         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+             // Validate the source header before selecting its device snapshot.
+-            io = std::make_unique<llama_io_read_host>(src, size);
++            io = std::make_unique<llama_io_read_host>(src, size, backends);
+ 
+             uint32_t magic_read;
+             io->read(&magic_read, sizeof(magic_read));
+@@ -3833,7 +3834,7 @@
+ 
+             io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+         } else {
+-            io = std::make_unique<llama_io_read_host>(src, size);
++            io = std::make_unique<llama_io_read_host>(src, size, backends);
+         }
+ 
+         uint32_t magic_read;
+diff --git a/src/llama-state-transfer.h b/src/llama-state-transfer.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-state-transfer.h
+@@ -0,0 +1,140 @@
++#pragma once
++
++#include "ggml-cpp.h"
++#include "ggml-cuda-kv-growth.h"
++#include "../ggml/src/ggml-backend-impl.h"
++
++#include <exception>
++#include <utility>
++#include <vector>
++
++// A state operation already owns a synchronized context. Use its existing
++// backend streams, never a second stream with an independent tensor lifetime.
++// Buffers with nonstandard layouts retain their synchronous buffer callbacks.
++class llama_state_transfer_context {
++public:
++    explicit llama_state_transfer_context(const std::vector<ggml_backend_ptr> & backends) {
++        entries.reserve(backends.size());
++        for (const auto & backend : backends) {
++            if (!backend || !backend->iface.synchronize) { continue; }
++            auto * buft = ggml_backend_get_default_buffer_type(backend.get());
++            if (!buft || ggml_backend_buft_is_host(buft)) { continue; }
++            const ggml_backend_cuda_kv_growth_api * growth = nullptr;
++            auto * device = ggml_backend_get_device(backend.get());
++            auto * registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++            if (registry) {
++                growth = static_cast<const ggml_backend_cuda_kv_growth_api *>(
++                    ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_growth_api"));
++                if (growth && (growth->version != 1 || !growth->committed)) { continue; }
++            }
++            entries.push_back({backend.get(), buft, growth, false});
++        }
++    }
++
++    template<class Transfers>
++    void get(const Transfers & transfers) {
++        run(transfers, true, [](ggml_backend_t backend, const auto & item) {
++            if (backend) {
++                backend->iface.get_tensor_async(backend, item.tensor, item.ptr, item.offset, item.size);
++            } else {
++                auto * buffer = buffer_for(item.tensor);
++                buffer->iface.get_tensor(buffer, item.tensor, item.ptr, item.offset, item.size);
++            }
++        });
++    }
++
++    template<class Transfers>
++    void set(const Transfers & transfers) {
++        run(transfers, false, [](ggml_backend_t backend, const auto & item) {
++            if (backend) {
++                backend->iface.set_tensor_async(backend, item.tensor, item.ptr, item.offset, item.size);
++            } else {
++                auto * buffer = buffer_for(item.tensor);
++                buffer->iface.set_tensor(buffer, item.tensor, item.ptr, item.offset, item.size);
++            }
++        });
++    }
++
++private:
++    struct entry {
++        ggml_backend_t backend;
++        ggml_backend_buffer_type_t buft;
++        const ggml_backend_cuda_kv_growth_api * growth;
++        bool pending;
++    };
++    std::vector<entry> entries;
++    std::vector<std::pair<ggml_backend_buffer_t, bool>> mapped_buffers;
++
++    static ggml_backend_buffer_t buffer_for(const ggml_tensor * tensor) {
++        return tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    }
++
++    bool fully_mapped(const entry & backend, ggml_backend_buffer_t buffer) {
++        if (!backend.growth) { return true; }
++        for (const auto & checked : mapped_buffers) {
++            if (checked.first == buffer) { return checked.second; }
++        }
++        // VMM buffers deliberately retain CUDA's default buft. Async accessors
++        // do not commit pages; retain the buffer callbacks until all pages are
++        // mapped. Mapped pages never shrink during a state operation. Cache a
++        // conservative answer only within this operation, including views.
++        const size_t committed = backend.growth->committed(buffer);
++        const bool mapped = committed != SIZE_MAX && committed >= ggml_backend_buffer_get_size(buffer);
++        mapped_buffers.emplace_back(buffer, mapped);
++        return mapped;
++    }
++
++    entry * find(const ggml_tensor * tensor, bool get) {
++        // Match the buffer selected by ggml's own tensor accessors, including
++        // views. supports_buft is insufficient: CUDA, for example, can execute
++        // on split buffers but its async tensor accessors require its default.
++        auto * buffer = buffer_for(tensor);
++        if (!buffer) { return nullptr; }
++        auto * buft = ggml_backend_buffer_get_type(buffer);
++        for (auto & candidate : entries) {
++            if (candidate.buft == buft &&
++                    (get ? candidate.backend->iface.get_tensor_async != nullptr :
++                           candidate.backend->iface.set_tensor_async != nullptr)) {
++                return fully_mapped(candidate, buffer) ? &candidate : nullptr;
++            }
++        }
++        return nullptr;
++    }
++
++    // Call the interfaces directly after the same range/buffer checks as ggml.
++    // MSVC /EHsc assumes the public extern-C wrappers cannot throw and can omit
++    // their unwind handlers. Backend callbacks can throw (e.g. quota denial),
++    // so these C++ indirect calls must stay inside the explicit drain boundary.
++    template<class Transfers, class Submit>
++    void run(const Transfers & transfers, bool get, Submit submit) {
++        mapped_buffers.clear(); // classification belongs to this operation, not the helper lifetime
++        std::exception_ptr failure;
++        try {
++            for (const auto & item : transfers) {
++                if (!item.size) { continue; }
++                GGML_ASSERT(item.tensor && item.tensor->data && buffer_for(item.tensor));
++                const size_t bytes = ggml_nbytes(item.tensor);
++                GGML_ASSERT(item.offset <= bytes && item.size <= bytes - item.offset);
++                entry * target = find(item.tensor, get);
++                // Mark before submitting: an accessor may enqueue some work and
++                // then throw. Neither the snapshot nor tensors may expire yet.
++                if (target) { target->pending = true; }
++                submit(target ? target->backend : nullptr, item);
++            }
++        } catch (...) {
++            failure = std::current_exception();
++        }
++        // Explicitly drain every participating stream, even when a previous
++        // submit/fence failed. Destruction must never perform transfers or throw.
++        for (auto & item : entries) {
++            if (!item.pending) { continue; }
++            item.pending = false;
++            try {
++                item.backend->iface.synchronize(item.backend);
++            } catch (...) {
++                if (!failure) { failure = std::current_exception(); }
++            }
++        }
++        if (failure) { std::rethrow_exception(failure); }
++    }
++};
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -1,4 +1,6 @@
+ #include "llama-model-ram.h"
++#include "llama-model-ram-ready.h"
++#include "llama-model-ram-pipeline.h"
+ #include "llama-impl.h"
+ #include "llama-runtime-activity.h"
+ #include "llama-moe-runtime.h"
+@@ -498,16 +500,6 @@
+         }
+         uint8_t * result = free_slots.back(); free_slots.pop_back(); return result;
+     }
+-    bool ready_range(const ggml_tensor * tensor, size_t offset, size_t bytes) const {
+-        const region * r = find(tensor);
+-        if (!r) { return false; }
+-        const size_t first = checked_add((uintptr_t)tensor->data-(uintptr_t)r->data, offset);
+-        const size_t end = checked_add(first, bytes);
+-        for (size_t page = first/page_size; page < round_up(end,page_size)/page_size; ++page) {
+-            if (!r->pages[page].resident) { return false; }
+-        }
+-        return true;
+-    }
+     void copy_out(const ggml_tensor * tensor, size_t offset, void * dst, size_t bytes) const {
+         if (!pooled) { memcpy(dst, static_cast<const uint8_t *>(tensor->data)+offset, bytes); return; }
+         const region * r = find(tensor);
+@@ -561,87 +553,89 @@
+             bool committed = false;
+         };
+         std::array<load_job, io_depth> jobs;
+-        size_t i = 0, active = 0;
++        size_t i = 0;
++        auto submit = [&] {
++            while (i < needed.size()) {
++                page * first = needed[i];
++                if (first->resident) { ++i; continue; }
++                size_t n = 1;
++                while (i + n < needed.size() && n*page_size < io_chunk) {
++                    page * next = needed[i + n];
++                    if (next->resident || next->owner != first->owner || next->index != first->index + n) { break; }
++                    ++n;
++                }
++                size_t slot = 0;
++                while (jobs[slot].committed) { ++slot; }
++                auto & job = jobs[slot];
++                region & r = *first->owner;
++                const size_t offset = first->index*page_size;
++                const size_t file_offset = checked_add(r.offset, offset);
++                job.bytes = n*page_size;
++                job.size = std::min(job.bytes, r.size - offset);
++                job.prefix = file_offset % alignment;
++                job.dst = r.data + offset;
++                // Allocate queue entries before committing pages or submitting I/O.
++                for (size_t j = 0; j < n; ++j) { job.ready.push_back(needed[i + j]); }
++                int64_t start = clock();
++                if (pooled) {
++                    job.committed = true;
++                    for (page * p : job.ready) { p->storage = allocate_slot(); }
++                } else { commit_lock(job.dst, job.bytes); }
++                if (!pooled) { elapsed(start, commit_us); }
++                job.committed = true;
++                if (!pooled) { resident += job.bytes; peak = std::max(peak, resident); }
++                start = clock();
++                requests[slot].start(*readers[r.file], staging + slot*(io_chunk + alignment),
++                                     round_up(job.prefix + job.size, alignment), file_offset - job.prefix);
++                elapsed(start, io_submit_us);
++                ++read_calls;
++                i += n;
++                return true;
++            }
++            return false;
++        };
++        auto complete = [&] {
++            int64_t start = clock();
++            size_t slot = io_depth;
++            while (slot == io_depth) {
++                for (size_t j = 0; j < io_depth; ++j) {
++                    if (jobs[j].committed && requests[j].ready()) { slot = j; break; }
++                }
++#ifdef _WIN32
++                if (slot == io_depth) {
++                    HANDLE events[io_depth]; DWORD count = 0;
++                    for (size_t j = 0; j < io_depth; ++j) { if (jobs[j].committed) { events[count++] = requests[j].ov.hEvent; } }
++                    const DWORD result = WaitForMultipleObjects(count,events,FALSE,INFINITE);
++                    if (result == WAIT_FAILED) { throw std::runtime_error("MoE RAM cache: completion wait failed"); }
++                }
++#endif
++            }
++            auto & job = jobs[slot];
++            const size_t got = requests[slot].finish();
++            elapsed(start, io_wait_us);
++            bytes_read += got;
++            llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
++            if (got < job.prefix + job.size) { throw std::runtime_error("MoE RAM cache: truncated queued GGUF read"); }
++            start = clock();
++            const uint8_t * input = staging + slot*(io_chunk+alignment) + job.prefix;
++            if (pooled) {
++                size_t done = 0;
++                for (page * p : job.ready) {
++                    const size_t bytes = std::min(page_size,job.size-done);
++                    memcpy(p->storage,input+done,bytes); done += bytes;
++                }
++            } else { memcpy(job.dst,input,job.size); }
++            elapsed(start, host_copy_us);
++            for (auto it = job.ready.begin(); it != job.ready.end(); ++it) {
++                page * p = *it;
++                p->resident = true; p->hot = false; p->prefetched = prefetch;
++                p->position = it;
++            }
++            probation.splice(probation.end(), job.ready);
++            job.committed = false;
++        };
+         try {
+-            while (i < needed.size() || active) {
+-                while (i < needed.size() && active < io_depth) {
+-                    page * first = needed[i];
+-                    if (first->resident) { ++i; continue; }
+-                    size_t n = 1;
+-                    while (i + n < needed.size() && n*page_size < io_chunk) {
+-                        page * next = needed[i + n];
+-                        if (next->resident || next->owner != first->owner || next->index != first->index + n) { break; }
+-                        ++n;
+-                    }
+-                    size_t slot = 0;
+-                    while (jobs[slot].committed) { ++slot; }
+-                    auto & job = jobs[slot];
+-                    region & r = *first->owner;
+-                    const size_t offset = first->index*page_size;
+-                    const size_t file_offset = checked_add(r.offset, offset);
+-                    job.bytes = n*page_size;
+-                    job.size = std::min(job.bytes, r.size - offset);
+-                    job.prefix = file_offset % alignment;
+-                    job.dst = r.data + offset;
+-                    // Allocate queue entries before committing pages or submitting I/O.
+-                    for (size_t j = 0; j < n; ++j) { job.ready.push_back(needed[i + j]); }
+-                    int64_t start = clock();
+-                    if (pooled) {
+-                        job.committed = true;
+-                        for (page * p : job.ready) { p->storage = allocate_slot(); }
+-                    } else { commit_lock(job.dst, job.bytes); }
+-                    if (!pooled) { elapsed(start, commit_us); }
+-                    job.committed = true;
+-                    if (!pooled) { resident += job.bytes; peak = std::max(peak, resident); }
+-                    start = clock();
+-                    requests[slot].start(*readers[r.file], staging + slot*(io_chunk + alignment),
+-                                         round_up(job.prefix + job.size, alignment), file_offset - job.prefix);
+-                    elapsed(start, io_submit_us);
+-                    ++read_calls;
+-                    i += n; ++active;
+-                }
+-                if (!active) { break; }
+-                int64_t start = clock();
+-                size_t slot = io_depth;
+-                while (slot == io_depth) {
+-                    for (size_t j = 0; j < io_depth; ++j) {
+-                        if (jobs[j].committed && requests[j].ready()) { slot = j; break; }
+-                    }
+-#ifdef _WIN32
+-                    if (slot == io_depth) {
+-                        HANDLE events[io_depth]; DWORD count = 0;
+-                        for (size_t j = 0; j < io_depth; ++j) { if (jobs[j].committed) { events[count++] = requests[j].ov.hEvent; } }
+-                        const DWORD result = WaitForMultipleObjects(count,events,FALSE,INFINITE);
+-                        if (result == WAIT_FAILED) { throw std::runtime_error("MoE RAM cache: completion wait failed"); }
+-                    }
+-#endif
+-                }
+-                auto & job = jobs[slot];
+-                const size_t got = requests[slot].finish();
+-                elapsed(start, io_wait_us);
+-                bytes_read += got;
+-                llama_runtime_activity::ram(resident, limit, bytes_read, h2d_bytes);
+-                if (got < job.prefix + job.size) { throw std::runtime_error("MoE RAM cache: truncated queued GGUF read"); }
+-                start = clock();
+-                const uint8_t * input = staging + slot*(io_chunk+alignment) + job.prefix;
+-                if (pooled) {
+-                    size_t done = 0;
+-                    for (page * p : job.ready) {
+-                        const size_t bytes = std::min(page_size,job.size-done);
+-                        memcpy(p->storage,input+done,bytes); done += bytes;
+-                    }
+-                } else { memcpy(job.dst,input,job.size); }
+-                elapsed(start, host_copy_us);
+-                for (auto it = job.ready.begin(); it != job.ready.end(); ++it) {
+-                    page * p = *it;
+-                    p->resident = true; p->hot = false; p->prefetched = prefetch;
+-                    p->position = it;
+-                }
+-                probation.splice(probation.end(), job.ready);
+-                job.committed = false;
+-                --active;
+-                if (on_ready) { on_ready(); }
+-            }
++            llama_model_ram_run_io<io_depth>(submit, complete, [&] { if (on_ready) { on_ready(); } });
+         } catch (...) {
+             // I/O must finish before its buffers or destination pages can be released.
+             for (auto & request : requests) { request.drain(); }
+@@ -885,20 +879,33 @@
+             bool finished = false;
+             ~queue_guard() { if (!finished) { upload->api->synchronize(upload->queue); } }
+         } guard { upload };
+-        struct task { const llama_model_ram_copy * copy; size_t done,size; bool sent=false; };
++        struct task {
++            const llama_model_ram_copy * copy;
++            size_t done, size;
++            llama_model_ram_ready_range<impl::page> ready;
++            bool sent = false;
++        };
+         std::vector<task> tasks;
+         const size_t capacity=io_size/2;
+         for (const auto & copy : copies) {
++            const auto * region = p.find(copy.src);
++            // copy_batch validated every source and pinned all these pages in
++            // this epoch. Cache lookups and page-prefix scans need not repeat
++            // every time one of the asynchronous reads completes.
++            const size_t base = checked_add((uintptr_t)copy.src->data-(uintptr_t)region->data, copy.src_offset);
+             for (size_t done=0; done<copy.size;) {
+                 const size_t bytes=std::min(capacity,copy.size-done);
+-                tasks.push_back({&copy,done,bytes}); done+=bytes;
++                const size_t first = checked_add(base, done), end = checked_add(first, bytes);
++                tasks.push_back({&copy,done,bytes,
++                    {region->pages.data()+first/page_size, region->pages.data()+round_up(end,page_size)/page_size}});
++                done+=bytes;
+             }
+         }
+         auto * data=static_cast<uint8_t *>(ggml_backend_buffer_get_base(upload->buffer.get()));
+         size_t remaining=tasks.size();
+         auto dispatch = [&] {
+             for (auto & task : tasks) {
+-                if (task.sent || !p.ready_range(task.copy->src,task.copy->src_offset+task.done,task.size)) { continue; }
++                if (task.sent || !task.ready.ready()) { continue; }
+                 const unsigned slot=unsigned(upload->next_slot);
+                 const int64_t start=p.clock();
+                 if (!api->wait_host(upload->queue,slot)) { throw std::runtime_error("MoE upload: source-slot wait failed"); }
+diff --git a/src/llama-model-ram-ready.h b/src/llama-model-ram-ready.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-model-ram-ready.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++// A batch pins all of its source pages through the RAM cache epoch. Residency
++// can therefore only advance until that batch has completed its uploads. Keep
++// the validated prefix instead of rescanning it after every I/O completion.
++// Recreate this cursor for every batch; it must never survive cache eviction.
++template<class Page>
++struct llama_model_ram_ready_range {
++    const Page * next = nullptr;
++    const Page * end = nullptr;
++
++    bool ready() {
++        while (next != end && next->resident) { ++next; }
++        return next == end;
++    }
++};
+diff --git a/src/llama-model-ram-pipeline.h b/src/llama-model-ram-pipeline.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-model-ram-pipeline.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <cstddef>
++
++// complete() must consume one submitted read and copy its staging bytes into
++// their protected destination pages before returning. Refill that freed slot
++// before notifying upload consumers, whose waits/copies may otherwise leave
++// the storage queue idle. The single-slot reader is synchronous on supported
++// POSIX platforms: preserve upload-before-next-read there. The owner drains
++// outstanding reads on exceptions.
++template<std::size_t Depth, class Submit, class Complete, class Ready>
++void llama_model_ram_run_io(Submit && submit, Complete && complete, Ready && ready) {
++    static_assert(Depth > 0, "I/O depth must be positive");
++    std::size_t active = 0;
++    bool exhausted = false;
++    auto refill = [&] {
++        while (active < Depth && !exhausted) {
++            if (submit()) { ++active; }
++            else { exhausted = true; }
++        }
++    };
++    refill();
++    while (active) {
++        complete();
++        --active;
++        if constexpr (Depth > 1) {
++            refill();
++            ready();
++        } else {
++            ready();
++            refill();
++        }
++    }
++}
+diff --git a/tests/test-state-transfer.cpp b/tests/test-state-transfer.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-state-transfer.cpp
+@@ -0,0 +1,348 @@
++#include "../src/llama-state-transfer.h"
++#include "ggml-alloc.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <functional>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct transfer {
++    ggml_tensor * tensor;
++    uint8_t * ptr;
++    size_t offset;
++    size_t size;
++};
++
++struct deferred_backend {
++    ggml_backend_buffer_type buft{};
++    ggml_backend_reg registry{};
++    ggml_backend_device device{};
++    ggml_backend backend{};
++    ggml_backend_buffer buffer{};
++    std::vector<std::function<void()>> pending;
++    size_t fences = 0, sync_gets = 0, sync_sets = 0, submissions = 0;
++    size_t fail_submission = 0;
++    size_t committed_bytes = 0, committed_queries = 0;
++    bool fail_fence = false, fail_sync = false;
++    std::vector<uint8_t> bytes;
++
++    explicit deferred_backend(size_t size) : bytes(size) {
++        buft.context = this;
++        buft.device = &device;
++        buft.iface.is_host = [](ggml_backend_buffer_type_t) { return false; };
++        device.context = this;
++        device.iface.get_buffer_type = [](ggml_backend_dev_t dev) {
++            return &static_cast<deferred_backend *>(dev->context)->buft;
++        };
++        buffer.buft = &buft;
++        buffer.context = this;
++        buffer.size = size;
++        buffer.iface.get_tensor = [](ggml_backend_buffer_t buf, const ggml_tensor * tensor, void * dst, size_t off, size_t n) {
++            auto & self = *static_cast<deferred_backend *>(buf->context);
++            ++self.sync_gets;
++            if (self.fail_sync) { throw std::runtime_error("injected synchronous failure"); }
++            std::memcpy(dst, static_cast<const uint8_t *>(tensor->data) + off, n);
++        };
++        buffer.iface.set_tensor = [](ggml_backend_buffer_t buf, ggml_tensor * tensor, const void * src, size_t off, size_t n) {
++            ++static_cast<deferred_backend *>(buf->context)->sync_sets;
++            std::memcpy(static_cast<uint8_t *>(tensor->data) + off, src, n);
++        };
++        backend.device = &device;
++        backend.context = this;
++        backend.iface.free = [](ggml_backend_t) {};
++        backend.iface.get_tensor_async = [](ggml_backend_t backend, const ggml_tensor * tensor, void * dst, size_t off, size_t n) {
++            auto & self = *static_cast<deferred_backend *>(backend->context);
++            self.pending.push_back([=] { std::memcpy(dst, static_cast<const uint8_t *>(tensor->data) + off, n); });
++            if (++self.submissions == self.fail_submission) { throw std::runtime_error("injected async failure"); }
++        };
++        backend.iface.set_tensor_async = [](ggml_backend_t backend, ggml_tensor * tensor, const void * src, size_t off, size_t n) {
++            auto & self = *static_cast<deferred_backend *>(backend->context);
++            self.pending.push_back([=] { std::memcpy(static_cast<uint8_t *>(tensor->data) + off, src, n); });
++            if (++self.submissions == self.fail_submission) { throw std::runtime_error("injected async failure"); }
++        };
++        backend.iface.synchronize = [](ggml_backend_t backend) {
++            auto & self = *static_cast<deferred_backend *>(backend->context);
++            ++self.fences;
++            for (auto & apply : self.pending) { apply(); }
++            self.pending.clear();
++            if (self.fail_fence) { throw std::runtime_error("injected fence failure"); }
++        };
++    }
++};
++
++static void test_deferred() {
++    constexpr size_t count = 64, part = 1024;
++    ggml_context_ptr context(ggml_init({(count + 8)*ggml_tensor_overhead(), nullptr, true}));
++    require(context != nullptr, "cannot allocate mock metadata");
++    deferred_backend first(count*part), second(count*part);
++    std::vector<ggml_backend_ptr> backends;
++    backends.emplace_back(&first.backend);
++    backends.emplace_back(&second.backend);
++    llama_state_transfer_context copy(backends);
++    std::vector<uint8_t> source(count*part), result(source.size());
++    for (size_t i = 0; i < source.size(); ++i) { source[i] = uint8_t(i*23 + i/37); }
++    std::vector<transfer> items;
++    for (size_t i = 0; i < count; ++i) {
++        auto * tensor = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, part/sizeof(float));
++        auto & owner = i%2 ? second : first;
++        tensor->buffer = &owner.buffer;
++        tensor->data = owner.bytes.data() + i*part;
++        items.push_back({tensor, source.data() + i*part, 0, part});
++    }
++    copy.set(items);
++    require(first.fences == 1 && second.fences == 1 && first.sync_sets == 0 && second.sync_sets == 0,
++            "async restore did not use one fence per device");
++    for (size_t i = 0; i < count; ++i) { items[i].ptr = result.data() + i*part; }
++    copy.get(items);
++    require(source == result && first.fences == 2 && second.fences == 2,
++            "batched save lost bytes or used per-tensor fences");
++    require(first.pending.empty() && second.pending.empty(), "successful copy left work in flight");
++
++    auto * view = ggml_view_1d(context.get(), items[0].tensor, 32, 16);
++    view->buffer = nullptr; // buffer must be resolved through the source
++    std::vector<uint8_t> view_result(128);
++    copy.get(std::vector<transfer>{{view, view_result.data(), 0, view_result.size()}});
++    require(std::memcmp(view_result.data(), source.data() + 16, view_result.size()) == 0,
++            "view bytes or source-buffer discovery are wrong");
++    require(first.fences == 3 && first.sync_gets == 0, "view missed async path");
++
++    ggml_backend_buffer_type special = first.buft;
++    ggml_backend_buffer special_buffer = first.buffer;
++    special_buffer.buft = &special;
++    auto * tensor = items[0].tensor;
++    tensor->buffer = &special_buffer;
++    copy.get(std::vector<transfer>{{tensor, result.data(), 0, part}});
++    require(first.sync_gets == 1 && first.fences == 3, "nondefault buffer did not retain synchronous callback");
++    special.iface.is_host = [](ggml_backend_buffer_type_t) { return true; };
++    copy.set(std::vector<transfer>{{tensor, source.data(), 0, part}});
++    require(first.sync_sets == 1 && first.fences == 3, "host buffer did not retain synchronous callback");
++    tensor->buffer = &first.buffer;
++
++    first.backend.iface.get_tensor_async = nullptr;
++    copy.get(std::vector<transfer>{{tensor, result.data(), 0, part}});
++    require(first.sync_gets == 2 && first.fences == 3, "backend without async acquired extra fences");
++    first.backend.iface.get_tensor_async = second.backend.iface.get_tensor_async;
++    auto first_fences = first.fences, second_fences = second.fences;
++    second.fail_submission = second.submissions + 1;
++    bool failed = false;
++    try { copy.get(items); }
++    catch (const std::runtime_error & e) { failed = std::string(e.what()) == "injected async failure"; }
++    require(failed && first.pending.empty() && second.pending.empty(), "failed submit was not drained before unwind");
++    require(first.fences == first_fences + 1 && second.fences == second_fences + 1,
++            "failed submit did not drain all submitted devices");
++    second.fail_submission = 0;
++
++    first.fail_fence = true;
++    first_fences = first.fences; second_fences = second.fences;
++    failed = false;
++    try { copy.get(items); }
++    catch (const std::runtime_error & e) { failed = std::string(e.what()) == "injected fence failure"; }
++    require(failed && first.pending.empty() && second.pending.empty() &&
++            first.fences == first_fences + 1 && second.fences == second_fences + 1,
++            "one fence failure prevented draining another device");
++    first.fail_fence = false;
++
++    // A synchronous fallback can also fail after a different stream was queued.
++    tensor->buffer = &special_buffer;
++    first.fail_sync = true;
++    failed = false;
++    try { copy.get(std::vector<transfer>{items[1], items[0]}); }
++    catch (const std::runtime_error & e) { failed = std::string(e.what()) == "injected synchronous failure"; }
++    require(failed && second.pending.empty(), "fallback failure abandoned earlier asynchronous work");
++    first.fail_sync = false;
++    tensor->buffer = &first.buffer;
++    std::fill(result.begin(), result.end(), 0);
++    copy.get(items);
++    require(source == result, "context could not be reused after transfer failure");
++    first_fences = first.fences; second_fences = second.fences;
++    copy.get(std::vector<transfer>{{tensor, nullptr, 0, 0}});
++    require(first.fences == first_fences && second.fences == second_fences, "empty copy submitted work");
++    // Reusing the helper must not reuse a buffer classification. Simulate an
++    // allocator returning the same buffer address for a new sparse backing.
++    first.registry.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
++        static const ggml_backend_cuda_kv_growth_api api = {
++            1, nullptr, nullptr, nullptr,
++            [](ggml_backend_buffer_t buffer) -> size_t {
++                auto & self = *static_cast<deferred_backend *>(buffer->context);
++                ++self.committed_queries;
++                return self.committed_bytes;
++            }, nullptr
++        };
++        return std::strcmp(name, "ggml_backend_cuda_kv_growth_api") == 0 ?
++            const_cast<ggml_backend_cuda_kv_growth_api *>(&api) : nullptr;
++    };
++    first.device.reg = &first.registry;
++    llama_state_transfer_context repeated(backends);
++    first.committed_bytes = first.buffer.size;
++    first_fences = first.fences;
++    const size_t old_sync_gets = first.sync_gets;
++    repeated.get(std::vector<transfer>{items[0], items[2]});
++    require(first.fences == first_fences + 1 && first.committed_queries == 1,
++            "fully mapped buffer was not checked once within an operation");
++    first.committed_bytes = 0;
++    repeated.get(std::vector<transfer>{items[0], items[2]});
++    require(first.fences == first_fences + 1 && first.sync_gets == old_sync_gets + 2 && first.committed_queries == 2,
++            "new operation reused an obsolete fully mapped classification");
++    first.committed_bytes = first.buffer.size;
++    repeated.get(std::vector<transfer>{items[0], items[2]});
++    require(first.fences == first_fences + 2 && first.committed_queries == 3,
++            "new operation retained an obsolete sparse classification");
++    std::printf("state-transfer mock PASS: 64 tensors, 2 devices, 2 fences per operation; views, fallback, submit/fence/fallback failure, recovery, renewed mapping classification\n");
++}
++
++static void test_partial_vmm(ggml_backend_t backend) {
++    auto * device = ggml_backend_get_device(backend);
++    auto * registry = ggml_backend_dev_backend_reg(device);
++    const auto * api = static_cast<const ggml_backend_cuda_kv_growth_api *>(
++        ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_growth_api"));
++    auto * buft = ggml_backend_get_default_buffer_type(backend);
++    require(api && api->version == 1, "KV growth API unavailable for sparse snapshot regression");
++    const size_t page = api->granularity(buft);
++    require(page != 0, "VMM unavailable for sparse snapshot regression");
++    const size_t capacity = page*16;
++    ggml_context_ptr context(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
++    require(context != nullptr, "cannot allocate sparse snapshot metadata");
++    auto * tensor = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, capacity/sizeof(float));
++    ggml_backend_buffer_ptr buffer(api->reserve(buft, capacity));
++    require(buffer != nullptr, "cannot reserve sparse snapshot storage");
++    auto allocator = ggml_tallocr_new(buffer.get());
++    require(ggml_tallocr_alloc(&allocator, tensor) == GGML_STATUS_SUCCESS, "cannot place sparse snapshot tensor");
++    require(api->committed(buffer.get()) == 0, "sparse fixture unexpectedly precommitted its pages");
++    auto * view = ggml_view_1d(context.get(), tensor, 4096, page*3 + 128);
++    require(ggml_backend_view_init(view) == GGML_STATUS_SUCCESS, "cannot place sparse snapshot view");
++    std::vector<ggml_backend_ptr> borrowed;
++    borrowed.emplace_back(backend);
++    struct release_borrow { std::vector<ggml_backend_ptr> & value; ~release_borrow() { value[0].release(); } } release{borrowed};
++    llama_state_transfer_context grouped(borrowed);
++    std::vector<uint8_t> bytes(8192, 0xff);
++    // A read from untouched virtual storage must first commit/zero its range.
++    // The view has its own base offset and the transfer adds another offset.
++    grouped.get(std::vector<transfer>{{view, bytes.data(), 64, bytes.size()}});
++    require(std::all_of(bytes.begin(), bytes.end(), [](uint8_t x) { return x == 0; }),
++            "sparse read bypassed physical commitment or zero initialization");
++    require(api->committed(buffer.get()) == page, "sparse read committed more than its touched page");
++    for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = uint8_t(i*17 + i/31); }
++    const auto expected = bytes;
++    grouped.set(std::vector<transfer>{{tensor, bytes.data(), page*9 + 256, bytes.size()}});
++    require(api->committed(buffer.get()) == 2*page, "sparse write bypassed commitment or committed the full cache");
++    std::fill(bytes.begin(), bytes.end(), 0);
++    // A fresh operation must independently classify the still-partial buffer.
++    llama_state_transfer_context(borrowed).get(std::vector<transfer>{{tensor, bytes.data(), page*9 + 256, bytes.size()}});
++    require(bytes == expected, "sparse snapshot transfer changed bytes");
++    std::printf("state-transfer VMM PASS: untouched read and write, nonzero view/transfer offsets, committed=%zu logical=%zu\n",
++            api->committed(buffer.get()), capacity);
++}
++static double median(std::vector<double> values) {
++    std::sort(values.begin(), values.end());
++    return (values[(values.size() - 1)/2] + values[values.size()/2])/2;
++}
++
++static void benchmark(ggml_backend_t backend, size_t part, bool pinned) {
++    constexpr size_t count = 64;
++    const size_t total = part*count;
++    ggml_context_ptr context(ggml_init({(count + 4)*ggml_tensor_overhead(), nullptr, true}));
++    require(context != nullptr, "cannot allocate GPU transfer metadata");
++    std::vector<transfer> items;
++    for (size_t i = 0; i < count; ++i) {
++        auto * tensor = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, part/sizeof(float));
++        items.push_back({tensor, nullptr, 0, part});
++    }
++    ggml_backend_buffer_ptr device_buffer(ggml_backend_alloc_ctx_tensors(context.get(), backend));
++    require(device_buffer != nullptr, "cannot allocate GPU transfer buffers");
++    std::vector<uint8_t> pageable;
++    ggml_backend_buffer_ptr host_buffer;
++    uint8_t * host;
++    if (pinned) {
++        auto * buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
++        require(buft != nullptr, "backend has no pinned host buffer");
++        host_buffer.reset(ggml_backend_buft_alloc_buffer(buft, total));
++        require(host_buffer != nullptr, "cannot allocate pinned transfer buffer");
++        require(ggml_backend_buffer_get_type(host_buffer.get()) == buft, "pinned allocation fell back to pageable storage");
++        host = static_cast<uint8_t *>(ggml_backend_buffer_get_base(host_buffer.get()));
++    } else {
++        pageable.resize(total);
++        host = pageable.data();
++    }
++    std::vector<uint8_t> expected(total);
++    for (size_t i = 0; i < total; ++i) { expected[i] = uint8_t(i*13 + i/29); }
++    std::memcpy(host, expected.data(), total);
++    for (size_t i = 0; i < count; ++i) { items[i].ptr = host + i*part; }
++    // The helper borrows the existing context's stream; this owner is released
++    // below so the caller keeps the actual backend alive for the next case.
++    std::vector<ggml_backend_ptr> borrowed;
++    borrowed.emplace_back(backend);
++    struct release_borrow { std::vector<ggml_backend_ptr> & value; ~release_borrow() { value[0].release(); } } release{borrowed};
++    llama_state_transfer_context grouped(borrowed);
++    auto run = [&](bool batched, bool get) {
++        const auto start = std::chrono::steady_clock::now();
++        if (batched) {
++            if (get) { grouped.get(items); } else { grouped.set(items); }
++        } else {
++            for (const auto & item : items) {
++                if (get) { ggml_backend_tensor_get(item.tensor, item.ptr, item.offset, item.size); }
++                else { ggml_backend_tensor_set(item.tensor, item.ptr, item.offset, item.size); }
++            }
++        }
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    };
++    grouped.set(items);
++    for (bool get : {true, false}) {
++        std::vector<double> baseline, batched;
++        for (int repetition = 0; repetition < 19; ++repetition) {
++            // Alternate order to reduce clock/order bias. Validate every pair
++            // outside its timer; the H2D check downloads into the same host area.
++            for (int order = 0; order < 2; ++order) {
++                const bool use_batch = (repetition + order)%2 != 0;
++                if (get) {
++                    std::memset(host, 0, total);
++                } else {
++                    // Change every tensor at both ends so a missed/stale upload
++                    // cannot pass merely because the initial bytes matched.
++                    for (size_t i = 0; i < count; ++i) {
++                        expected[i*part] ^= 0x5a;
++                        expected[(i + 1)*part - 1] ^= 0xa5;
++                    }
++                    std::memcpy(host, expected.data(), total);
++                }
++                const double ms = run(use_batch, get);
++                if (repetition >= 3) { (use_batch ? batched : baseline).push_back(ms); }
++                if (!get) { grouped.get(items); }
++                require(std::memcmp(host, expected.data(), total) == 0, "GPU transfer changed snapshot bytes");
++            }
++        }
++        const double before = median(baseline), after = median(batched);
++        std::printf("state-transfer GPU: host=%s direction=%s tensors=%zu bytes=%zu baseline_ms=%.6f batched_ms=%.6f ratio=%.4f repeats=%zu bytes=identical\n",
++                pinned ? "pinned" : "pageable", get ? "D2H" : "H2D", count, total,
++                before, after, before/after, baseline.size());
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        test_deferred();
++        if (argc > 1 && std::strcmp(argv[1], "--gpu") == 0) {
++            ggml_backend_load_all();
++            auto * device = ggml_backend_dev_by_name("CUDA0");
++            if (!device) { std::fprintf(stderr, "SKIP: CUDA0 unavailable\n"); return 77; }
++            ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
++            require(backend != nullptr, "cannot initialize CUDA backend");
++            test_partial_vmm(backend.get());
++            for (const size_t part : {size_t(4096), size_t(256*1024)}) {
++                benchmark(backend.get(), part, false);
++                benchmark(backend.get(), part, true);
++            }
++        }
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "state-transfer FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-readiness.cpp b/tests/test-moe-readiness.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-moe-readiness.cpp
+@@ -0,0 +1,182 @@
++#include "../src/llama-model-ram-ready.h"
++#include "../src/llama-model-ram-pipeline.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <vector>
++
++namespace {
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++
++struct counted_flag {
++    bool value = false;
++    size_t * checks = nullptr;
++    operator bool() const { if (checks) { ++*checks; } return value; }
++};
++struct page { counted_flag resident; };
++
++bool baseline(const page * first, const page * end) {
++    for (; first != end; ++first) { if (!first->resident) { return false; } }
++    return true;
++}
++
++void exact_completion_order() {
++    std::mt19937 random(42);
++    for (size_t count : {size_t(1), size_t(2), size_t(17), size_t(32), size_t(129)}) {
++        for (int iteration = 0; iteration < 32; ++iteration) {
++            std::vector<page> pages(count);
++            std::vector<size_t> order(count);
++            std::iota(order.begin(), order.end(), size_t(0));
++            if (iteration) { std::shuffle(order.begin(), order.end(), random); }
++            const size_t first = count > 2 ? 1 : 0;
++            llama_model_ram_ready_range<page> cursor {pages.data()+first, pages.data()+count};
++            require(!cursor.ready(), "cold range was reported ready");
++            for (size_t index : order) {
++                pages[index].resident.value = true;
++                const bool expected = baseline(pages.data()+first,pages.data()+count);
++                require(cursor.ready() == expected, "out-of-order I/O changed upload readiness");
++                require(cursor.ready() == expected, "duplicate readiness callback changed its answer");
++            }
++            require(cursor.ready(), "completed range stayed pending");
++            // A later batch must start a new cursor: a completed cursor is not
++            // a cross-batch residency cache and must never bypass new misses.
++            pages[first].resident.value = false;
++            llama_model_ram_ready_range<page> next_batch {pages.data()+first,pages.data()+count};
++            require(!next_batch.ready(), "new batch reused obsolete readiness");
++        }
++    }
++    llama_model_ram_ready_range<page> empty;
++    require(empty.ready(), "empty range was not ready");
++}
++
++void shared_pages_and_work_bound() {
++    constexpr size_t pages_per_range = 32, overlapping_ranges = 64;
++    std::vector<page> pages(pages_per_range);
++    std::vector<llama_model_ram_ready_range<page>> ranges(overlapping_ranges,
++        {pages.data(), pages.data()+pages.size()});
++    size_t old_checks = 0, new_checks = 0;
++    for (size_t step = 0; step <= pages.size(); ++step) {
++        if (step) { pages[step-1].resident.value = true; }
++        for (auto & range : ranges) {
++            for (auto & page : pages) { page.resident.checks = &old_checks; }
++            const bool expected = baseline(pages.data(),pages.data()+pages.size());
++            for (auto & page : pages) { page.resident.checks = &new_checks; }
++            require(range.ready() == expected, "shared-page upload became ready too early");
++        }
++    }
++    require(new_checks == overlapping_ranges*2*pages_per_range,
++            "incremental range reread a previously validated resident page");
++    require(old_checks > new_checks*8, "baseline did not exercise repeated page-prefix scans");
++    printf("readiness checks, 64 overlapping 32-page ranges: baseline=%zu incremental=%zu\n", old_checks,new_checks);
++}
++
++void pipeline_refill_and_failures() {
++    constexpr size_t depth=4, jobs=19;
++    struct injected_failure {};
++    // Inject failure at each phase, including after several completions. A
++    // pending read owns its staging slot until completion or explicit drain.
++    for (int failure=-1; failure<3; ++failure) {
++        std::vector<size_t> pending;
++        size_t submitted=0, completed=0, callbacks=0, drained=0;
++        bool threw=false;
++        auto submit = [&] {
++            if (submitted==jobs) { return false; }
++            if (failure==0 && submitted==7) { throw injected_failure{}; }
++            require(pending.size()<depth,"I/O queue exceeded its staging capacity");
++            pending.push_back(submitted++);
++            return true;
++        };
++        auto complete = [&] {
++            require(!pending.empty(),"completed an I/O with no live staging slot");
++            if (failure==1 && completed==3) { throw injected_failure{}; }
++            // Alternate ends to model out-of-order OS completions.
++            pending.erase(pending.begin()+(completed%2 ? 0 : pending.size()-1));
++            ++completed;
++        };
++        auto ready = [&] {
++            require(pending.size()==std::min(depth,jobs-completed),
++                    "upload consumer ran before refilling its freed SSD slot");
++            require(submitted==completed+pending.size(),"I/O ownership accounting changed");
++            if (failure==2 && callbacks==3) { throw injected_failure{}; }
++            ++callbacks;
++        };
++        try { llama_model_ram_run_io<depth>(submit,complete,ready); }
++        catch (const injected_failure &) {
++            threw=true;
++            // Mirrors the cache owner's required cleanup; real I/O recovery is
++            // covered by test-moe-ram-pool with a truncated backing file.
++            drained=pending.size(); pending.clear();
++        }
++        require(threw==(failure>=0),"pipeline did not preserve an injected failure");
++        require(pending.empty() && submitted==completed+drained,"failed pipeline lost an in-flight read");
++        if (failure<0) { require(completed==jobs && callbacks==jobs,"pipeline dropped a ready notification"); }
++    }
++    size_t callbacks=0;
++    llama_model_ram_run_io<1>([] { return false; },[] { throw std::runtime_error("unexpected empty completion"); },
++        [&] { ++callbacks; });
++    require(callbacks==0,"empty I/O batch dispatched a ready callback");
++    size_t submitted=0, completed=0;
++    llama_model_ram_run_io<1>([&] { if (submitted==5) { return false; } ++submitted; return true; },
++        [&] { ++completed; }, [&] { require(submitted==completed,"synchronous reader delayed uploads behind the next disk read"); });
++    require(completed==5,"single-slot pipeline dropped a completion");
++}
++
++// Deliberately isolated CPU scheduling benchmark, not an inference TPS test.
++// Both versions see identical pages and completion notifications. All-hot
++// checks are included separately because a cursor cannot improve one scan.
++template<bool incremental>
++double measure(size_t pages_count, size_t completions, size_t repetitions, size_t & ready_count) {
++    std::vector<page> pages(pages_count);
++    const auto start = std::chrono::steady_clock::now();
++    for (size_t repeat = 0; repeat < repetitions; ++repeat) {
++        for (auto & page : pages) { page.resident.value = false; }
++        llama_model_ram_ready_range<page> range {pages.data(),pages.data()+pages.size()};
++        for (size_t completion = 0; completion < completions; ++completion) {
++            const size_t begin = completion*pages_count/completions;
++            const size_t end = (completion+1)*pages_count/completions;
++            for (size_t index = begin; index < end; ++index) { pages[index].resident.value = true; }
++            ready_count += incremental ? range.ready() : baseline(pages.data(),pages.data()+pages.size());
++        }
++    }
++    return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
++}
++
++void benchmark() {
++    for (size_t completions : {size_t(1),size_t(2),size_t(32)}) {
++        std::vector<double> before,after;
++        for (int sample=0; sample<7; ++sample) {
++            size_t old_ready=0,new_ready=0;
++            // Alternate order to avoid giving one implementation every warm CPU.
++            if (sample&1) {
++                after.push_back(measure<true>(32,completions,100000,new_ready));
++                before.push_back(measure<false>(32,completions,100000,old_ready));
++            } else {
++                before.push_back(measure<false>(32,completions,100000,old_ready));
++                after.push_back(measure<true>(32,completions,100000,new_ready));
++            }
++            require(old_ready==100000 && old_ready==new_ready, "benchmark changed scheduling decisions");
++        }
++        std::sort(before.begin(),before.end()); std::sort(after.begin(),after.end());
++        printf("readiness CPU median, 100000 x 32 pages / %zu completion(s): baseline=%.3f ms incremental=%.3f ms\n",
++            completions,before[before.size()/2],after[after.size()/2]);
++    }
++}
++}
++
++int main() {
++    try {
++        exact_completion_order();
++        shared_pages_and_work_bound();
++        pipeline_refill_and_failures();
++        benchmark();
++        printf("PASS readiness: exact cold/warm, shared pages, reordered completions, renewed batches, linear prefix work and bounded refill-before-upload/failure ownership\n");
++        return 0;
++    } catch (const std::exception & error) {
++        fprintf(stderr,"FAIL: %s\n",error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-moe-ram-pool.cpp b/tests/test-moe-ram-pool.cpp
+--- a/tests/test-moe-ram-pool.cpp
++++ b/tests/test-moe-ram-pool.cpp
+@@ -65,6 +65,68 @@
+     cache.device_residency(weights,100*page,page,false);
+     require(cache.stats(guard).resident<=budget && cache.stats(guard).peak<=budget,
+             "bounded hint selection exceeded its physical quota");
++}
++
++static void test_partial_upload_batches(const char * directory, ggml_backend_t backend) {
++    constexpr size_t page=65536, mib=1024*1024, size=10*mib, budget=8*mib, prefix=37;
++    struct fixture {
++        std::filesystem::path path;
++        ~fixture() { std::error_code error; std::filesystem::remove(path,error); }
++    } file { std::filesystem::path(directory)/("moe-upload-prefix-"+std::to_string(std::random_device{}())+".bin") };
++    std::vector<uint8_t> raw(size+prefix), expected(size,0x91), actual(size);
++    for (size_t i=0; i<raw.size(); ++i) { raw[i]=uint8_t(i*31+i/127); }
++    auto write = [&] {
++        std::ofstream stream(file.path,std::ios::binary|std::ios::trunc);
++        stream.write(reinterpret_cast<const char *>(raw.data()),raw.size());
++        require(stream.good(),"cannot write upload-prefix fixture");
++    };
++    write();
++    llama_files files;
++    files.emplace_back(new llama_file(file.path.string().c_str(),"rb"));
++    ggml_context_ptr source(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    ggml_context_ptr target(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    require(source && target,"cannot create upload-prefix contexts");
++    auto * weights=ggml_new_tensor_1d(source.get(),GGML_TYPE_I8,size);
++    // A tensor view makes source addressing include its original region offset.
++    auto * view=ggml_view_1d(source.get(),weights,size-page,page);
++    auto * destination=ggml_new_tensor_1d(target.get(),GGML_TYPE_I8,size);
++    ggml_backend_buffer_ptr output(ggml_backend_alloc_ctx_tensors(target.get(),backend));
++    require(output!=nullptr,"cannot allocate upload-prefix output");
++    llama_model_ram_cache cache(budget,files,true);
++    cache.bind(weights,0,prefix);
++    view->data=static_cast<uint8_t *>(weights->data)+page;
++    const std::vector<llama_model_ram_copy> copies = {
++        {weights,destination,11,19,2*mib+47},
++        {view,destination,2*mib+23,3*mib+53,2*mib+61},
++        {weights,destination,mib+31,6*mib+7,2*mib+83},
++    };
++    for (const auto & copy:copies) {
++        const size_t base=copy.src==view ? page : 0;
++        std::copy_n(raw.data()+prefix+base+copy.src_offset,copy.size,expected.data()+copy.dst_offset);
++    }
++    auto guard=cache.acquire();
++    auto transfer = [&] {
++        std::fill(actual.begin(),actual.end(),0x91);
++        ggml_backend_tensor_set(destination,actual.data(),0,size);
++        require(cache.copy_batch(backend,copies),"partial-page multi-chunk batch rejected");
++        ggml_backend_synchronize(backend);
++        ggml_backend_tensor_get(destination,actual.data(),0,size);
++        require(actual==expected,"partial-page multi-chunk upload changed bytes or destination gaps");
++        const auto stats=cache.stats(guard);
++        require(stats.resident<=budget && stats.peak<=budget,"multi-chunk upload exceeded RAM budget");
++    };
++    transfer();
++    const auto cold=cache.stats(guard);
++    require(cold.read_calls>4,"multi-chunk test did not exercise repeated I/O completions");
++    transfer();
++    require(cache.stats(guard).bytes_read==cold.bytes_read,"all-hot multi-chunk batch repeated SSD reads");
++    // Evict enough source pages and force a new batch to validate residency
++    // again, rather than inheriting the completed cursors from the warm batch.
++    cache.prefetch({{weights,6*mib,4*mib}});
++    const auto evicted=cache.stats(guard);
++    transfer();
++    require(cache.stats(guard).bytes_read>evicted.bytes_read,"new batch bypassed reloaded source pages");
++    printf("PASS multi-chunk upload readiness: overlapping sources, tensor view, partial pages, warm reuse and eviction\n");
+ }
+ 
+ int main(int argc, char ** argv) {
+@@ -240,6 +302,7 @@
+         const auto final=cache.stats();
+         require(final.commit_us == filled.commit_us, "pool grew commitment after its slots were fully allocated");
+         test_bounded_hint_scan(argv[1]);
++        test_partial_upload_batches(argv[1],backend.get());
+         printf("PASS pooled RAM: exact reads/copies, reuse without recommit, cooperative eviction, shared readers, bounds and I/O recovery (%s)\n",
+                gpu ? "GPU" : "CPU");
+         return 0;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -408,3 +408,6 @@
+     llama_test(test-moe-ram NAME test-moe-ram-cache-cuda ARGS --cache-gpu ${CMAKE_CURRENT_BINARY_DIR} LABEL "backend cuda")
+     set_tests_properties(test-cuda-memory-budget test-moe-ram-metrics-cuda test-moe-ram-cache-cuda PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+ endif()
++
++llama_build_and_test(test-state-transfer.cpp LABEL "main behavior" LINK ggml)
++target_include_directories(test-state-transfer PRIVATE ../src)

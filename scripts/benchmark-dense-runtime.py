@@ -205,9 +205,11 @@ def main(argv=None):
     parser.add_argument("--predict", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--baseline-dense-opt", choices=(0, 1), type=int, default=0)
-    parser.add_argument("--candidate-dense-opt", choices=(0, 1), type=int, default=1)
+    parser.add_argument("--candidate-dense-opt", choices=(0, 1), type=int, default=0,
+                        help="Enable explicitly for a kernel ablation; payload comparisons default to equal options")
     parser.add_argument("--baseline-kv-initial-tokens", type=int, default=0)
-    parser.add_argument("--candidate-kv-initial-tokens", type=int, default=8192)
+    parser.add_argument("--candidate-kv-initial-tokens", type=int, default=0,
+                        help="Set explicitly for a KV-growth ablation; payload comparisons default to equal options")
     parser.add_argument("--gpu-vram-limit-mib", type=int, default=0, help="Optional managed quota, e.g. 12288 for 12 GiB")
     parser.add_argument("--gpu-exclusive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--free-ram-guard-gib", type=float, default=4)

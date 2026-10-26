@@ -7,7 +7,7 @@ param(
     [string]$CudaVersion = '',
     [string]$CudaArchitectures = '120',
     [int]$Parallel = 4,
-    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-expert-trace','test-cuda-dense','test-cuda-kv-growth','test-kv-growth','test-dense-embedding')
+    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-expert-trace','test-cuda-dense','test-cuda-kv-growth','test-kv-growth','test-dense-embedding','test-moe-readiness','test-state-transfer')
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-integrity.ps1')

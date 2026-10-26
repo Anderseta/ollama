@@ -3788,12 +3788,9 @@ func TestIsGPUBuffer(t *testing.T) {
 }
 
 func TestAccumulatedToolCallsRejectsInvalidArguments(t *testing.T) {
-	_, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{
-		0: {
-			name:      "weather",
-			arguments: `{"city":`,
-		},
-	})
+	acc := &llamaServerToolCallAccumulator{}
+	acc.append("", "weather", `{"city":`)
+	_, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{0: acc})
 	if err == nil {
 		t.Fatal("expected invalid tool call arguments to return an error")
 	}

@@ -1,6 +1,6 @@
 # GPU-first MoE inference (experimental)
 
-This feature is opt-in on the `gpu-first-moe-inference` branch. It extends the
+This feature is opt-in and is integrated into this fork's `main` branch. It extends the
 bounded expert RAM cache and the CUDA expert cache rather than replacing the
 normal Ollama runtime. The native changes are shipped as
 `llama/compat/004-gpu-first-moe.patch`, after patches 001–003, against the revision

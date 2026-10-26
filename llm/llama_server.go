@@ -2309,16 +2309,15 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 			}
 
 			for _, tc := range choice.Delta.ToolCalls {
+				if tc.Index < 0 {
+					return fmt.Errorf("llama-server returned a negative tool call index: %d", tc.Index)
+				}
 				acc := toolCalls[tc.Index]
 				if acc == nil {
 					acc = &llamaServerToolCallAccumulator{index: tc.Index}
 					toolCalls[tc.Index] = acc
 				}
-				acc.id += tc.ID
-				if tc.Function.Name != "" {
-					acc.name += tc.Function.Name
-				}
-				acc.arguments += tc.Function.Arguments
+				acc.append(tc.ID, tc.Function.Name, tc.Function.Arguments)
 			}
 
 			if choice.FinishReason != nil {
@@ -2394,9 +2393,18 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 type llamaServerToolCallAccumulator struct {
 	index     int
-	id        string
-	name      string
-	arguments string
+	id        strings.Builder
+	name      strings.Builder
+	arguments strings.Builder
+}
+
+func (a *llamaServerToolCallAccumulator) append(id, name, arguments string) {
+	// A tool argument can be an entire source file, delivered in token-sized
+	// fragments. Appending immutable strings recopies that growing file for every
+	// fragment. Builders keep total copying linear and remain request-local.
+	a.id.WriteString(id)
+	a.name.WriteString(name)
+	a.arguments.WriteString(arguments)
 }
 
 type llamaServerChatToolCall struct {
@@ -2414,30 +2422,36 @@ func accumulatedToolCalls(accs map[int]*llamaServerToolCallAccumulator) ([]api.T
 		return nil, nil
 	}
 
-	maxIndex := 0
+	indices := make([]int, 0, len(accs))
 	for index := range accs {
-		maxIndex = max(maxIndex, index)
+		if index < 0 {
+			return nil, fmt.Errorf("llama-server returned a negative tool call index: %d", index)
+		}
+		indices = append(indices, index)
 	}
+	slices.Sort(indices)
 
 	toolCalls := make([]api.ToolCall, 0, len(accs))
-	for index := 0; index <= maxIndex; index++ {
+	// Iterate the calls actually received. Sparse or oversized wire indices
+	// must not cause a scan over billions of absent calls (or integer overflow).
+	for _, index := range indices {
 		acc := accs[index]
 		if acc == nil {
 			continue
 		}
 
 		var args api.ToolCallFunctionArguments
-		if strings.TrimSpace(acc.arguments) != "" {
-			if err := json.Unmarshal([]byte(acc.arguments), &args); err != nil {
-				return nil, fmt.Errorf("llama-server returned invalid tool call arguments for %q: %w", acc.name, err)
+		if arguments := acc.arguments.String(); strings.TrimSpace(arguments) != "" {
+			if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+				return nil, fmt.Errorf("llama-server returned invalid tool call arguments for %q: %w", acc.name.String(), err)
 			}
 		}
 
 		toolCalls = append(toolCalls, api.ToolCall{
-			ID: acc.id,
+			ID: acc.id.String(),
 			Function: api.ToolCallFunction{
 				Index:     acc.index,
-				Name:      acc.name,
+				Name:      acc.name.String(),
 				Arguments: args,
 			},
 		})
