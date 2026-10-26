@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
-	"strings"
 	"time"
 )
 
@@ -99,28 +98,34 @@ func (w *StatusWriter) observeActivity(b []byte) {
 	for len(b) > 0 {
 		i := bytes.IndexByte(b, '\n')
 		if i < 0 {
-			if len(w.activityTail)+len(b) <= maxLine {
+			if !w.activityDiscardingLine && len(w.activityTail)+len(b) <= maxLine {
 				w.activityTail = append(w.activityTail, b...)
 			} else {
-				w.activityTail = nil
+				w.activityTail = w.activityTail[:0]
+				w.activityDiscardingLine = true
 			}
 			break
 		}
-		if len(w.activityTail)+i <= maxLine {
-			w.activityTail = append(w.activityTail, b[:i]...)
-			w.observeActivityLine(string(w.activityTail), time.Now().UnixMilli())
+		if !w.activityDiscardingLine && len(w.activityTail)+i <= maxLine {
+			if len(w.activityTail) == 0 {
+				w.observeActivityLine(b[:i], time.Now().UnixMilli())
+			} else {
+				w.activityTail = append(w.activityTail, b[:i]...)
+				w.observeActivityLine(w.activityTail, time.Now().UnixMilli())
+			}
 		}
-		w.activityTail = nil
+		w.activityTail = w.activityTail[:0]
+		w.activityDiscardingLine = false
 		b = b[i+1:]
 	}
 }
 
-func (w *StatusWriter) observeActivityLine(line string, now int64) {
+func (w *StatusWriter) observeActivityLine(line []byte, now int64) {
 	a := &w.activity
 	const marker = "wildllama_activity "
-	if strings.HasPrefix(line, marker) {
+	if bytes.HasPrefix(line, []byte(marker)) {
 		var event runtimeEvent
-		if json.Unmarshal([]byte(line[len(marker):]), &event) != nil {
+		if json.Unmarshal(line[len(marker):], &event) != nil {
 			return
 		}
 		switch event.Kind {
@@ -185,11 +190,11 @@ func (w *StatusWriter) observeActivityLine(line string, now int64) {
 	// Older native payloads still report useful milestones. These are concrete
 	// log messages, never inferred from a timer or from increasing RAM usage.
 	switch {
-	case strings.Contains(line, "load_tensors:") && strings.Contains(line, "loading model tensors"):
+	case bytes.Contains(line, []byte("load_tensors:")) && bytes.Contains(line, []byte("loading model tensors")):
 		a.setPhase("loading", now)
-	case strings.Contains(line, "llama_context:") && strings.Contains(line, "constructing llama_context"):
+	case bytes.Contains(line, []byte("llama_context:")) && bytes.Contains(line, []byte("constructing llama_context")):
 		a.setPhase("context", now)
-	case strings.Contains(line, "warmup") && strings.Contains(line, "running"):
+	case bytes.Contains(line, []byte("warmup")) && bytes.Contains(line, []byte("running")):
 		a.setPhase("warming", now)
 	}
 }
@@ -210,6 +215,11 @@ func (w *StatusWriter) ActivitySnapshot() RuntimeActivity {
 	w.activityMu.Lock()
 	defer w.activityMu.Unlock()
 	value := w.activity
+	value.Progress = activityValueCopy(value.Progress)
+	value.PromptProcessed = activityValueCopy(value.PromptProcessed)
+	value.PromptTotal = activityValueCopy(value.PromptTotal)
+	value.GeneratedTokens = activityValueCopy(value.GeneratedTokens)
+	value.TokensPerSecond = activityValueCopy(value.TokensPerSecond)
 	value.History = append([]RuntimePhase{}, value.History...)
 	if value.Memory != nil {
 		memory := *value.Memory
@@ -217,9 +227,18 @@ func (w *StatusWriter) ActivitySnapshot() RuntimeActivity {
 	}
 	if value.Operation != nil {
 		operation := *value.Operation
+		operation.Layer = activityValueCopy(operation.Layer)
 		value.Operation = &operation
 	}
 	return value
+}
+
+func activityValueCopy[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // managedVRAM reports successful live allocations in the native CUDA allocator.

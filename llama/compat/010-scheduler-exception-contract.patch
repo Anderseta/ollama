@@ -1,0 +1,174 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -360,8 +360,15 @@
+ 
+     // Allocate and compute graph on the backend scheduler
+     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
++    // C++ callbacks can throw on storage/allocation failures. MSVC /EHsc
++    // otherwise assumes these extern-C calls cannot reach a caller's handler.
++#ifdef __cplusplus
++    GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) noexcept(false);
++    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) noexcept(false);
++#else
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
++#endif
+     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+ 
+     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2250,13 +2250,13 @@
+     return true;
+ }
+ 
+-enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) noexcept(false) {
+     enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
+     ggml_backend_sched_synchronize(sched);
+     return err;
+ }
+ 
+-enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) noexcept(false) {
+     GGML_ASSERT(sched);
+     if (!sched->is_reset && !sched->is_alloc) {
+         ggml_backend_sched_reset(sched);
+diff --git a/tests/test-scheduler-exceptions.cpp b/tests/test-scheduler-exceptions.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-scheduler-exceptions.cpp
+@@ -0,0 +1,118 @@
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++
++#include <cstdio>
++#include <stdexcept>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++struct injected_failure : std::runtime_error {
++    injected_failure() : std::runtime_error("injected scheduler storage failure") {}
++};
++
++struct callback_state {
++    ggml_tensor * sum;
++    ggml_tensor * output;
++    bool fail_prepare;
++    unsigned failures=0;
++};
++
++static void check_values(ggml_tensor * tensor, float expected) {
++    float values[8];
++    ggml_backend_tensor_get(tensor,values,0,sizeof(values));
++    for (float value : values) { require(value==expected,"callback observed unfinished or stale CPU graph data"); }
++}
++
++static bool prepare(ggml_tensor * tensor, bool ask, void * data) {
++    auto & state=*static_cast<callback_state *>(data);
++    if (ask) { return state.fail_prepare && tensor==state.output; }
++    check_values(state.sum,3.0f);
++    ++state.failures;
++    throw injected_failure();
++}
++
++static bool evaluate(ggml_tensor * tensor, bool ask, void * data) {
++    auto & state=*static_cast<callback_state *>(data);
++    if (ask) { return !state.fail_prepare && tensor==state.output; }
++    check_values(state.output,5.0f);
++    ++state.failures;
++    throw injected_failure();
++}
++
++static void run_case(ggml_backend_t cpu, bool asynchronous, bool fail_prepare) {
++    ggml_context_ptr inputs(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    ggml_context_ptr context(ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(),nullptr,true}));
++    require(inputs && context,"cannot allocate scheduler exception metadata");
++    auto * a=ggml_new_tensor_1d(inputs.get(),GGML_TYPE_F32,8);
++    auto * b=ggml_new_tensor_1d(inputs.get(),GGML_TYPE_F32,8);
++    ggml_set_input(a); ggml_set_input(b);
++    ggml_backend_buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(inputs.get(),cpu));
++    require(input_buffer!=nullptr,"cannot allocate scheduler exception inputs");
++    auto * sum=ggml_add(context.get(),a,b);
++    auto * output=ggml_add(context.get(),sum,b);
++    ggml_set_output(sum); ggml_set_output(output);
++    auto * graph=ggml_new_graph(context.get());
++    ggml_build_forward_expand(graph,output);
++    ggml_backend_t backends[]={cpu};
++    ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends,nullptr,1,128,false,true));
++    require(scheduler && ggml_backend_sched_alloc_graph(scheduler.get(),graph),"cannot allocate scheduler exception graph");
++    float values[8];
++    for (float & value:values) { value=1.0f; }
++    ggml_backend_tensor_set(a,values,0,sizeof(values));
++    for (float & value:values) { value=2.0f; }
++    ggml_backend_tensor_set(b,values,0,sizeof(values));
++    callback_state state{sum,output,fail_prepare};
++    ggml_backend_sched_set_prepare_callback(scheduler.get(),prepare,&state);
++    ggml_backend_sched_set_eval_callback(scheduler.get(),evaluate,&state);
++    bool caught=false;
++    ggml_status status=GGML_STATUS_SUCCESS;
++    // Keep the public API call inside this handler. An ordinary extern-C
++    // declaration lets MSVC /EHsc omit it, even if the callback really throws.
++    try {
++        status=asynchronous ? ggml_backend_sched_graph_compute_async(scheduler.get(),graph) :
++                              ggml_backend_sched_graph_compute(scheduler.get(),graph);
++    } catch (const injected_failure &) {
++        caught=true;
++        status=GGML_STATUS_ABORTED; // Same conversion used by llama_context's boundary.
++    }
++    require(caught && state.failures==1 && status==GGML_STATUS_ABORTED,
++            "scheduler callback exception bypassed its C++ caller's handler");
++    // API exception propagation does not promise an implicit final fence.
++    // The owner drains work before changing callbacks or releasing metadata.
++    ggml_backend_sched_synchronize(scheduler.get());
++    ggml_backend_sched_set_prepare_callback(scheduler.get(),nullptr,nullptr);
++    ggml_backend_sched_set_eval_callback(scheduler.get(),nullptr,nullptr);
++    for (float & value:values) { value=3.0f; }
++    ggml_backend_tensor_set(a,values,0,sizeof(values));
++    for (float & value:values) { value=7.0f; }
++    ggml_backend_tensor_set(b,values,0,sizeof(values));
++    require(ggml_backend_sched_graph_compute(scheduler.get(),graph)==GGML_STATUS_SUCCESS,
++            "scheduler did not recover after disabling its failed callback");
++    check_values(sum,10.0f);
++    check_values(output,17.0f);
++    std::printf("PASS scheduler exceptions: %s API, %s callback, local catch and exact changed-input recovery\n",
++            asynchronous ? "async" : "sync",fail_prepare ? "prepare" : "evaluation");
++}
++
++int main() {
++    try {
++        // Load the CPU module only: this regression never allocates on CUDA.
++        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr));
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        if (!cpu) {
++            require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH)!=nullptr,"cannot load the CPU test module");
++            cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr));
++        }
++#endif
++        require(cpu!=nullptr,"CPU backend unavailable");
++        for (bool asynchronous : {false,true}) {
++            for (bool fail_prepare : {false,true}) { run_case(cpu.get(),asynchronous,fail_prepare); }
++        }
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr,"FAIL scheduler exceptions: %s\n",error.what());
++        return 1;
++    }
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -411,3 +411,9 @@
+ 
+ llama_build_and_test(test-state-transfer.cpp LABEL "main behavior" LINK ggml)
+ target_include_directories(test-state-transfer PRIVATE ../src)
++
++if (TARGET ggml-cpu)
++    llama_build_and_test(test-scheduler-exceptions.cpp LABEL "main behavior" LINK ggml)
++    add_dependencies(test-scheduler-exceptions ggml-cpu)
++    target_compile_definitions(test-scheduler-exceptions PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++endif()

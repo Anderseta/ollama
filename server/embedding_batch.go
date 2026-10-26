@@ -17,7 +17,7 @@ type embeddingInput struct {
 }
 
 func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs []embeddingInput,
-	remember func(string, []int), tokens func(string) ([]int, error),
+	remember func(string, []int), releaseTokens func(), tokens func(string) ([]int, error),
 	prepare func(string) (string, bool, error), single func(embeddingInput) ([]float32, int, error),
 ) ([][]float32, int, bool, error) {
 	batcher, ok := runner.(llm.EmbeddingBatchRunner)
@@ -28,21 +28,35 @@ func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs [
 	if maxItems < 2 || maxTokens <= 0 {
 		return nil, 0, false, nil
 	}
+	defer releaseTokens()
 	texts := make([]string, 0, len(inputs))
-	seen := make(map[string]bool)
-	for _, item := range inputs {
+	positions := make(map[string][]int)
+	for index, item := range inputs {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, true, err
+		}
 		if len(item.media) != 0 {
 			return nil, 0, false, nil
 		}
 		if len(item.text) > 16*1024*1024 {
 			return nil, 0, false, nil
 		}
-		if !seen[item.text] {
-			seen[item.text] = true
+		if _, seen := positions[item.text]; !seen {
 			texts = append(texts, item.text)
 		}
+		positions[item.text] = append(positions[item.text], index)
 	}
+	type job struct {
+		text    string
+		cost    int
+		indices []int
+	}
+	jobs := make([]job, 0, len(texts))
+	byText := make(map[string]int)
 	for offset := 0; offset < len(texts); {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, true, err
+		}
 		end, size := offset, 0
 		for end < len(texts) && end-offset < 64 && len(texts[end]) <= 16*1024*1024-size {
 			size += len(texts[end])
@@ -62,35 +76,38 @@ func prepareEmbeddingBatch(ctx context.Context, runner llm.LlamaServer, inputs [
 		for i, value := range result {
 			remember(part[i], value)
 		}
+		for _, original := range part {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, true, err
+			}
+			text, _, err := prepare(original)
+			if err != nil {
+				return nil, 0, true, err
+			}
+			if existing, found := byText[text]; found {
+				jobs[existing].indices = append(jobs[existing].indices, positions[original]...)
+				continue
+			}
+			tokenized, err := tokens(text)
+			if err != nil {
+				return nil, 0, true, err
+			}
+			byText[text] = len(jobs)
+			jobs = append(jobs, job{text: text, cost: len(tokenized) + 2, indices: positions[original]})
+		}
+		// Keep prepared text and exact costs for the global packer, but not all
+		// token arrays for a potentially huge indexing request. The single-item
+		// fallback accepts already prepared text and only retokenizes on a 413.
+		releaseTokens()
 		offset = end
-	}
-	type job struct {
-		text    string
-		cost    int
-		indices []int
-	}
-	jobs := make([]job, 0, len(texts))
-	byText := make(map[string]int)
-	for index, input := range inputs {
-		text, _, err := prepare(input.text)
-		if err != nil {
-			return nil, 0, true, err
-		}
-		if existing, found := byText[text]; found {
-			jobs[existing].indices = append(jobs[existing].indices, index)
-			continue
-		}
-		tokenized, err := tokens(text)
-		if err != nil {
-			return nil, 0, true, err
-		}
-		byText[text] = len(jobs)
-		jobs = append(jobs, job{text: text, cost: len(tokenized) + 2, indices: []int{index}})
 	}
 	slices.SortStableFunc(jobs, func(a, b job) int { return a.cost - b.cost })
 	result := make([][]float32, len(inputs))
 	total := 0
 	for offset := 0; offset < len(jobs); {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, true, err
+		}
 		end, cost := offset, 0
 		for end < len(jobs) && end-offset < maxItems && jobs[end].cost <= maxTokens-cost {
 			cost += jobs[end].cost

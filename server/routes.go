@@ -732,13 +732,15 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
+	streamCtx, stopStream := context.WithCancel(c.Request.Context())
+	defer stopStream()
 	ch := make(chan any)
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
 		var sb strings.Builder
 		defer close(ch)
 
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		ctx, cancel := context.WithCancel(streamCtx)
 		defer cancel()
 		var parserErr error
 
@@ -797,7 +799,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 
 			if _, err := sb.WriteString(cr.Content); err != nil {
-				ch <- gin.H{"error": err.Error()}
+				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			}
 
 			if cr.Done {
@@ -806,9 +808,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
 				if !req.Raw {
-					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
+					tokens, err := r.Tokenize(streamCtx, prompt+sb.String())
 					if err != nil {
-						ch <- gin.H{"error": err.Error()}
+						sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 						return
 					}
 					res.Context = tokens
@@ -820,26 +822,26 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				// visible content, otherwise generate logprobs disappear for models with
 				// builtin thinking/tool parsers.
 				if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 || len(res.Logprobs) > 0 {
-					ch <- res
+					sendResponse(streamCtx, ch, res)
 				}
 
 				return
 			}
 
-			ch <- res
+			sendResponse(streamCtx, ch, res)
 		}); err != nil {
 			if parserErr == nil {
 				s.sched.expireRunnersForRuntimeOOM(m, err)
 				var serr api.StatusError
 				if errors.As(err, &serr) {
-					ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
+					sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
 				} else {
-					ch <- gin.H{"error": err.Error()}
+					sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 				}
 			}
 		}
 		if parserErr != nil {
-			ch <- gin.H{"error": parserErr.Error()}
+			sendResponse(streamCtx, ch, gin.H{"error": parserErr.Error()})
 		}
 	}()
 
@@ -1285,9 +1287,9 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return truncateInputToLimit(text, 0)
 	}
 
-	embedWithRetry := func(item embedInput) ([]float32, int, error) {
+	embedWithRetry := func(item embedInput, prepared bool) ([]float32, int, error) {
 		text := item.text
-		if req.Truncate != nil && !*req.Truncate {
+		if !prepared && req.Truncate != nil && !*req.Truncate {
 			tokens, ctxLen, err := inputTokensAndContext(text)
 			if err != nil {
 				return nil, 0, err
@@ -1301,7 +1303,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 					ErrorMessage: "the input length exceeds the context length",
 				}
 			}
-		} else {
+		} else if !prepared {
 			var err error
 			text, _, err = truncateInput(text)
 			if err != nil {
@@ -1352,13 +1354,21 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 			if err != nil {
 				return "", false, err
 			}
+			if limit <= 0 {
+				return "", false, fmt.Errorf("input after truncation exceeds maximum context length")
+			}
 			if len(tokens) > limit {
 				return "", false, api.StatusError{StatusCode: 400, ErrorMessage: "the input length exceeds the context length"}
 			}
 			return text, false, nil
 		}
 	}
-	batched, batchTokens, usedBatch, batchErr := prepareEmbeddingBatch(ctx, r, input, rememberTokens, cachedTokenize, prepareBatchText, embedWithRetry)
+	// Batched jobs already passed the same validation/truncation. Their token
+	// arrays can be released before inference without tokenizing each one again.
+	embedPrepared := func(item embeddingInput) ([]float32, int, error) {
+		return embedWithRetry(item, true)
+	}
+	batched, batchTokens, usedBatch, batchErr := prepareEmbeddingBatch(ctx, r, input, rememberTokens, tokenCache.Clear, cachedTokenize, prepareBatchText, embedPrepared)
 	if batchErr != nil {
 		s.sched.expireRunnersForRuntimeOOM(m, batchErr)
 		var status api.StatusError
@@ -1382,7 +1392,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 			if usedBatch {
 				embedding = batched[i]
 			} else {
-				embedding, tokenCount, err = embedWithRetry(item)
+				embedding, tokenCount, err = embedWithRetry(item, false)
 			}
 			if err != nil {
 				return err
@@ -1451,6 +1461,21 @@ func normalize(vec []float32) ([]float32, error) {
 			return nil, errors.New("embedding contains NaN or Inf values")
 		}
 		sum += v * v
+	}
+
+	if math.IsInf(float64(sum), 1) {
+		// Finite components can overflow the float32 sum of squares. Keep the
+		// ordinary arithmetic unchanged, but avoid turning these vectors into zero.
+		var wideSum float64
+		for _, v := range vec {
+			value := float64(v)
+			wideSum += value * value
+		}
+		norm := 1.0 / max(math.Sqrt(wideSum), 1e-12)
+		for i, v := range vec {
+			vec[i] = float32(float64(v) * norm)
+		}
+		return vec, nil
 	}
 
 	norm := float32(1.0 / max(math.Sqrt(float64(sum)), 1e-12))
@@ -1559,22 +1584,24 @@ func (s *Server) PullHandler(c *gin.Context) {
 		return
 	}
 
+	streamCtx, stopStream := context.WithCancel(c.Request.Context())
+	defer stopStream()
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
 		fn := func(r api.ProgressResponse) {
-			ch <- r
+			sendResponse(streamCtx, ch, r)
 		}
 
 		regOpts := &registryOptions{
 			Insecure: req.Insecure,
 		}
 
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		ctx, cancel := context.WithCancel(streamCtx)
 		defer cancel()
 
 		if err := PullModel(ctx, name.DisplayShortest(), runner, regOpts, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
+			sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -1613,28 +1640,30 @@ func (s *Server) PushHandler(c *gin.Context) {
 		return
 	}
 
+	streamCtx, stopStream := context.WithCancel(c.Request.Context())
+	defer stopStream()
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
 		fn := func(r api.ProgressResponse) {
-			ch <- r
+			sendResponse(streamCtx, ch, r)
 		}
 
 		regOpts := &registryOptions{
 			Insecure: req.Insecure,
 		}
 
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		ctx, cancel := context.WithCancel(streamCtx)
 		defer cancel()
 
 		name, err := getExistingName(model.ParseName(mname))
 		if err != nil {
-			ch <- gin.H{"error": err.Error()}
+			sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			return
 		}
 
 		if err := PushModel(ctx, name.DisplayShortest(), regOpts, fn); err != nil {
-			ch <- gin.H{"error": err.Error()}
+			sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 		}
 	}()
 
@@ -2650,10 +2679,30 @@ func waitForStream(c *gin.Context, ch chan any) {
 	c.JSON(http.StatusOK, latest)
 }
 
+// A response consumer may return before its producer (disconnect, write
+// failure or parser error). Never leave the producer holding a runner slot
+// while sending to an abandoned response channel.
+func sendResponse(ctx context.Context, ch chan<- any, value any) {
+	if ctx.Err() != nil {
+		return
+	}
+	select {
+	case ch <- value:
+	case <-ctx.Done():
+	}
+}
+
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
+	ctx := c.Request.Context()
 	c.Stream(func(w io.Writer) bool {
-		val, ok := <-ch
+		var val any
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return false
+		case val, ok = <-ch:
+		}
 		if !ok {
 			return false
 		}
@@ -3358,11 +3407,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		toolParser = tools.NewParser(m.Template.Template, req.Tools)
 	}
 
+	streamCtx, stopStream := context.WithCancel(c.Request.Context())
+	defer stopStream()
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
 
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		ctx, cancel := context.WithCancel(streamCtx)
 		defer cancel()
 
 		var parserErr error
@@ -3422,7 +3473,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 				if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done || len(res.Logprobs) > 0 {
 					slog.Log(ctx, logutil.LevelTrace, "builtin parser output", "parser", parserName, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
-					ch <- res
+					sendResponse(streamCtx, ch, res)
 				} else {
 					slog.Log(ctx, logutil.LevelTrace, "builtin parser empty output", "parser", parserName)
 				}
@@ -3457,30 +3508,30 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						logprobRes := res
 						logprobRes.Message.Content = ""
 						logprobRes.Message.ToolCalls = nil
-						ch <- logprobRes
+						sendResponse(streamCtx, ch, logprobRes)
 					}
 
 					if r.Done {
 						res.Message.Content = toolParser.Content()
-						ch <- res
+						sendResponse(streamCtx, ch, res)
 					}
 					return
 				}
 			}
 
-			ch <- res
+			sendResponse(streamCtx, ch, res)
 		})
 		if parserErr != nil {
-			ch <- gin.H{"error": parserErr.Error()}
+			sendResponse(streamCtx, ch, gin.H{"error": parserErr.Error()})
 			return
 		}
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			var serr api.StatusError
 			if errors.As(err, &serr) {
-				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
+				sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
 			} else {
-				ch <- gin.H{"error": err.Error()}
+				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			}
 		}
 	}()
@@ -3540,11 +3591,13 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		return
 	}
 
+	streamCtx, stopStream := context.WithCancel(c.Request.Context())
+	defer stopStream()
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
 
-		err := r.Chat(c.Request.Context(), nativeReq, func(r llm.ChatResponse) {
+		err := r.Chat(streamCtx, nativeReq, func(r llm.ChatResponse) {
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -3571,15 +3624,15 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 			}
 
-			ch <- res
+			sendResponse(streamCtx, ch, res)
 		})
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			var serr api.StatusError
 			if errors.As(err, &serr) {
-				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
+				sendResponse(streamCtx, ch, gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode})
 			} else {
-				ch <- gin.H{"error": err.Error()}
+				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
 			}
 		}
 	}()

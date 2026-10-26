@@ -1,0 +1,214 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "9b8b11aeafbdeaf0ca938dbc83d138bdcfad66c0",
+  "scope": "Small CPU/CUDA fixtures and mock/integration tests only, as requested. No new large-model TPS result.",
+  "native_base": "llama.cpp b11845",
+  "patches": {
+    "009-bounded-copy-pipeline.patch": "bcf03171c2f496ebbb50d8b6871b5a2fb9e7a333c11efae096809c26ea0e4a58",
+    "010-scheduler-exception-contract.patch": "27cd6c45a84f83d01303fad255f729331b22d76dcd992b83b5c0fd494a9d0072"
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "97a83f17e694a1e28c7406571aabef6a3056ee37773f7919dd414d2f5ed8fa7d",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "7e8d99315ea968d1f69878dd1b3f7b663e0cd241ae67ddf02320191d2239bcd7",
+    "lib/ollama/ggml-cpu.dll": "bb93e036da7245174183b074cad9f591d35308ca29c5b107aec9a0f0554ed66c",
+    "lib/ollama/ggml.dll": "3be5b66f53942d0d25fd4d46977aa08e9dd6856ee79edd12812b5c61599a4a95",
+    "lib/ollama/llama-common.dll": "543092f069ea2ba048acce0a28b6e1997b471478b7b25c19c1d2c57ba7566143",
+    "lib/ollama/llama-quantize-impl.dll": "674547aa40aaaa24c70d48d1f3604ec9efe1c752220b7a839c94f67855464b18",
+    "lib/ollama/llama-quantize.exe": "368708e322f398bd1f6e94319713359590a08ef10908ba95bc0db7dda4931cea",
+    "lib/ollama/llama-server-impl.dll": "92602a74d9b2b83a92649f2c61abaa13afdefc417152c928e5b2d3185b25e5af",
+    "lib/ollama/llama-server.exe": "30f2219c62bb850704dd6c9be0751452902f3d6cdaedd0d85b623847956b1fd4",
+    "lib/ollama/llama.dll": "0d06317bb3b2f06cdde14798e452317c21100ccc3479bdba498a18acb578c0e9",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "23bd58214044f625e95412f855155b0ec461a85ae29c4da25df55db615b359e4",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "ollama.exe": "34ecbca7d4192331415b52f0e63e6d48ca33fde8f60eb9af8882ef07f447ed98"
+  },
+  "embedding_retention": {
+    "documents": 4096,
+    "tokens_per_document": 1024,
+    "vector_dimensions": 768,
+    "before_retained_token_bytes": 33554432,
+    "after_retained_token_bytes": 524288,
+    "tokenize_batches": 64,
+    "embedding_calls": 586,
+    "extra_tokenize_calls": 0,
+    "measurement": "Token-array capacity referenced by the request cache, not total RSS/VRAM or a GC timing guarantee.",
+    "samples": {
+      "before": [
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  57120900 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t  33554432 peak-token-B\t        64.00 tokenize-batches/op\t61084304 B/op\t   18354 allocs/op",
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  56832600 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t  33554432 peak-token-B\t        64.00 tokenize-batches/op\t61079208 B/op\t   18349 allocs/op",
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  50792200 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t  33554432 peak-token-B\t        64.00 tokenize-batches/op\t61079192 B/op\t   18348 allocs/op"
+      ],
+      "after": [
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  34992000 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t    524288 peak-token-B\t        64.00 tokenize-batches/op\t60653128 B/op\t   18311 allocs/op",
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  29800100 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t    524288 peak-token-B\t        64.00 tokenize-batches/op\t60653128 B/op\t   18311 allocs/op",
+        "BenchmarkEmbeddingTokenRetention-12    \t       1\t  28129500 ns/op\t       586.0 embedding-calls/op\t         0 extra-tokenize/op\t    524288 peak-token-B\t        64.00 tokenize-batches/op\t60653144 B/op\t   18311 allocs/op"
+      ]
+    }
+  },
+  "activity_framing": {
+    "scope": "observeActivity only; 64 log lines per operation, 3 samples, 100ms minimum benchmark duration.",
+    "before": [
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t    6723\t     15581 ns/op\t 266.99 MB/s\t    8192 B/op\t     128 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t    8004\t     14819 ns/op\t 280.72 MB/s\t    8192 B/op\t     128 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t    7939\t     14784 ns/op\t 281.38 MB/s\t    8192 B/op\t     128 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     624\t    216579 ns/op\t  31.03 MB/s\t   50688 B/op\t     832 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     642\t    221192 ns/op\t  30.38 MB/s\t   50688 B/op\t     832 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     669\t    188049 ns/op\t  35.74 MB/s\t   50688 B/op\t     832 allocs/op"
+    ],
+    "after": [
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t   12712\t      9589 ns/op\t 433.85 MB/s\t       0 B/op\t       0 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t   11394\t      9321 ns/op\t 446.28 MB/s\t       0 B/op\t       0 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/ordinary-12         \t   12301\t      9617 ns/op\t 432.57 MB/s\t       0 B/op\t       0 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     590\t    193635 ns/op\t  34.70 MB/s\t   30208 B/op\t     640 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     738\t    189188 ns/op\t  35.52 MB/s\t   30215 B/op\t     640 allocs/op",
+      "BenchmarkRuntimeActivityLogFraming/activity-12         \t     666\t    170303 ns/op\t  39.46 MB/s\t   30215 B/op\t     640 allocs/op"
+    ],
+    "regressions": "Oversized-line suffix cannot become a memory event; subsequent records recover. Snapshot scalar and layer pointers are independent."
+  },
+  "stream_cancellation": {
+    "baseline_reproduced": true,
+    "checks": [
+      "Native chat, rendered chat and generate HTTP disconnection release a runner lease and permit the next request.",
+      "Writer failure cancels the producer.",
+      "Consumer cancellation while waiting for a token exits.",
+      "Parser errors remain observable after child inference cancellation."
+    ],
+    "race_packages": [
+      "llm",
+      "server"
+    ]
+  },
+  "normalization": {
+    "overflow": "Recompute finite overflow only in float64.",
+    "ordinary_output": "Bitwise old float32 path preserved, including zeros, tiny vectors and1e-12 floor.",
+    "invalid_input": "NaN/Inf still rejected before mutation."
+  },
+  "native_results": {
+    "pool-cpu": [
+      "PASS multi-chunk upload readiness: overlapping sources, tensor view, partial pages, warm reuse and eviction",
+      "fallback upload budget=131072 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "fallback upload budget=131072 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "fallback upload budget=131072 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "fallback upload budget=524288 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "fallback upload budget=524288 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "fallback upload budget=524288 range=6291503 H2D_calls=0 explicit_syncs=0 staging=0",
+      "PASS bounded fallback upload: oversized ranges, views, gaps, two RAM quotas, renewed staging, no-op and partial-I/O recovery",
+      "PASS pooled RAM: exact reads/copies, reuse without recommit, cooperative eviction, shared readers, bounds and I/O recovery (CPU)"
+    ],
+    "pool-gpu": [
+      "PASS multi-chunk upload readiness: overlapping sources, tensor view, partial pages, warm reuse and eviction",
+      "fallback upload budget=131072 range=6291503 H2D_calls=49 explicit_syncs=2 staging=4194304",
+      "fallback upload budget=131072 range=6291503 H2D_calls=49 explicit_syncs=2 staging=4194304",
+      "fallback upload budget=131072 range=6291503 H2D_calls=49 explicit_syncs=2 staging=4194304",
+      "fallback upload budget=524288 range=6291503 H2D_calls=13 explicit_syncs=2 staging=4194304",
+      "fallback upload budget=524288 range=6291503 H2D_calls=13 explicit_syncs=2 staging=4194304",
+      "fallback upload budget=524288 range=6291503 H2D_calls=13 explicit_syncs=2 staging=4194304",
+      "PASS bounded fallback upload: oversized ranges, views, gaps, two RAM quotas, renewed staging, no-op and partial-I/O recovery",
+      "PASS pooled RAM: exact reads/copies, reuse without recommit, cooperative eviction, shared readers, bounds and I/O recovery (GPU)"
+    ],
+    "scheduler": [
+      "PASS scheduler exceptions: sync API, evaluation callback, local catch and exact changed-input recovery",
+      "PASS scheduler exceptions: sync API, prepare callback, local catch and exact changed-input recovery",
+      "PASS scheduler exceptions: async API, evaluation callback, local catch and exact changed-input recovery",
+      "PASS scheduler exceptions: async API, prepare callback, local catch and exact changed-input recovery"
+    ],
+    "moe-logits": [
+      "comparison=streaming max_abs=5.06653e-05 max_scaled=5.06653e-05 rmse=7.22706e-06 nmse=2.69778e-06 finite=1 outside_tolerance=0 top1_same=9/9",
+      "PASS 2331 logits, max absolute error=5.06653e-05 scaled error=5.06653e-05; original GGUF and context preserved"
+    ],
+    "dense-embedding": [
+      "PASS: dense exclusive embeddings stay resident; tied weights share storage; normal, MoE, overrides and quotas preserved"
+    ],
+    "state-transfer": [],
+    "server-components": [
+      "tests      : 42",
+      "assertions : 157",
+      "failures   : 0"
+    ]
+  },
+  "scheduler_contract_probe": [
+    "GGML real CPU prepare throw: local_catch=0 escaped=1 retry_status=0 retry_exact=1",
+    "GGML real CPU prepare throw: local_catch=1 escaped=0 retry_status=0 retry_exact=1"
+  ],
+  "api_smoke": {
+    "fixture_bytes": 436576,
+    "fixture_sha256": "8b14d0f83a9cfbe97f7d4955fface1e2cbd240c8d6be6faf78afd6bb42782e14",
+    "num_ctx": 256,
+    "num_gpu": 0,
+    "threads": 2,
+    "cpu_only": true,
+    "checks": [
+      {
+        "kind": "generate",
+        "stream": false,
+        "done": true,
+        "eval_count": 8
+      },
+      {
+        "kind": "generate",
+        "stream": true,
+        "done": true,
+        "events": 7
+      },
+      {
+        "kind": "generate",
+        "cancelled_after_nonfinal_chunk": true,
+        "following_request_done": true,
+        "following_request_elapsed_s": 0.015000000000327418
+      },
+      {
+        "kind": "chat",
+        "stream": false,
+        "done": true,
+        "eval_count": 8
+      },
+      {
+        "kind": "chat",
+        "stream": true,
+        "done": true,
+        "events": 5
+      },
+      {
+        "kind": "chat",
+        "cancelled_after_nonfinal_chunk": true,
+        "following_request_done": true,
+        "following_request_elapsed_s": 0.014999999999417923
+      }
+    ],
+    "ok": true,
+    "stopped": true
+  },
+  "limitations": [
+    "No large model or simultaneous external GPU workload throughput comparison.",
+    "Fewer MoE fences do not reduce the model bytes that must be read.",
+    "The fixture numeric comparison is bounded validation, not universal language-quality proof.",
+    "Windows/CUDA runtime and C11 header checks do not establish Linux runtime behavior."
+  ]
+}

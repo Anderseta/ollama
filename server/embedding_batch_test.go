@@ -47,6 +47,7 @@ func TestEmbeddingBatchGroupingDedupAndFallback(t *testing.T) {
 		inputs := []embeddingInput{{text: "one two"}, {text: "short"}, {text: "one two"}, {text: "three four five"}}
 		result, _, used, err := prepareEmbeddingBatch(t.Context(), fixture, inputs,
 			func(text string, tokens []int) { cache[text] = tokens },
+			func() { clear(cache) },
 			func(text string) ([]int, error) { return cache[text], nil },
 			func(text string) (string, bool, error) { return text, false, nil },
 			func(item embeddingInput) ([]float32, int, error) {

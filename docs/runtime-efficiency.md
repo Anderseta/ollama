@@ -148,3 +148,104 @@ model and 12,658,688,384 bytes for Flash. Flash's managed host-weight cache stay
 at its 6 GiB test quota. The changes do not shrink resident weights or the
 logical KV cache. No model/profile setting or experimental option was enabled
 in the installed configuration as part of this work.
+
+## Further reliability and efficiency changes
+
+The next changes build on `9b8b11ae`. Native changes are carried by
+`009-bounded-copy-pipeline.patch` and `010-scheduler-exception-contract.patch`.
+Validation for this round uses small synthetic models and fixtures only; no
+new Qwen9B or Flash throughput comparison is claimed.
+
+### Cancelled streams release the runner
+
+Generate, native/rendered Chat and Pull/Push response producers now stop sending
+when their consumer has disconnected or failed to write. Previously a producer
+could block on an abandoned channel while holding a runner's semaphore. The
+consumer can also exit while waiting for the next token. Cancelling inference
+after a parser error still delivers that error through the live response channel.
+
+HTTP tests disconnect the client or fail its writer, then require the handler
+and runner lease to finish and the next request to succeed. The disconnect
+regression fails against the old handlers using a Go overlay; focused race
+checks pass against the correction. This prevents wasted/stuck work rather
+than increasing the speed of an uninterrupted generation.
+
+### Smaller embedding preparation retention
+
+Embedding preparation releases token arrays after each window instead of
+retaining the whole request's token cache until inference ends. It keeps the
+same global stable cost sort, batch packing, deduplication and result order.
+Single-item fallback accepts already prepared text and retokenizes only when
+an actual 413 requires a new truncation attempt.
+
+In the synthetic 4,096-document, 1,024-token fixture, token arrays referenced by
+the cache peak at **512 KiB instead of 32 MiB**. Both versions issue exactly 64
+batched tokenization calls and 586 embedding calls, with no extra individual
+tokenization. This is retained token backing, not total process RSS or VRAM;
+Go's collector determines when unreachable allocations are reclaimed. Total
+cumulative allocations remain approximately 61 MB in both versions.
+
+Finite embedding components can also overflow their float32 sum of squares.
+That case previously produced zeroed vectors. It now recomputes only the
+overflowing normalization in float64. Ordinary vectors, zero/tiny values and
+the existing `1e-12` floor retain their previous bit patterns; NaN and infinity
+inputs continue to be rejected.
+
+### Bounded MoE upload fallback
+
+When an expert-copy batch exceeds the host-weight RAM quota, the pooled GPU
+fallback now reuses the existing pinned upload pipeline for individual bounded
+chunks. It replaces synchronous uploads of scattered 64 KiB pages without
+enlarging the 4 MiB staging buffer or the host-weight quota. CPU and unavailable
+staging backends retain their fallback path. `copy()` still completes its
+destination before returning and drains submitted work on failure.
+
+The small test copies 6 MiB plus 47 bytes through an offset view, preserving
+destination gaps. It records 49 uploads and two explicit backend fences under
+a 128 KiB RAM quota, or 13 uploads and two fences under 512 KiB. The previous
+code's loop required 97 synchronous page uploads plus 50/14 explicit fences
+for those ranges (derived from the old loop, not an elapsed-time benchmark).
+Tests cover renewed event slots, empty copies, truncated reads and recovery.
+Fewer calls do not imply fewer required SSD bytes or a measured model TPS gain.
+
+### Correct scheduler exception boundary on Windows
+
+MSVC `/EHsc` could omit a caller's catch around the public scheduler compute
+APIs because their `extern C` declarations were assumed not to throw. Managed
+storage callbacks can throw on read/allocation failure. The two C++ declarations
+and definitions now explicitly use `noexcept(false)`; C declarations, symbols
+and compiler-wide exception flags are unchanged.
+
+A real GGML CPU fixture reproduces the old bypass and requires local handling
+for synchronous/asynchronous execution and preparation/evaluation failures,
+followed by explicit draining and exact changed-input recovery. It does not
+promise recovery from arbitrary CUDA driver failure.
+Callers must be rebuilt against the corrected declaration; replacing a GGML
+DLL alone cannot change exception handling already compiled into an old caller.
+
+### Accurate, lighter activity parsing
+
+The progress parser now discards an entire oversized log line through its
+newline. Previously its suffix could be mistaken for a new memory/progress
+record, affecting an observed VRAM value. Complete lines are parsed directly
+from bytes; polling snapshots also copy scalar and layer pointers so a caller
+cannot mutate the runner's internal state through a snapshot.
+
+For 64 ordinary log lines, the isolated framing benchmark goes from 128
+allocations/8 KiB to zero allocations; its median time goes from approximately
+14.8 to 9.6 microseconds. This measures `observeActivity`, not the complete log
+writer, GUI polling or inference. Fragmented/oversized framing, recovery and
+snapshot independence have regression tests.
+
+The [small-test artifact](benchmarks/runtime-reliability-20261026.json) records
+the final payload hashes and this round's checks. All six Go package suites
+and focused race checks passed. The rebuilt scheduler, pooled RAM CPU/CUDA,
+dense placement, state transfer, MoE logits and server component fixtures passed.
+Patch replay through 010 is repeatable and the source-integrity guard passed.
+
+The real HTTP smoke uploads a 436,576-byte synthetic GGUF to a separate local
+store and uses CPU only, two threads and context 256. Generate and rendered
+chat pass in streaming/nonstreaming modes; closing an active stream permits the
+next request to finish. No production models are used by this smoke, and the
+owned server and its children are stopped afterwards. This is functional
+validation, not a language-quality or large-model throughput comparison.

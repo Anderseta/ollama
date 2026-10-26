@@ -13,10 +13,11 @@ type StatusWriter struct {
 	out io.Writer
 	// Subprocess wrappers may wire both stdout and stderr to the same
 	// StatusWriter, and os/exec serializes Write calls in that case.
-	lastErrMsg   atomic.Value
-	activityMu   sync.Mutex
-	activityTail []byte
-	activity     RuntimeActivity
+	lastErrMsg             atomic.Value
+	activityMu             sync.Mutex
+	activityTail           []byte
+	activityDiscardingLine bool
+	activity               RuntimeActivity
 }
 
 const maxCapturedErrorBytes = 8 * 1024
