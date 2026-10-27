@@ -405,3 +405,36 @@ MMVQ, whose Q8 activation scales use different precision. This is recorded as an
 unresolved baseline numerical limitation, not counted among passing cases and
 not addressed by relaxing tolerance. Its normally auto-sized cases pass.
 Linux portability was reviewed statically; this round ran Windows tests only.
+
+### Preserve incomplete-generation signals in the Go API
+
+A clean HTTP EOF without a generation terminal marker now returns an explicit
+error in chat and completion. Partial text remains available, cancellation keeps
+its original error, and this condition never restarts the runner or retries the
+generation. A completed request still releases its stream before its final
+callback, preserving reentrant tokenization.
+
+Native chat maps both `length` and `max_tokens` to `done_reason: "length"`.
+If that terminal event contains invalid tool arguments, the entire buffered tool
+batch is discarded and the response adds `tool_calls_truncated: true`. Valid
+batches retain their tools and length reason; invalid arguments under `stop`
+remain errors. The flag is omitted otherwise. Clients can request complete,
+smaller calls without receiving or executing part of an incomplete batch.
+OpenAI conversions preserve length ahead of the tool-call finish reason.
+
+The completion repetition guard ignores terminal and empty protocol events and
+compares actual content, preserving distinct spaces, tabs and line breaks. Its
+existing threshold still limits repeated nonempty content. Sampling, requested
+context capacity, model weights and cache policies are unchanged.
+
+Local HTTP fakes cover missing terminal markers, cancellation, repetition,
+all-or-nothing tool batches, metrics and streaming/nonstreaming API propagation:
+
+```sh
+go test ./llm ./server ./openai -run 'TestLlamaServer(ChatRequiresTerminalMarker|CompletionRequiresTerminalMarker|MissingTerminalPreservesCancellation|ChatToolCallLimit|CompletionTerminalMarker|CompletionRepeatGuard)$|TestNativeChatToolCallTruncationFlag$|TestFinishChunk$|TestToChatCompletion_FinishReasonPrecedence$' -count=1 -timeout 90s
+```
+
+These are Go-only changes: a staged `go build -o <staging>/ollama.exe .` can reuse
+the installed native payload. Set `GOCACHE`, `GOMODCACHE`, `GOPATH` and `GOTMPDIR`
+to the installation's persistent cache/temp directories before testing or
+building; no native payload rebuild or model download is required.

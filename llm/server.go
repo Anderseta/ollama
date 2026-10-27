@@ -252,6 +252,7 @@ type ChatResponse struct {
 	GPUFirst              json.RawMessage `json:"gpu_first,omitempty"`
 	Message               api.Message     `json:"message"`
 	DoneReason            DoneReason      `json:"done_reason"`
+	ToolCallsTruncated    bool            `json:"tool_calls_truncated,omitempty"`
 	Done                  bool            `json:"done"`
 	PromptEvalCount       int             `json:"prompt_eval_count"`
 	PromptEvalCachedCount *int            `json:"prompt_eval_cached_count,omitempty"`

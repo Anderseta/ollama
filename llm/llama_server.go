@@ -1969,17 +1969,21 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				return fmt.Errorf("error unmarshalling llama-server response: %v", err)
 			}
 
-			// Token repeat detection
-			switch {
-			case strings.TrimSpace(lsResp.Content) == lastToken:
-				tokenRepeat++
-			default:
-				lastToken = strings.TrimSpace(lsResp.Content)
-				tokenRepeat = 0
-			}
-			if tokenRepeat > 100 {
-				slog.Debug("prediction aborted, token repeat limit reached")
-				return fmt.Errorf("prediction aborted, token repeat limit reached")
+			// Only generated content participates in loop detection. Protocol-only
+			// events and the terminal marker must not invalidate a valid completion;
+			// distinct whitespace is meaningful in code and document layout.
+			if !lsResp.Stop && lsResp.Content != "" {
+				switch {
+				case lsResp.Content == lastToken:
+					tokenRepeat++
+				default:
+					lastToken = lsResp.Content
+					tokenRepeat = 0
+				}
+				if tokenRepeat > 100 {
+					slog.Debug("prediction aborted, token repeat limit reached")
+					return fmt.Errorf("prediction aborted, token repeat limit reached")
+				}
 			}
 
 			if lsResp.Content != "" && !lsResp.Stop {
@@ -2049,7 +2053,10 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		return fmt.Errorf("error reading llama-server response: %v", err)
 	}
 
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.New("llama-server completion stream ended without a completion marker")
 }
 
 func llamaServerStreamLimitError(label string, err error) error {
@@ -2322,7 +2329,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 			if choice.FinishReason != nil {
 				doneReason := DoneReasonStop
-				if *choice.FinishReason == "length" {
+				if *choice.FinishReason == "length" || *choice.FinishReason == "max_tokens" {
 					doneReason = DoneReasonLength
 				}
 
@@ -2334,11 +2341,16 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
 				resp.GPUFirst = lsResp.Timings.GPUFirst
-				toolCalls, err := accumulatedToolCalls(toolCalls)
+				completedCalls, err := accumulatedToolCalls(toolCalls)
 				if err != nil {
-					return err
+					if doneReason != DoneReasonLength {
+						return err
+					}
+					// Keep the limit visible to clients so they can request a complete,
+					// smaller batch. Never expose even a valid prefix of a cut batch.
+					resp.ToolCallsTruncated = true
 				}
-				resp.Message.ToolCalls = toolCalls
+				resp.Message.ToolCalls = completedCalls
 				finalResp = resp
 				hasFinalResp = true
 				break
@@ -2388,7 +2400,10 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("error reading llama-server chat response: %v", err)
 	}
 
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.New("llama-server chat stream ended without a completion marker")
 }
 
 type llamaServerToolCallAccumulator struct {

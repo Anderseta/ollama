@@ -3599,10 +3599,11 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 
 		err := r.Chat(streamCtx, nativeReq, func(r llm.ChatResponse) {
 			res := api.ChatResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now().UTC(),
-				Message:   r.Message,
-				Done:      r.Done,
+				Model:              req.Model,
+				CreatedAt:          time.Now().UTC(),
+				Message:            r.Message,
+				Done:               r.Done,
+				ToolCallsTruncated: r.ToolCallsTruncated,
 				Metrics: api.Metrics{
 					PromptEvalCount:       r.PromptEvalCount,
 					PromptEvalCachedCount: r.PromptEvalCachedCount,

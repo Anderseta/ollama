@@ -545,6 +545,10 @@ type ChatResponse struct {
 	// DoneReason is the reason the model stopped generating text.
 	DoneReason string `json:"done_reason,omitempty"`
 
+	// ToolCallsTruncated indicates that an incomplete batch of tool calls was
+	// discarded after reaching the output limit. That batch returns no tool calls.
+	ToolCallsTruncated bool `json:"tool_calls_truncated,omitempty"`
+
 	DebugInfo *DebugInfo `json:"_debug_info,omitempty"`
 
 	// Logprobs contains log probability information for the generated tokens,
