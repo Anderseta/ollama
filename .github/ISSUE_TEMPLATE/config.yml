@@ -1,8 +1,11 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Help
-    url: https://discord.com/invite/ollama
-    about: Please join our Discord server for help using Ollama
+  - name: WildLlama documentation
+    url: https://github.com/Anderseta/wildllama#readme
+    about: Read setup instructions, performance notes and memory-limit scopes.
   - name: Troubleshooting
-    url: https://github.com/ollama/ollama/blob/main/docs/faq.md#faq
-    about: See the FAQ for common issues and solutions
+    url: https://github.com/Anderseta/wildllama/blob/main/docs/troubleshooting.mdx
+    about: Check the inherited troubleshooting reference and include your WildLlama commit in reports.
+  - name: Security reporting
+    url: https://github.com/Anderseta/wildllama/blob/main/SECURITY.md
+    about: Read the security policy before sharing sensitive vulnerability details.

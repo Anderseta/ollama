@@ -1,357 +1,200 @@
 <p align="center">
-  <a href="https://ollama.com">
-    <img src="https://github.com/ollama/ollama/assets/3325447/0d0b44e2-8f4a-4e99-9b52-a5c1c741c8f7" alt="ollama" width="200"/>
-  </a>
+  <img src="docs/assets/wildllama-mark.svg" alt="WildLlama" width="176" />
 </p>
 
-# Ollama
+<h1 align="center">WildLlama</h1>
 
-Start building with open models. Access the latest releases locally or in the cloud with complete privacy.
+<p align="center"><strong>Local inference with tighter memory control and smarter MoE streaming.</strong></p>
 
-## Download
+<p align="center">
+  <a href="#what-wildllama-adds">Features</a> ·
+  <a href="#getting-started">Get started</a> ·
+  <a href="#memory-controls">Memory controls</a> ·
+  <a href="#measured-improvements">Results</a> ·
+  <a href="https://github.com/Anderseta/wildllama/issues">Issues</a>
+</p>
 
-### macOS
+WildLlama is an independent fork of [Ollama](https://github.com/ollama/ollama) focused on making local inference more efficient on limited hardware. Its main work is in **bounded model-weight RAM, controlled CUDA allocations, and selective SSD → RAM → GPU streaming for large Mixture-of-Experts models**. It also improves dense-model placement, chat preparation, state transfers, and runtime visibility.
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
+The goal is to spend less time moving the same weights, repeating host work, or computing drafts that will be discarded. WildLlama keeps Ollama's familiar CLI and HTTP API while adding controls and diagnostics for these paths. The executable, `OLLAMA_*` settings, and API names currently retain their upstream names for compatibility.
+
+## What WildLlama adds
+
+| Focus | WildLlama's additions to the inherited Ollama runtime |
+| --- | --- |
+| **Model-weight RAM control** | A bounded, locked host-weight cache for supported raw GGUF MoE models. Load selected experts and embedding rows on demand instead of making the complete host weight set resident. |
+| **More efficient MoE streaming** | Coordinate RAM and GPU residency, batch nearby SSD reads, merge adjacent uploads, reuse route plans, and use event-protected upload slots. Eligible prompt batches group work by expert to avoid repeatedly transferring the same weights. |
+| **Explicit GPU policy** | Optional GPU-exclusive execution and a quota for tracked native CUDA allocations. Unsupported placement fails explicitly rather than quietly moving floating-point inference to the CPU. |
+| **Dense-model efficiency** | More accurate hybrid/recurrent KV placement estimates, corrected dense embedding placement in GPU-exclusive mode, and optional physical KV growth with unchanged logical context capacity. Experimental CUDA dense paths remain separately opt-in. |
+| **Less runtime overhead** | More efficient fragmented tool-call assembly, batched state transfers, safer snapshots, and speculative MTP/EAGLE draft budgets enforced before unnecessary forward passes. |
+| **Visible progress** | An additive `/api/activity` endpoint reports sampled loading, context preparation, prefill, generation, memory-cache counters, and weight-transfer activity. WildGoose can present these observations in its interface. |
+
+These changes target unnecessary work and transfers. They do not prune routed experts, requantize weights, or automatically shrink the requested context to make a model fit. Eligible optimized paths retain the original calculation or fall back when their supported layout or kernel conditions are not met. Numerical regression tests accompany the native changes.
+
+Coordinated MoE execution, GPU-exclusive execution, physical KV growth, and the experimental CUDA dense kernels are **opt-in**. Ordinary runners retain their existing default behavior. See [runtime efficiency](docs/runtime-efficiency.md), [dense-model improvements](docs/dense-runtime.md), and [GPU-first MoE inference](docs/gpu-first-moe-inference.md) for implementation details and activation rules.
+
+## Large MoE models on smaller machines
+
+A MoE model uses only its router-selected experts for each token, but the full set of expert weights can still be much larger than VRAM or available RAM. WildLlama's selective-weight path keeps bounded working sets in memory and reads missing weights from the original GGUF files on SSD.
+
+The GPU-first path tiles expert matrices and prompt windows so the selected work can execute on CUDA within its cache and workspace. The coordinated runtime then tries to keep useful experts resident, avoid duplicate reads and uploads, and pipeline bounded transfers. Prompt-wide expert reuse can help when a cache is too small to hold the union of experts selected across the prompt.
+
+**MoE does not eliminate weight traffic.** A cold expert still has to reach the device. SSD bandwidth, PCIe transfers, model architecture, routing, quantization, cache size, and the available GPU working set determine practical speed. Smaller budgets can increase misses and latency; a model whose fixed weights and minimum working set cannot fit may still fail. WildLlama does not make SSD storage equivalent to VRAM bandwidth.
+
+The optimized paths work with supported original GGUF weights; they do not require a proprietary model conversion or an additional on-disk expert index. Architecture-independent graph hooks do not establish support for every architecture, quantization, adapter, or multimodal projector.
+
+## Getting started
+
+Build **this repository** to get WildLlama. The upstream Ollama installers and `ollama/ollama` container image install Ollama, not the modifications in this fork.
+
+This guide covers source builds and CLI/native runtime use. It does not provide or claim isolation for a packaged desktop installer, desktop auto-start, or updater.
+
+Prerequisites include Go, CMake 3.24+, and a C/C++ toolchain. CUDA builds additionally require the appropriate CUDA toolkit. See the [development guide](docs/development.md) for platform requirements and backend selection.
+
+```sh
+git clone https://github.com/Anderseta/wildllama.git
+cd wildllama
+cmake -B build .
+cmake --build build --parallel 8
 ```
 
-or [download manually](https://ollama.com/download/Ollama.dmg)
+The default build is CPU-only except for Metal on macOS arm64. Select a CUDA backend explicitly for the CUDA-specific features, for example:
 
-### Windows
-
-```shell
-irm https://ollama.com/install.ps1 | iex
+```sh
+cmake -B build . -DOLLAMA_LLAMA_BACKENDS=cuda_v12 -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build --parallel 8
 ```
 
-or [download manually](https://ollama.com/download/OllamaSetup.exe)
+Use the locally built executable: `./ollama` on Linux/macOS or `.\ollama.exe` on Windows. A Go-only rebuild can reuse an existing compatible native payload, but **the new native features require the patched native runtime**; replacing only the Go executable is insufficient.
 
-### Linux
+### Run alongside an existing Ollama installation
 
-```shell
-curl -fsSL https://ollama.com/install.sh | sh
+Choose a separate listener and model directory to keep the services independent. For example, from the built checkout:
+
+**PowerShell**
+
+```powershell
+$env:OLLAMA_HOST = "127.0.0.1:11446"
+$env:OLLAMA_MODELS = Join-Path (Get-Location) "models"
+.\ollama.exe serve
 ```
 
-[Manual install instructions](https://docs.ollama.com/linux#manual-install)
+**Linux/macOS**
 
-### Docker
-
-The official [Ollama Docker image](https://hub.docker.com/r/ollama/ollama) `ollama/ollama` is available on Docker Hub.
-
-### Libraries
-
-- [ollama-python](https://github.com/ollama/ollama-python)
-- [ollama-js](https://github.com/ollama/ollama-js)
-
-### Community
-
-- [Discord](https://discord.gg/ollama)
-- [𝕏 (Twitter)](https://x.com/ollama)
-- [Reddit](https://reddit.com/r/ollama)
-
-## Get started
-
-```
-ollama
+```sh
+OLLAMA_HOST=127.0.0.1:11446 OLLAMA_MODELS="$PWD/models" ./ollama serve
 ```
 
-You'll be prompted to run a model or connect Ollama to your existing agents or applications such as `Claude Code`, `OpenClaw`, `OpenCode` , `Codex`, `Copilot`,  and more.
+Point your client at `http://127.0.0.1:11446`. For CLI commands in another terminal, set the same `OLLAMA_HOST` there. A separate model directory does not automatically migrate models; import or download them into the chosen store. Account files, logs, temporary directories, and build caches have their own locations—`OLLAMA_MODELS` controls the model store only.
 
-### Coding
+### API compatibility
 
-To launch a specific integration:
+The standard `/api/chat`, `/api/generate`, model-management endpoints, and inherited OpenAI-compatible routes remain available. Existing Ollama clients can use WildLlama by selecting its base URL. Extra controls are optional; clients can inspect `/api/version` for advertised capabilities before using them.
 
-```
-ollama launch claude
-```
+An ordinary chat request needs no WildLlama-specific options:
 
-Supported integrations include [Claude Code](https://docs.ollama.com/integrations/claude-code), [Codex](https://docs.ollama.com/integrations/codex), [Copilot CLI](https://docs.ollama.com/integrations/copilot-cli), [DeepSeek Harness](https://docs.ollama.com/integrations/deepseek-harness), [Droid](https://docs.ollama.com/integrations/droid), and [OpenCode](https://docs.ollama.com/integrations/opencode).
-
-### AI assistant
-
-Use [OpenClaw](https://docs.ollama.com/integrations/openclaw) to turn Ollama into a personal AI assistant across WhatsApp, Telegram, Slack, Discord, and more:
-
-```
-ollama launch openclaw
-```
-
-### Chat with a model
-
-Run and chat with [Gemma 4](https://ollama.com/library/gemma4):
-
-```
-ollama run gemma4
-```
-
-See [ollama.com/library](https://ollama.com/library) for the full list.
-
-See the [quickstart guide](https://docs.ollama.com/quickstart) for more details.
-
-## REST API
-
-Ollama has a REST API for running and managing models.
-
-```
-curl http://localhost:11434/api/chat -d '{
-  "model": "gemma4",
-  "messages": [{
-    "role": "user",
-    "content": "Why is the sky blue?"
-  }],
+```sh
+curl http://127.0.0.1:11446/api/chat -d '{
+  "model": "your-model",
+  "messages": [{"role": "user", "content": "Hello!"}],
   "stream": false
 }'
 ```
 
-See the [API documentation](https://docs.ollama.com/api) for all endpoints.
+See the inherited [API documentation](https://docs.ollama.com/api) for standard endpoints and the local guides below for WildLlama extensions. Feature support still depends on the selected runner and model.
 
-### Python
+## Memory controls
 
-```
-pip install ollama
-```
+| Setting | What it controls | What it does not control |
+| --- | --- | --- |
+| `moe_ram_limit_mib` | Resident pages of the managed host-weight cache for supported MoE models. `10240` means 10 GiB; `0` disables it. | Total process RAM, KV cache, activations, metadata, staging buffers, other applications, or system-wide swapping. |
+| `gpu_vram_limit_mib` | Tracked native CUDA allocations on one physical device, including retained allocator pools. | Other processes, display/driver allocations, and every implicit library allocation. |
+| `LLAMA_ARG_MOE_CACHE_MIB` | The GPU cache used for host-stored expert weights. | The full GPU footprint; fixed weights, KV, and workspaces still need room. |
+| `kv_cache_initial_tokens` | Optional initial physical KV commitment on supported CUDA VMM layouts. Logical context capacity stays unchanged. | A maximum KV budget or permission to exceed the eventual allocation quota. Growing the context still needs memory. |
 
-```python
-from ollama import chat
+`fit-target`/fit margin is placement guidance, not a hard VRAM allocation ceiling. The managed RAM and CUDA budgets are separate scopes; neither is a total machine-memory limiter. Locked managed weight pages avoid pageable storage for that cache, but **WildLlama cannot guarantee that the operating system never pages any other allocation**.
 
-response = chat(model='gemma4', messages=[
-  {
-    'role': 'user',
-    'content': 'Why is the sky blue?',
-  },
-])
-print(response.message.content)
-```
+A server-wide MoE weight budget can be set with:
 
-### JavaScript
-
-```
-npm i ollama
+```sh
+./ollama serve --moe-ram-limit-mib 10240
 ```
 
-```javascript
-import ollama from "ollama";
+The corresponding server environment variable is `OLLAMA_MOE_RAM_LIMIT_MIB`. The API option or a model's `PARAMETER moe_ram_limit_mib` takes precedence, including explicit zero. Server defaults apply to MoE models; an incompatible explicit request fails rather than silently ignoring the budget.
 
-const response = await ollama.chat({
-  model: "gemma4",
-  messages: [{ role: "user", content: "Why is the sky blue?" }],
-});
-console.log(response.message.content);
+### Opt into coordinated CUDA MoE execution
+
+The following illustrates the extension fields for an eligible MoE model. **These budgets are examples, not a universal model profile.** Keep enough memory for the model's fixed tensors, KV, compute workspace, and other applications.
+
+```json
+{
+  "model": "your-moe-model",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "stream": true,
+  "options": {
+    "moe_ram_limit_mib": 10240,
+    "moe_runtime": true,
+    "gpu_exclusive": true,
+    "gpu_vram_limit_mib": 12288,
+    "runner_env": {
+      "LLAMA_ARG_CPU_MOE": "1",
+      "LLAMA_ARG_MOE_CACHE_MIB": "1024",
+      "WILDLLAMA_MOE_DYNAMIC_PREFILL": "1"
+    }
+  }
+}
 ```
 
-## Supported backends
+Here `CPU_MOE` describes **weight storage**. In GPU-exclusive mode the selected expert arithmetic still runs on CUDA. This mode requires compatible full GPU-layer placement and a positive GPU expert cache for host-stored experts. It does not silently fall back to CPU arithmetic or reduce the requested context when an allocation cannot fit.
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) project founded by Georgi Gerganov.
+`moe_runtime` enables the coordinated runtime; dynamic prefill has its separate opt-in switch. Expert grouping and packed row uploads require the appropriate coordinated path. Optional frequency-aware RAM admission stays off by default because it can help stable hot sets but hurt changing ones.
 
-## Documentation
+Read the [RAM-budget contract](docs/moe-ram-limit.md), [GPU execution and quota contract](docs/gpu-first-moe-inference.md), [memory validation](docs/gpu-first-memory-validation.md), and [coordinated runtime guide](docs/moe-residency-pipeline.md) before tuning constrained workloads.
 
-- [CLI reference](https://docs.ollama.com/cli)
-- [REST API reference](https://docs.ollama.com/api)
-- [Importing models](https://docs.ollama.com/import)
-- [Modelfile reference](https://docs.ollama.com/modelfile)
-- [Building from source](https://github.com/ollama/ollama/blob/main/docs/development.md)
+## Measured improvements
 
-## Community Integrations
+Small fixtures establish specific improvements without requiring a large-model download:
 
-> Want to add your project? Open a pull request.
+| Component or small-model case | Recorded result |
+| --- | --- |
+| Qwen3MoE under fixed GPU-cache pressure | H2D traffic: **9,526,896 → 3,733,104 bytes**, approximately 61% less. |
+| Gemma4 under fixed GPU-cache pressure | H2D traffic: **6,475,344 → 2,788,944 bytes**, approximately 57% less. |
+| Packed Q5_0 embedding rows | **8,192 → 1 CUDA upload calls**, with identical transferred payload bytes and row order. |
+| Nearby GGUF tensor regions | **4 → 1 SSD reads**, within the same managed RAM peak and existing staging allocation. |
+| Capped MTP/EAGLE draft request | **48 → 1 actual draft output rows** for a one-token request; unused drafts are no longer computed first. |
 
-### Chat Interfaces
+These are **component and synthetic-model observations, not equivalent tokens-per-second gains**. Cache pressure, warm state, model layout, and shared GPU load matter. The expert-grouping result is chiefly a prompt-processing optimization; it does not predict single-token decoding speed for a large Flash model.
 
-#### Web
+The [expert-reuse validation artifact](docs/benchmarks/moe-expert-reuse-20261027.json) records 23 passing CTest components, 24 CUDA synthetic-model comparisons, and 44 server cases. Approved numerical comparisons retain the existing scaled-logit tolerance of `0.0002` and agree on top-1 at all nine checked output positions. This checks numerical regressions, not real-model language quality or universal model compatibility.
 
-- [Open WebUI](https://github.com/open-webui/open-webui) - Extensible, self-hosted AI interface
-- [Onyx](https://github.com/onyx-dot-app/onyx) - Connected AI workspace
-- [LibreChat](https://github.com/danny-avila/LibreChat) - Enhanced ChatGPT clone with multi-provider support
-- [Lobe Chat](https://github.com/lobehub/lobe-chat) - Modern chat framework with plugin ecosystem ([docs](https://lobehub.com/docs/self-hosting/examples/ollama))
-- [NextChat](https://github.com/ChatGPTNextWeb/ChatGPT-Next-Web) - Cross-platform ChatGPT UI ([docs](https://docs.nextchat.dev/models/ollama))
-- [Perplexica](https://github.com/ItzCrazyKns/Perplexica) - AI-powered search engine, open-source Perplexity alternative
-- [big-AGI](https://github.com/enricoros/big-AGI) - AI suite for professionals
-- [Lollms WebUI](https://github.com/ParisNeo/lollms-webui) - Multi-model web interface
-- [ChatOllama](https://github.com/sugarforever/chat-ollama) - Chatbot with knowledge bases
-- [Bionic GPT](https://github.com/bionic-gpt/bionic-gpt) - On-premise AI platform
-- [Chatbot UI](https://github.com/ivanfioravanti/chatbot-ollama) - ChatGPT-style web interface
-- [Hollama](https://github.com/fmaclen/hollama) - Minimal web interface
-- [Chatbox](https://github.com/Bin-Huang/Chatbox) - Desktop and web AI client
-- [chat](https://github.com/swuecho/chat) - Chat web app for teams
-- [Ollama RAG Chatbot](https://github.com/datvodinh/rag-chatbot.git) - Chat with multiple PDFs using RAG
-- [Tkinter-based client](https://github.com/chyok/ollama-gui) - Python desktop client
+The record also preserves limitations: expert grouping is disabled for F32 weights after a numerical regression, and a forced 32 KiB MXFP4-cache diagnostic exceeds its resident-reference tolerance equally with grouping enabled and disabled. It is an unresolved baseline kernel-precision difference, not counted as a passing comparison. See [runtime efficiency](docs/runtime-efficiency.md) and the [batching artifact](docs/benchmarks/moe-batching-20261027.json) for controls, scopes, and additional results.
 
-#### Desktop
+## Compatibility and current scope
 
-- [Dify.AI](https://github.com/langgenius/dify) - LLM app development platform
-- [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) - All-in-one AI app for Mac, Windows, and Linux
-- [Maid](https://github.com/Mobile-Artificial-Intelligence/maid) - Cross-platform mobile and desktop client
-- [Witsy](https://github.com/nbonamy/witsy) - AI desktop app for Mac, Windows, and Linux
-- [Cherry Studio](https://github.com/kangfenmao/cherry-studio) - Multi-provider desktop client
-- [Ollama App](https://github.com/JHubi1/ollama-app) - Multi-platform client for desktop and mobile
-- [PyGPT](https://github.com/szczyglis-dev/py-gpt) - AI desktop assistant for Linux, Windows, and Mac
-- [Alpaca](https://github.com/Jeffser/Alpaca) - GTK4 client for Linux and macOS
-- [SwiftChat](https://github.com/aws-samples/swift-chat) - Cross-platform including iOS, Android, and Apple Vision Pro
-- [Enchanted](https://github.com/AugustDev/enchanted) - Native macOS and iOS client
-- [RWKV-Runner](https://github.com/josStorer/RWKV-Runner) - Multi-model desktop runner
-- [Ollama Grid Search](https://github.com/dezoito/ollama-grid-search) - Evaluate and compare models
-- [macai](https://github.com/Renset/macai) - macOS client for Ollama and ChatGPT
-- [AI Studio](https://github.com/MindWorkAI/AI-Studio) - Multi-provider desktop IDE
-- [Reins](https://github.com/ibrahimcetin/reins) - Parameter tuning and reasoning model support
-- [ConfiChat](https://github.com/1runeberg/confichat) - Privacy-focused with optional encryption
-- [LLocal.in](https://github.com/kartikm7/llocal) - Electron desktop client
-- [MindMac](https://mindmac.app) - AI chat client for Mac
-- [Msty](https://msty.app) - Multi-model desktop client
-- [BoltAI for Mac](https://boltai.com) - AI chat client for Mac
-- [IntelliBar](https://intellibar.app/) - AI-powered assistant for macOS
-- [Kerlig AI](https://www.kerlig.com/) - AI writing assistant for macOS
-- [Hillnote](https://hillnote.com) - Markdown-first AI workspace
-- [Perfect Memory AI](https://www.perfectmemory.ai/) - Productivity AI personalized by screen and meeting history
+- **Windows + NVIDIA CUDA** is the primary runtime validation target for the new selective-weight and GPU-first paths. Linux portability has been reviewed, but these paths still need wider Linux runtime testing; macOS and other backends are not validated for these additions.
+- Linux selective-weight caching requires supported direct I/O and a sufficient locked-memory allowance. Lock failure is reported instead of silently changing to pageable managed weights.
+- Validation covers several small MoE architectures and quantizations, with the exact matrices documented in the technical guides. It does not establish that every MoE model or multimodal path works.
+- Dense models benefit from their applicable placement and runtime fixes. The **MoE host-weight budget does not turn arbitrary dense models into streamed MoE models**.
+- Keep context capacity, reasoning policy, quantization, and memory budgets as separate choices. Memory tuning does not automatically change them, and optional reasoning limits can affect answer quality.
+- Ollama compatibility remains the interface goal. New native features require a matching patched payload, and experimental paths may reject unsupported configurations.
 
-#### Mobile
+## Documentation and integration
 
-- [Ollama Android Chat](https://github.com/sunshine0523/OllamaServer) - One-click Ollama on Android
+- [Build and development](docs/development.md)
+- [MoE host-weight RAM budget](docs/moe-ram-limit.md)
+- [GPU-first execution](docs/gpu-first-moe-inference.md) and [memory validation](docs/gpu-first-memory-validation.md)
+- [Coordinated expert residency and transfer pipeline](docs/moe-residency-pipeline.md)
+- [Dense-model runtime](docs/dense-runtime.md)
+- [Runtime efficiency and measured results](docs/runtime-efficiency.md)
+- [Live activity API and WildGoose integration](docs/runtime-activity.md)
+- [Brand assets and regeneration](docs/branding.md)
 
-> SwiftChat, Enchanted, Maid, Ollama App, Reins, and ConfiChat listed above also support mobile platforms.
+[WildGoose](https://github.com/Anderseta/wildgoose) can manage the local service and model profiles and display WildLlama's sampled runtime activity. Other Ollama-compatible frontends can use the usual inference endpoints; they need explicit support to expose WildLlama's additional controls and telemetry.
 
-### Code Editors & Development
+For bugs and proposals, use [WildLlama issues](https://github.com/Anderseta/wildllama/issues). Include the model/quantization, OS, GPU/backend, relevant budgets, and a minimal reproduction. Distinguish cold loading, prompt processing, and steady-state decoding when reporting performance. Development in this fork follows `main`; upstream Ollama updates are reviewed separately.
 
-- [Cline](https://github.com/cline/cline) - VS Code extension for multi-file/whole-repo coding
-- [Continue](https://github.com/continuedev/continue) - Open-source AI code assistant for any IDE
-- [Void](https://github.com/voideditor/void) - Open source AI code editor, Cursor alternative
-- [Copilot for Obsidian](https://github.com/logancyang/obsidian-copilot) - AI assistant for Obsidian
-- [twinny](https://github.com/rjmacarthy/twinny) - Copilot and Copilot chat alternative
-- [gptel Emacs client](https://github.com/karthink/gptel) - LLM client for Emacs
-- [Ollama Copilot](https://github.com/bernardo-bruning/ollama-copilot) - Use Ollama as GitHub Copilot
-- [Obsidian Local GPT](https://github.com/pfrankov/obsidian-local-gpt) - Local AI for Obsidian
-- [Ellama Emacs client](https://github.com/s-kostyaev/ellama) - LLM tool for Emacs
-- [orbiton](https://github.com/xyproto/orbiton) - Config-free text editor with Ollama tab completion
-- [AI ST Completion](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) - Sublime Text 4 AI assistant
-- [VT Code](https://github.com/vinhnx/vtcode) - Rust-based terminal coding agent with Tree-sitter
-- [QodeAssist](https://github.com/Palm1r/QodeAssist) - AI coding assistant for Qt Creator
-- [AI Toolkit for VS Code](https://aka.ms/ai-tooklit/ollama-docs) - Microsoft-official VS Code extension
-- [Open Interpreter](https://docs.openinterpreter.com/language-model-setup/local-models/ollama) - Natural language interface for computers
-- [oxi](https://github.com/maziluiosif/oxi) - Native Rust desktop coding agent with editor, Git panel and terminal
+## License and acknowledgments
 
-### Libraries & SDKs
+WildLlama is an independent project derived from **[Ollama](https://github.com/ollama/ollama)**, with native inference powered by **[llama.cpp](https://github.com/ggml-org/llama.cpp)**. It is not an official Ollama release. Existing upstream copyright notices and the [MIT license](LICENSE) are preserved; bundled dependencies retain their own notices.
 
-- [LiteLLM](https://github.com/BerriAI/litellm) - Unified API for 100+ LLM providers
-- [Semantic Kernel](https://github.com/microsoft/semantic-kernel/tree/main/python/semantic_kernel/connectors/ai/ollama) - Microsoft AI orchestration SDK
-- [LangChain4j](https://github.com/langchain4j/langchain4j) - Java LangChain ([example](https://github.com/langchain4j/langchain4j-examples/tree/main/ollama-examples/src/main/java))
-- [LangChainGo](https://github.com/tmc/langchaingo/) - Go LangChain ([example](https://github.com/tmc/langchaingo/tree/main/examples/ollama-completion-example))
-- [Spring AI](https://github.com/spring-projects/spring-ai) - Spring framework AI support ([docs](https://docs.spring.io/spring-ai/reference/api/chat/ollama-chat.html))
-- [LangChain](https://python.langchain.com/docs/integrations/chat/ollama/) and [LangChain.js](https://js.langchain.com/docs/integrations/chat/ollama/) with [example](https://js.langchain.com/docs/tutorials/local_rag/)
-- [Ollama for Ruby](https://github.com/crmne/ruby_llm) - Ruby LLM library
-- [any-llm](https://github.com/mozilla-ai/any-llm) - Unified LLM interface by Mozilla
-- [OllamaSharp for .NET](https://github.com/awaescher/OllamaSharp) - .NET SDK
-- [LangChainRust](https://github.com/Abraxas-365/langchain-rust) - Rust LangChain ([example](https://github.com/Abraxas-365/langchain-rust/blob/main/examples/llm_ollama.rs))
-- [Agents-Flex for Java](https://github.com/agents-flex/agents-flex) - Java agent framework ([example](https://github.com/agents-flex/agents-flex/tree/main/agents-flex-chat/agents-flex-chat-ollama))
-- [Elixir LangChain](https://github.com/brainlid/langchain) - Elixir LangChain
-- [Ollama-rs for Rust](https://github.com/pepperoni21/ollama-rs) - Rust SDK
-- [LangChain for .NET](https://github.com/tryAGI/LangChain) - .NET LangChain ([example](https://github.com/tryAGI/LangChain/blob/main/examples/LangChain.Samples.OpenAI/Program.cs))
-- [chromem-go](https://github.com/philippgille/chromem-go) - Go vector database with Ollama embeddings ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [LangChainDart](https://github.com/davidmigloz/langchain_dart) - Dart LangChain
-- [LlmTornado](https://github.com/lofcz/llmtornado) - Unified C# interface for multiple inference APIs
-- [Ollama4j for Java](https://github.com/ollama4j/ollama4j) - Java SDK
-- [Ollama for Laravel](https://github.com/cloudstudio/ollama-laravel) - Laravel integration
-- [Ollama for Swift](https://github.com/mattt/ollama-swift) - Swift SDK
-- [LlamaIndex](https://docs.llamaindex.ai/en/stable/examples/llm/ollama/) and [LlamaIndexTS](https://developers.llamaindex.ai/typescript/framework/modules/models/llms/ollama/) - Data framework for LLM apps
-- [Haystack](https://github.com/deepset-ai/haystack-integrations/blob/main/integrations/ollama.md) - AI pipeline framework
-- [Firebase Genkit](https://firebase.google.com/docs/genkit/plugins/ollama) - Google AI framework
-- [Ollama-hpp for C++](https://github.com/jmont-dev/ollama-hpp) - C++ SDK
-- [PromptingTools.jl](https://github.com/svilupp/PromptingTools.jl) - Julia LLM toolkit ([example](https://svilupp.github.io/PromptingTools.jl/dev/examples/working_with_ollama))
-- [Ollama for R - rollama](https://github.com/JBGruber/rollama) - R SDK
-- [Portkey](https://portkey.ai/docs/welcome/integration-guides/ollama) - AI gateway
-- [Testcontainers](https://testcontainers.com/modules/ollama/) - Container-based testing
-- [LLPhant](https://github.com/theodo-group/LLPhant?tab=readme-ov-file#ollama) - PHP AI framework
-
-### Frameworks & Agents
-
-- [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT/blob/master/docs/platform/ollama.md) - Autonomous AI agent platform
-- [crewAI](https://github.com/crewAIInc/crewAI) - Multi-agent orchestration framework
-- [Strands Agents](https://github.com/strands-agents/sdk-python) - Model-driven agent building by AWS
-- [Cheshire Cat](https://github.com/cheshire-cat-ai/core) - AI assistant framework
-- [any-agent](https://github.com/mozilla-ai/any-agent) - Unified agent framework interface by Mozilla
-- [Stakpak](https://github.com/stakpak/agent) - Open source DevOps agent
-- [Hexabot](https://github.com/hexastack/hexabot) - Conversational AI builder
-- [Neuro SAN](https://github.com/cognizant-ai-lab/neuro-san-studio) - Multi-agent orchestration ([docs](https://github.com/cognizant-ai-lab/neuro-san-studio/blob/main/docs/user_guide.md#ollama))
-
-### RAG & Knowledge Bases
-
-- [RAGFlow](https://github.com/infiniflow/ragflow) - RAG engine based on deep document understanding
-- [R2R](https://github.com/SciPhi-AI/R2R) - Open-source RAG engine
-- [MaxKB](https://github.com/1Panel-dev/MaxKB/) - Ready-to-use RAG chatbot
-- [Minima](https://github.com/dmayboroda/minima) - On-premises or fully local RAG
-- [Chipper](https://github.com/TilmanGriesel/chipper) - AI interface with Haystack RAG
-- [ARGO](https://github.com/xark-argo/argo) - RAG and deep research on Mac/Windows/Linux
-- [Archyve](https://github.com/nickthecook/archyve) - RAG-enabling document library
-- [Casibase](https://casibase.org) - AI knowledge base with RAG and SSO
-- [BrainSoup](https://www.nurgo-software.com/products/brainsoup) - Native client with RAG and multi-agent automation
-
-### Bots & Messaging
-
-- [LangBot](https://github.com/RockChinQ/LangBot) - Multi-platform messaging bots with agents and RAG
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot/) - Multi-platform chatbot with RAG and plugins
-- [Discord-Ollama Chat Bot](https://github.com/kevinthedang/discord-ollama) - TypeScript Discord bot
-- [Ollama Telegram Bot](https://github.com/ruecat/ollama-telegram) - Telegram bot
-- [LLM Telegram Bot](https://github.com/innightwolfsleep/llm_telegram_bot) - Telegram bot for roleplay
-
-### Terminal & CLI
-
-- [aichat](https://github.com/sigoden/aichat) - All-in-one LLM CLI with Shell Assistant, RAG, and AI tools
-- [oterm](https://github.com/ggozad/oterm) - Terminal client for Ollama
-- [gollama](https://github.com/sammcj/gollama) - Go-based model manager for Ollama
-- [tlm](https://github.com/yusufcanb/tlm) - Local shell copilot
-- [tenere](https://github.com/pythops/tenere) - TUI for LLMs
-- [ParLlama](https://github.com/paulrobello/parllama) - TUI for Ollama
-- [llm-ollama](https://github.com/taketwo/llm-ollama) - Plugin for [Datasette's LLM CLI](https://llm.datasette.io/en/stable/)
-- [ShellOracle](https://github.com/djcopley/ShellOracle) - Shell command suggestions
-- [LLM-X](https://github.com/mrdjohnson/llm-x) - Progressive web app for LLMs
-- [cmdh](https://github.com/pgibler/cmdh) - Natural language to shell commands
-- [VT](https://github.com/vinhnx/vt.ai) - Minimal multimodal AI chat app
-
-### Productivity & Apps
-
-- [AppFlowy](https://github.com/AppFlowy-IO/AppFlowy) - AI collaborative workspace, self-hostable Notion alternative
-- [Screenpipe](https://github.com/mediar-ai/screenpipe) - 24/7 screen and mic recording with AI-powered search
-- [Vibe](https://github.com/thewh1teagle/vibe) - Transcribe and analyze meetings
-- [Page Assist](https://github.com/n4ze3m/page-assist) - Chrome extension for AI-powered browsing
-- [NativeMind](https://github.com/NativeMindBrowser/NativeMindExtension) - Private, on-device browser AI assistant
-- [Ollama Fortress](https://github.com/ParisNeo/ollama_proxy_server) - Security proxy for Ollama
-- [1Panel](https://github.com/1Panel-dev/1Panel/) - Web-based Linux server management
-- [Writeopia](https://github.com/Writeopia/Writeopia) - Text editor with Ollama integration
-- [QA-Pilot](https://github.com/reid41/QA-Pilot) - GitHub code repository understanding
-- [Raycast extension](https://github.com/MassimilianoPasquini97/raycast_ollama) - Ollama in Raycast
-- [Painting Droid](https://github.com/mateuszmigas/painting-droid) - Painting app with AI integrations
-- [Serene Pub](https://github.com/doolijb/serene-pub) - AI roleplaying app
-- [Mayan EDMS](https://gitlab.com/mayan-edms/mayan-edms) - Document management with Ollama workflows
-- [TagSpaces](https://www.tagspaces.org) - File management with [AI tagging](https://docs.tagspaces.org/ai/)
-
-### Observability & Monitoring
-
-- [Opik](https://www.comet.com/docs/opik/cookbook/ollama) - Debug, evaluate, and monitor LLM applications
-- [OpenLIT](https://github.com/openlit/openlit) - OpenTelemetry-native monitoring for Ollama and GPUs
-- [Lunary](https://lunary.ai/docs/integrations/ollama) - LLM observability with analytics and PII masking
-- [Langfuse](https://langfuse.com/docs/integrations/ollama) - Open source LLM observability
-- [HoneyHive](https://docs.honeyhive.ai/integrations/ollama) - AI observability and evaluation for agents
-- [MLflow Tracing](https://mlflow.org/docs/latest/llms/tracing/index.html#automatic-tracing) - Open source LLM observability
-
-### Database & Embeddings
-
-- [pgai](https://github.com/timescale/pgai) - PostgreSQL as a vector database ([guide](https://github.com/timescale/pgai/blob/main/docs/vectorizer-quick-start.md))
-- [MindsDB](https://docs.mindsdb.com/integrations/ai-engines/ollama) - Connect Ollama with 200+ data platforms
-- [chromem-go](https://github.com/philippgille/chromem-go/blob/v0.5.0/embed_ollama.go) - Embeddable vector database for Go ([example](https://github.com/philippgille/chromem-go/tree/v0.5.0/examples/rag-wikipedia-ollama))
-- [Kangaroo](https://github.com/dbkangaroo/kangaroo) - AI-powered SQL client
-
-### Infrastructure & Deployment
-
-#### Cloud
-
-- [Google Cloud](https://cloud.google.com/run/docs/tutorials/gpu-gemma2-with-ollama)
-- [Fly.io](https://fly.io/docs/python/do-more/add-ollama/)
-- [Koyeb](https://www.koyeb.com/deploy/ollama)
-- [Harbor](https://github.com/av/harbor) - Containerized LLM toolkit with Ollama as default backend
-
-#### Package Managers
-
-- [Pacman](https://archlinux.org/packages/extra/x86_64/ollama/)
-- [Homebrew](https://formulae.brew.sh/formula/ollama)
-- [Nix package](https://search.nixos.org/packages?show=ollama&from=0&size=50&sort=relevance&type=packages&query=ollama)
-- [Helm Chart](https://artifacthub.io/packages/helm/ollama-helm/ollama)
-- [Gentoo](https://github.com/gentoo/gentoo/tree/master/sci-ml/ollama)
-- [Flox](https://flox.dev/blog/ollama-part-one)
-- [Guix channel](https://codeberg.org/tusharhero/ollama-guix)
+The MoE efficiency work also draws on ideas studied in [Strata](https://github.com/Niko1221/Strata). The implementation and validation notes identify the reviewed revision and explain the differences: WildLlama preserves router-selected experts and does not adopt approximate expert skipping to obtain its reported results.

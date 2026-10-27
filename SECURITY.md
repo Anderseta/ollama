@@ -1,25 +1,36 @@
 # Security
 
-The Ollama maintainer team takes security seriously and will actively work to resolve security issues.
+This policy covers the WildLlama fork at
+[Anderseta/wildllama](https://github.com/Anderseta/wildllama). WildLlama is
+maintained independently of Ollama; the upstream Ollama team is not responsible
+for reviewing this fork's changes.
 
 ## Reporting a vulnerability
 
-If you discover a security vulnerability, please do not open a public issue. Instead, please create a vulnerability report on [Github advisories](https://github.com/ollama/ollama/security/advisories/new). We ask that you give us sufficient time to investigate and address the vulnerability before disclosing it publicly.
+Do not post credentials, exploit instructions or private model data in a public
+issue. Check the repository's
+[Security tab](https://github.com/Anderseta/wildllama/security) for private
+vulnerability reporting. If **Report a vulnerability** is available, use it to
+send a confidential report to this repository's maintainers.
 
-Please include the following details in your report:
-- A description of the vulnerability
-- Steps to reproduce the issue
-- Your assessment of the potential impact
-- Any possible mitigations
+Private reporting depends on the repository's GitHub settings. If that option is
+unavailable, use a private contact method published by the repository owner to
+arrange confidential disclosure before sending sensitive details. This project
+does not publish a dedicated security email address or a guaranteed response
+time.
 
-## Security best practices
+Include the affected commit/build, platform, minimal reproduction, expected and
+actual behavior, likely impact and any mitigation you have identified. Keep
+large or sensitive artifacts out of the initial report.
 
-While the maintainer team does its best to secure Ollama, users are encouraged to implement their own security best practices, such as:
+For a vulnerability reproduced in unmodified upstream Ollama, also follow
+[Ollama's security policy](https://github.com/ollama/ollama/blob/main/SECURITY.md).
+Clearly distinguish an upstream issue from a WildLlama-specific change.
 
-- Regularly updating to the latest version of Ollama
-- Securing access to hosted instances of Ollama
-- Monitoring systems for unusual activity
+## Running a local inference service
 
-## Contact
-
-For any other questions or concerns related to security, please contact us at hello@ollama.com
+Keep inference endpoints restricted to trusted clients and review authentication
+and network exposure before hosting a service. Treat models, templates and
+extensions as inputs from their publishers, and keep the runtime and GPU drivers
+updated. RAM and VRAM quotas describe the documented allocation scopes; they are
+not security sandbox boundaries.

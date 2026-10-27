@@ -1,88 +1,80 @@
-# Contributing to Ollama
+# Contributing to WildLlama
 
-Thank you for your interest in contributing to Ollama! Here are a few guidelines to help get you started.
+WildLlama is an independent fork of [Ollama](https://github.com/ollama/ollama),
+focused on efficient local inference, bounded weight memory and large MoE models.
+Send WildLlama issues and pull requests to
+[Anderseta/wildllama](https://github.com/Anderseta/wildllama).
 
 ## Set up
 
-See the [development documentation](./docs/development.md) for instructions on how to build and run Ollama locally.
+Start with the [README](README.md) and
+[development documentation](docs/development.md). Keep a development runtime,
+listener and model metadata separate from an existing Ollama installation. The
+Go module and compatible command/API names intentionally retain their upstream
+names; a repository rename does not require renaming every import or model.
 
-### Ideal issues
+Development in this fork targets `main`. Open pull requests against `main` and
+preserve the upstream history. Updating from upstream Ollama is separate from
+integrating WildLlama changes.
 
-* [Bugs](https://github.com/ollama/ollama/issues?q=is%3Aissue+is%3Aopen+label%3Abug): issues where Ollama stops working or where it results in an unexpected error.
-* [Performance](https://github.com/ollama/ollama/issues?q=is%3Aissue+is%3Aopen+label%3Aperformance): issues to make Ollama faster at model inference, downloading or uploading.
-* [Security](https://github.com/ollama/ollama/blob/main/SECURITY.md): issues that could lead to a security vulnerability. As mentioned in [SECURITY.md](https://github.com/ollama/ollama/blob/main/SECURITY.md), please do not disclose security vulnerabilities publicly.
+## Report a problem or propose a change
 
-### Issues that are harder to review
+Use [WildLlama issues](https://github.com/Anderseta/wildllama/issues) for bugs,
+performance reports, model compatibility and feature proposals. Follow
+[SECURITY.md](SECURITY.md) for vulnerabilities rather than posting exploit details
+in a public issue.
 
-* New features: new features (e.g. API fields, environment variables) add surface area to Ollama and make it harder to maintain in the long run as they cannot be removed without potentially breaking users in the future.
-* Refactoring: large code improvements are important, but can be harder or take longer to review and merge.
-* Documentation: small updates to fill in or correct missing documentation are helpful, however large documentation additions can be hard to maintain over time.
+For a reproducible inference problem, include:
 
-### Issues that may not be accepted
+- The WildLlama commit or build version, operating system, GPU/driver and backend.
+- The model architecture, quantization, context, batch sizes and relevant options.
+- Configured RAM/VRAM limits and whether coordinated MoE mode is enabled.
+- The smallest prompt or fixture that reproduces the problem, with relevant logs.
 
-* Changes that break backwards compatibility in Ollama's API (including the OpenAI-compatible API)
-* Changes that add significant friction to the user experience
-* Changes that create a large future maintenance burden for maintainers and contributors
+Remove access tokens, private prompts and sensitive file paths from reports.
+Large GGUF files and complete model stores do not belong in an issue or patch.
+If a problem also occurs on unmodified Ollama, link the upstream report and
+describe which runtime was tested.
 
-## Proposing a (non-trivial) change
+Discuss substantial changes in an issue before investing in a large patch.
+Explain the concrete problem, the resulting behavior, compatibility impact and
+how a reviewer can validate it.
 
-> By "non-trivial", we mean a change that is not a bug fix or small
-> documentation update. If you are unsure, please ask us on our [Discord
-> server](https://discord.gg/ollama).
+## Performance and memory changes
 
-Before opening a non-trivial Pull Request, please open an issue to discuss the change and
-get feedback from the maintainers. This helps us understand the context of the
-change and how it fits into Ollama's roadmap and prevents us from duplicating
-work or you from spending time on a change that we may not be able to accept.
+Preserve target weights, selected experts and sampling behavior unless a feature
+explicitly changes them and documents the tradeoff. Memory claims must identify
+their scope: a weight-cache quota is not a cap on the entire process, KV cache or
+operating-system memory use.
 
-Tips for proposals:
+Use small, reproducible fixtures first. Compare the old and new paths under the
+same model, context, precision and memory limits. Record warm-up, cache state,
+hardware and competing workloads. Distinguish component counters or timings from
+end-to-end tokens/s; fewer uploads alone do not prove a proportional speedup.
+Check numerical outputs and exercise failure/recovery paths when changing storage
+or asynchronous execution.
 
-* Explain the problem you are trying to solve, not what you are trying to do.
-* Explain why the change is important.
-* Explain how the change will be used.
-* Explain how the change will be tested.
-
-Additionally, for bonus points: Provide draft documentation you would expect to
-see if the changes were accepted.
+The [runtime efficiency notes](docs/runtime-efficiency.md),
+[MoE memory design](docs/moe-ram-limit.md) and
+[validation artifacts](docs/benchmarks) describe the existing test approach.
+Do not run large-model benchmarks on shared hardware without coordinating access.
 
 ## Pull requests
 
-**Commit messages**
+Keep changes focused and explain the problem and final behavior in the PR
+description. Include the validation performed and any known platform limits.
+Tests should cover meaningful behavior; documentation-only changes usually need
+link, example and rendering checks rather than an inference benchmark.
 
-The title should look like:
+Use a concise commit title, for example:
 
-    <package>: <short description>
+```text
+llm: preserve terminal errors in streamed responses
+docs: explain MoE weight-cache limits
+```
 
-The package is the most affected Go package. If the change does not affect Go
-code, then use the directory name instead. Changes to a single well-known
-file in the root directory may use the file name.
-
-The short description should start with a lowercase letter and be a
-continuation of the sentence:
-
-      "This changes Ollama to..."
-
-Examples:
-
-      llm/backend/mlx: support the llama architecture
-      CONTRIBUTING: provide clarity on good commit messages, and bad
-
-Bad Examples:
-
-      feat: add more emoji
-      fix: was not using famous web framework
-      chore: generify code
-
-**Tests**
-
-Please include tests. Strive to test behavior, not implementation.
-
-**New dependencies**
-
-Dependencies should be added sparingly. If you are adding a new dependency,
-please explain why it is necessary and what other ways you attempted that
-did not work without it.
-
-## Need help?
-
-If you need help with anything, feel free to reach out to us on our [Discord server](https://discord.gg/ollama).
+Add dependencies sparingly and explain why an existing implementation is
+insufficient. Preserve license notices and credit Ollama, llama.cpp and other
+upstream projects when adapting their work. Public branding, installers and
+update paths must clearly identify this fork and avoid replacing an independent
+Ollama installation.

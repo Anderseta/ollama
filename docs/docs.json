@@ -1,16 +1,16 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "name": "Ollama",
+  "name": "WildLlama",
   "colors": {
-    "primary": "#000",
-    "light": "#b5b5b5",
-    "dark": "#000"
+    "primary": "#122d32",
+    "light": "#57d6b2",
+    "dark": "#57d6b2"
   },
   "favicon": "/images/favicon.png",
   "logo": {
     "light": "/images/logo.png",
     "dark": "/images/logo-dark.png",
-    "href": "https://ollama.com"
+    "href": "https://github.com/Anderseta/wildllama"
   },
   "theme": "maple",
   "background": {
@@ -39,14 +39,18 @@
   "navbar": {
     "links": [
       {
-        "label": "Sign in",
-        "href": "https://ollama.com/signin"
+        "label": "Source",
+        "href": "https://github.com/Anderseta/wildllama"
+      },
+      {
+        "label": "Upstream API reference",
+        "href": "https://docs.ollama.com/api"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Download",
-      "href": "https://ollama.com/download"
+      "label": "Issues",
+      "href": "https://github.com/Anderseta/wildllama/issues"
     }
   },
   "api": {
