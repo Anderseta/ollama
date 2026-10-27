@@ -73,6 +73,14 @@ function setupBitmap() {
 function wordmark(color) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="520" height="128" viewBox="0 0 520 128" role="img" aria-label="WildLlama"><title>WildLlama</title><g transform="scale(.5)">${body}</g><text x="150" y="87" fill="${color}" font-family="Arial, Helvetica, sans-serif" font-size="66" font-weight="700" letter-spacing="-2">WildLlama</text></svg>\n`;
 }
+function socialPreview() {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="WildLlama repository preview">
+<title>WildLlama</title><desc>Local inference with memory control and efficient MoE streaming.</desc>
+<rect width="1280" height="640" fill="#122d32"/><rect x="24" y="24" width="1232" height="592" rx="28" fill="none" stroke="#2a4749" stroke-width="2"/>
+<g transform="translate(76 128) scale(1.5)">${body}</g>
+<g font-family="Arial, Helvetica, sans-serif"><text x="524" y="181" fill="#57d6b2" font-size="18" font-weight="700" letter-spacing="4">LOCAL INFERENCE</text><text x="518" y="285" fill="#fff9e9" font-size="88" font-weight="700" letter-spacing="-3">WildLlama</text><text x="524" y="350" fill="#fff9e9" font-size="30">Large models. Leaner hardware.</text><text x="524" y="402" fill="#b5d4cd" font-size="24">Memory control · Efficient MoE streaming</text><text x="80" y="575" fill="#b5d4cd" font-size="21">github.com/Anderseta/wildllama</text></g>
+</svg>\n`;
+}
 
 save('docs/assets/wildllama-glyph.svg', glyph);
 save('docs/assets/wildllama-mark.png', png(source, 512));
@@ -81,6 +89,8 @@ save('docs/assets/wildllama.ico', ico(source));
 save('docs/assets/wildllama.icns', icns(source));
 save('docs/assets/wildllama-wordmark.svg', wordmark('#122d32'));
 save('docs/assets/wildllama-wordmark-dark.svg', wordmark('#fff9e9'));
+save('docs/assets/wildllama-social-preview.svg', socialPreview());
+save('docs/assets/wildllama-social-preview.png', raster(socialPreview(), 1280, true).asPng());
 save('docs/images/logo.png', raster(wordmark('#122d32'), 1040, true).asPng());
 save('docs/images/logo-dark.png', raster(wordmark('#fff9e9'), 1040, true).asPng());
 save('docs/images/favicon.png', png(source, 64));

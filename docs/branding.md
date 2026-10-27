@@ -15,6 +15,10 @@ a small amber ear accent connect it visually to
 
 The mark is native SVG artwork. PNGs, Windows ICOs, macOS ICNS files, tray
 variants, documentation wordmarks and the installer bitmap are derived exports.
+For GitHub's **Settings → General → Social preview**, upload
+[wildllama-social-preview.png](assets/wildllama-social-preview.png), a 1280 × 640
+PNG with a solid background. Committing this file does not automatically change
+the repository setting; the image must also be uploaded in GitHub's interface.
 Keep edits in the canonical SVG and regenerate the exports together:
 
 ```sh
