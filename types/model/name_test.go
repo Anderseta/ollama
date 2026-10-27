@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -239,6 +240,10 @@ func TestNameIsValidPart(t *testing.T) {
 		{kind: kindNamespace, s: "bb", want: true},
 		{kind: kindNamespace, s: "a.", want: false},
 		{kind: kindModel, s: "-h", want: false},
+		{kind: kindModel, s: strings.Repeat("a", 96), want: true},
+		{kind: kindModel, s: strings.Repeat("a", 97), want: false},
+		{kind: kindNamespace, s: strings.Repeat("a", 81), want: false},
+		{kind: kindTag, s: strings.Repeat("a", 81), want: false},
 		{kind: kindDigest, s: "sha256-1000000000000000000000000000000000000000000000000000000000000000", want: true},
 	}
 	for _, tt := range cases {
@@ -248,6 +253,17 @@ func TestNameIsValidPart(t *testing.T) {
 				t.Errorf("isValidPart(%s, %q) = %v; want %v", tt.kind, tt.s, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLongHuggingFaceName(t *testing.T) {
+	const reference = "huggingface.co/DavidAU/Qwen3.8-Flash-Next-Abliterated-Uncensored-Turbo-Brilliance-50x-Reasoning-Instruct-GSQ-RCO-GGUF:IQ3_S"
+	n := ParseName(reference)
+	if !n.IsValid() || n.String() != reference {
+		t.Fatalf("valid Hugging Face repository rejected: %+v", n)
+	}
+	if ParseName("huggingface.co/DavidAU/../model:IQ3_S").IsValid() {
+		t.Fatal("path traversal accepted")
 	}
 }
 

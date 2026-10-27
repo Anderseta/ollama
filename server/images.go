@@ -1192,6 +1192,9 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 
 	mf, manifestData, err := pullModelManifest(ctx, n, regOpts)
 	if err != nil {
+		if (strings.EqualFold(n.Host, "huggingface.co") || strings.EqualFold(n.Host, "hf.co")) && strings.Contains(strings.ToLower(err.Error()), "sharded gguf") {
+			return pullHuggingFaceGGUF(ctx, n, runner, regOpts, fn)
+		}
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
 	selectedChildDigest := ""

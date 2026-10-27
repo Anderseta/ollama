@@ -191,3 +191,12 @@ Ollama looks for native helper binaries and acceleration libraries in installed 
 * `build/lib/ollama` and `dist/<platform>/lib/ollama` for local development builds
 
 If the libraries are not found, Ollama will not run with any acceleration libraries.
+
+## Hugging Face GGUF downloads
+
+Model names allow 96 characters so valid Hub repository names are accepted.
+When the Hub registry reports a sharded GGUF repository, the puller resolves
+the requested quantization through the Hub file API and downloads each shard
+through the existing resumable, SHA-256-verified blob downloader. Import keeps
+the original shards instead of merging or copying their weights. A single
+`mmproj` GGUF is included automatically when the repository provides one.
