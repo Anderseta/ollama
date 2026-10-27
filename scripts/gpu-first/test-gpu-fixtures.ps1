@@ -139,3 +139,4 @@ if (!$ResidentOnly -and !$SkipResidentDiagnostics) {
 }
 if ($results | Where-Object { $_.role -eq 'streaming' -and $_.verdict -ne 'PASS' }) { exit 1 }
 if ($ResidentOnly -and ($results | Where-Object { $_.verdict -ne 'PASS' })) { exit 1 }
+exit 0

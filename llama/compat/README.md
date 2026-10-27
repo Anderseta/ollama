@@ -42,6 +42,10 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
 - `007-dense-runtime.patch` - optional physical KV growth, explicit safe state
   I/O, gated CUDA dense projections/normalization and exact native template token
   counts. See `docs/dense-runtime.md` for controls and validation limits.
+- `011-moe-read-and-execution-batching.patch` - bounded multi-region SSD reads,
+  adjacent expert uploads, retained child-graph work batches, cached route
+  windows and measured-cost speculative recovery. Applied after patches 008-010.
+  See `docs/runtime-efficiency.md` for small-fixture evidence and limits.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under

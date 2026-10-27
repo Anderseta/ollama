@@ -1,0 +1,337 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-27T01:08:15.473550+00:00",
+  "source_base": "3e54c375b3dd7fe5879e0edf9a7d642b9f6e0057",
+  "native_revision": "b11845",
+  "strata_review_commit": "4b9e05a2a806a3fe24f7b2560d98626c37dade35",
+  "native_patch_sha256": "e1a37558908d74860d8e8b94382962dd6e8d844722032d699cf2a26d6313740d",
+  "hardware": {
+    "os": "Windows",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "cuda": "12.8",
+    "shared_external_gpu_load": true
+  },
+  "preserves": {
+    "weights": true,
+    "quantization": true,
+    "selected_experts": true,
+    "context": true,
+    "weight_ram_quota": true,
+    "gpu_workspace": true
+  },
+  "small_components": {
+    "ctest_passed": 13,
+    "ctest_failed": 0,
+    "server_cases": 44,
+    "server_assertions": 184,
+    "legacy_ram_cpu": true,
+    "pooled_ram_cpu": true,
+    "pooled_ram_cuda": true
+  },
+  "read_fixture": {
+    "read_calls_before": 4,
+    "read_calls_after": 1,
+    "read_bytes_before": 205270,
+    "read_bytes_after": 200939,
+    "managed_peak_bytes_before_and_after": 327680,
+    "io_staging_bytes_before_and_after": 4210688
+  },
+  "upload_fixture": {
+    "ranges_before": 192,
+    "ranges_after": 3,
+    "actual_cuda_calls_before": 192,
+    "actual_cuda_calls_after": 3,
+    "warm_median_ms_before": 5.0892,
+    "warm_median_ms_after": 0.1914,
+    "alternating_pairs": 7,
+    "managed_ram_limit_bytes": 1048576,
+    "inference_timing": false
+  },
+  "work_batch_fixture": {
+    "operations": 32,
+    "explicit_drains_before": 32,
+    "explicit_drains_after": 8,
+    "cpu_and_cuda": true,
+    "shared_id_and_output_scratch_reused": true,
+    "maximum_pending_graphs": 4
+  },
+  "gpu_fixture_comparisons": [
+    {
+      "suite": "gpu-logits",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 32768,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "qwen2moe.gguf",
+      "cache_bytes": 131072,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 5.47916e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "qwen2moe.gguf",
+      "cache_bytes": 1048576,
+      "context": 512,
+      "prefill": 64,
+      "logits": 2331,
+      "max_scaled_error": 5.10812e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 65536,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 9.43127e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 512,
+      "prefill": 64,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "gpt-oss-wide-MXFP4-prec-q8.gguf",
+      "cache_bytes": 1048576,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-logits",
+      "fixture": "gpt-oss-wide-MXFP4-prec-q8.gguf",
+      "cache_bytes": 32768,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch4",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch4",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 32768,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 5.06653e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch4",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 65536,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 9.43127e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch4",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 512,
+      "prefill": 64,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch1",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch1",
+      "fixture": "qwen3moe-q4.gguf",
+      "cache_bytes": 32768,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 5.06653e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch1",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 65536,
+      "context": 256,
+      "prefill": 32,
+      "logits": 2331,
+      "max_scaled_error": 9.43127e-05,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    },
+    {
+      "suite": "gpu-fixed-batch1",
+      "fixture": "gemma4-q4.gguf",
+      "cache_bytes": 1048576,
+      "context": 512,
+      "prefill": 64,
+      "logits": 2331,
+      "max_scaled_error": 0.0,
+      "outside_tolerance": 0,
+      "top1_same_out_of_9": 9
+    }
+  ],
+  "patch_replay": {
+    "patches": 11,
+    "files": 101,
+    "fresh_and_idempotent": true,
+    "exact_final_source": true
+  },
+  "api_smoke": {
+    "ok": true,
+    "stopped": true,
+    "cpu_only": true,
+    "fixture_bytes": 436576,
+    "fixture_sha256": "8b14d0f83a9cfbe97f7d4955fface1e2cbd240c8d6be6faf78afd6bb42782e14",
+    "checks": [
+      {
+        "kind": "generate",
+        "stream": false,
+        "done": true,
+        "eval_count": 8
+      },
+      {
+        "kind": "generate",
+        "stream": true,
+        "done": true,
+        "events": 7
+      },
+      {
+        "kind": "generate",
+        "cancelled_after_nonfinal_chunk": true,
+        "following_request_done": true,
+        "following_request_elapsed_s": 0.01599999999962165
+      },
+      {
+        "kind": "chat",
+        "stream": false,
+        "done": true,
+        "eval_count": 8
+      },
+      {
+        "kind": "chat",
+        "stream": true,
+        "done": true,
+        "events": 5
+      },
+      {
+        "kind": "chat",
+        "cancelled_after_nonfinal_chunk": true,
+        "following_request_done": true,
+        "following_request_elapsed_s": 0.0
+      }
+    ]
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "97a83f17e694a1e28c7406571aabef6a3056ee37773f7919dd414d2f5ed8fa7d",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "7e8d99315ea968d1f69878dd1b3f7b663e0cd241ae67ddf02320191d2239bcd7",
+    "lib/ollama/ggml-cpu.dll": "bb93e036da7245174183b074cad9f591d35308ca29c5b107aec9a0f0554ed66c",
+    "lib/ollama/ggml.dll": "3be5b66f53942d0d25fd4d46977aa08e9dd6856ee79edd12812b5c61599a4a95",
+    "lib/ollama/llama-common.dll": "543092f069ea2ba048acce0a28b6e1997b471478b7b25c19c1d2c57ba7566143",
+    "lib/ollama/llama-quantize-impl.dll": "674547aa40aaaa24c70d48d1f3604ec9efe1c752220b7a839c94f67855464b18",
+    "lib/ollama/llama-quantize.exe": "368708e322f398bd1f6e94319713359590a08ef10908ba95bc0db7dda4931cea",
+    "lib/ollama/llama-server-impl.dll": "e55a67c6c8461a8d28e3022aa68281c2b321c2c59261555d6aee07f44236b964",
+    "lib/ollama/llama-server.exe": "394a024859b8e214656907727e2f391c403cdcd64bf08b1c1e37e8af391bfe1a",
+    "lib/ollama/llama.dll": "130c1107dc8c96fc5de8a6aa27067ee95415d0d6b5aca046e1ac1a3c65852e3f",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "23bd58214044f625e95412f855155b0ec461a85ae29c4da25df55db615b359e4",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "ollama.exe": "34ecbca7d4192331415b52f0e63e6d48ca33fde8f60eb9af8882ef07f447ed98"
+  },
+  "limitations": [
+    "Only small synthetic weights; no Qwen Flash or other large model loaded/downloaded.",
+    "No language-quality benchmark or future-model tokens/s claim.",
+    "Component transfer speed depends on adjacent ranges; random sparse routes may not benefit.",
+    "Windows/CUDA execution only; portable planner exercised, Linux runtime not tested.",
+    "Bounded metadata/host ID arrays are additional host overhead outside the weight quota.",
+    "MTP head not enabled/downloaded; speculative_adaptive retains explicit existing option."
+  ]
+}

@@ -249,3 +249,68 @@ chat pass in streaming/nonstreaming modes; closing an active stream permits the
 next request to finish. No production models are used by this smoke, and the
 owned server and its children are stopped afterwards. This is functional
 validation, not a language-quality or large-model throughput comparison.
+
+## Bounded MoE batching inspired by Strata
+
+Patch `011-moe-read-and-execution-batching.patch` adds the following changes on
+top of `3e54c375`. The design was informed by a source review of Strata commit
+`4b9e05a2a806a3fe24f7b2560d98626c37dade35`; this does not copy its approximate
+expert skipping or its GPU spin waits. Target weights, quantization, selected
+experts, context and configured memory quotas remain unchanged.
+
+- The coordinated pooled RAM reader combines same-file spans across tensor
+  reservations. It accepts overlaps and small holes only within the existing
+  staging slot, with a 16 KiB maximum individual hole and at most 1/32 additional
+  aligned traffic relative to useful payload. Only requested pages enter RAM.
+  The 4 MiB staging allocation plus alignment, four Windows I/O slots and single
+  POSIX slot remain unchanged. Set `WILDLLAMA_MOE_READ_COALESCE=0` for the original
+  same-tensor grouping; the nonpooled reader retains its original grouping.
+- Expert uploads merge only consecutive copy ranges contiguous at both the
+  source and destination. Tiled source gaps, different tensors, different banks
+  and overflow retain separate copies. Oversized merged ranges still use the
+  existing bounded fallback. This does not reorder routed experts.
+- Dynamic prefill retains at most four child graph contexts and independent
+  host ID arrays before draining. The same child stream orders uploads, matmuls
+  and output copies; bank upload events protect earlier consumers. Shared GPU
+  workspace size does not grow. End-of-provider and exception paths drain before
+  releasing metadata. `WILDLLAMA_MOE_EXECUTOR_BATCH=0` selects a one-work batch.
+- Layer capacities are computed at cache initialization, and actual route IDs
+  and exact prompt-window partitions are reused within an evaluation. This
+  avoids repeated all-layer scans, route vector copies and partition passes.
+- The existing `speculative_adaptive` option now refreshes its plain-decoding
+  reference, observes the actual proposed span and backs off according to wasted
+  cost. Failed probes retry after 32-1024 plain steps; useful drafting is checked
+  against two fresh plain observations after at least 512 output tokens.
+  Invalid clocks/cancelled steps are discarded, and recurrent replay cost stays
+  in the observation. Target verification and sampling are unchanged. This
+  neither enables a missing MTP head nor changes saved profile choices.
+
+Only small tests were run, on Windows with CUDA 12.8 and the RTX 5060 Ti. The GPU
+was shared with other applications, so these results are component observations,
+not an isolated inference-speed benchmark:
+
+| Small fixture | Before / after |
+| --- | --- |
+| Four nearby tensor regions | 4 / 1 SSD reads; 205,270 / 200,939 bytes; identical 327,680-byte managed RAM peak |
+| 192 adjacent expert uploads | 192 / 3 actual CUDA uploads; same bytes and 1 MiB RAM quota |
+| Same warm upload fixture | Median 5.0892 / 0.1914 ms, seven alternating pairs; excludes SSD reads and model inference |
+| 32 queued child operations | 32 / 8 explicit drains, including shared GPU scratch/ID reuse |
+
+Thirteen CTest components passed, including CPU/CUDA transfer and lifetime
+fixtures. All 44 server component cases and 184 assertions passed. Legacy RAM,
+pooled CPU and pooled CUDA fixtures passed. Tests cover truncated reads and
+recovery, partial pages, shards, overlapping regions, destination guards,
+overflow, quotas and invalid speculative timing.
+
+Sixteen small synthetic-model comparisons cover Qwen3MoE, Qwen2MoE, Gemma4 and
+GPT-OSS/MXFP4. They include fixed caches, multiple row tiles, output-free prefixes,
+consecutive decode steps and serial/batched controls. All 2,331 logits per case
+were finite and within the existing scaled tolerance of 0.0002; top-1 agreed at
+all nine positions per case. Maximum observed scaled difference was 0.0000943127.
+These are numerical regressions, not an assessment of real-model language
+quality. No Qwen Flash or other large model was loaded or downloaded.
+
+The portable planner is tested through Windows builds; this round does not
+claim a Linux runtime test. SSD prefetch prediction, a full persistent CUDA
+window and hybrid CPU/GPU expert arithmetic are not added by this patch. The
+small-component improvements do not predict tokens/s for a future IQ3_S model.
