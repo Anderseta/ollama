@@ -46,6 +46,10 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
   adjacent expert uploads, retained child-graph work batches, cached route
   windows and measured-cost speculative recovery. Applied after patches 008-010.
   See `docs/runtime-efficiency.md` for small-fixture evidence and limits.
+- `012-expert-major-and-packed-rows.patch` - gated expert-major prompt execution,
+  packed quantized host rows, optional frequency-aware RAM admission and actual
+  per-sequence MTP/EAGLE draft limits. Applied after 011; see
+  `docs/runtime-efficiency.md` for fallback rules and validation limits.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under

@@ -314,3 +314,94 @@ The portable planner is tested through Windows builds; this round does not
 claim a Linux runtime test. SSD prefetch prediction, a full persistent CUDA
 window and hybrid CPU/GPU expert arithmetic are not added by this patch. The
 small-component improvements do not predict tokens/s for a future IQ3_S model.
+
+## Expert reuse, packed rows and actual draft budgets
+
+Patch `012-expert-major-and-packed-rows.patch` continues the review of the same
+Strata commit, particularly its expert-major prompt execution and pinned upload
+rings (`include/strata/prefill/prefill.hpp` and `moe_mmq.hpp`). The implementation
+uses the existing WildLlama cache, GGML operators and reserved workspace. It does
+not drop routed experts, change quantization or require a converted model.
+Expert grouping and row packing require the existing opt-in coordinated MoE
+runtime; grouping additionally requires its GPU-exclusive dynamic-prefill path.
+This patch does not enable these modes or change saved profiles. See
+[activation and memory scopes](moe-residency-pipeline.md).
+
+### Reuse expert weights across prompt tokens
+
+When the token-window executor repeatedly uploads the same experts, the new path
+groups routed entries by expert across the prompt. Gather and scatter operations
+restore each original token/rank position before the existing weighted reduction.
+Gate/up shared inputs and down-projection distinct rank inputs are both covered.
+Weights remain available while all bounded chunks for their group are processed.
+
+This path requires at least 32 tokens, more globally selected experts than cache
+slots, at least twice as many estimated window uploads as distinct experts and
+at most twice the old graph-work count. Its gather, output and index arrays fit
+the existing GPU workspace. The child stream, upload fences and four-work
+metadata retention bound remain in force, including draining on exceptions.
+Quantized execution queries the CUDA backend's actual MMVQ batch limit and caps
+both eligibility and grouped chunks accordingly. Unsupported backends, shapes,
+precision/kernel combinations or insufficient workspace retain the previous
+executor. F32 weights retain the previous executor: changing its matrix batch
+shape exceeded the existing full-model numerical tolerance in a stress fixture.
+Set `WILDLLAMA_MOE_EXPERT_MAJOR=0` to disable this optimization. Optional
+`WILDLLAMA_MOE_EXPERT_MAJOR_TRACE=1` reports only actual executions.
+
+### Pack small host-weight rows before uploading
+
+Selective token/PLE row copies now pack their original quantized bytes, in caller
+order, into the existing two pinned upload slots. CUDA still performs the original
+dequantization. Repeated rows, tensor views, partial pages and destination guards
+are preserved. Source pages are admitted in groups within the existing RAM quota;
+an individual oversized row uses bounded reads. Unsupported layouts/backend
+queues retain the copy-list path. `WILDLLAMA_MOE_PACK_ROWS=0` disables packing.
+
+The small Q5_0 CUDA fixture uploads 8,192 rows in one call rather than 8,192 calls,
+with identical payload bytes. Larger cases cross upload-slot boundaries. Tests
+also truncate the source after a packet has already been submitted, require
+draining and then restore the file and retry. This reduces calls and fences;
+it does not change the 64 KiB disk-page granularity or promise equal SSD savings.
+
+### Apply speculative depth before computing drafts
+
+MTP and EAGLE previously could compute the global draft maximum and discard the
+excess after a smaller per-sequence request. They now honor each sequence's budget
+before its next forward pass. Zero disables drafting, negative uses the global
+maximum and positive values are capped by it. Simple drafting follows the same
+rule. Early EOS and checkpoint ownership are retained; an unused final hidden
+state download is omitted. Target verification and sampling remain unchanged.
+This fixes wasted work only when these speculative modes are already enabled.
+
+### Experimental RAM history stays optional
+
+`WILDLLAMA_MOE_RAM_ADMISSION=1` opts the pooled reader into bounded frequency-aware
+victim selection. Small aging counters fit existing page-record padding and the
+victim scan is capped at 64 candidates. Recency aging lets old popular pages go.
+The ordinary SLRU policy remains the default and performs no history updates.
+
+Real file traces under a fixed 4 MiB quota saved 23.17% of SSD reads on a hot-set
+plus scan workload, 0.24% on one skewed workload, and none on sequential/uniform
+cycles. A changing hot set incurred 7.64% more reads. This tradeoff is why the
+option is not enabled by default or in saved profiles.
+
+The [validation artifact](benchmarks/moe-expert-reuse-20261027.json) records
+small-test results, controls and payload hashes. Component measurements are not
+large-model tokens/s measurements. No large model was loaded or downloaded.
+
+The final small suite includes 23 CTest components, 44 server cases, legacy and
+pooled RAM tests, a CPU-only HTTP smoke and 24 CUDA synthetic-model comparisons.
+The latter include serial/batched controls and actual expert-major execution
+under fixed cache pressure. Every approved comparison retains the existing
+0.0002 scaled-logit tolerance and agrees on top-1 at all nine output positions.
+In the fixed-cache Qwen3MoE test, total recorded H2D bytes decrease from 9,526,896
+to 3,733,104; the Gemma4 test decreases from 6,475,344 to 2,788,944. The same
+fixtures with a cache large enough for their expert union retain the old path.
+
+An additional diagnostic forced MXFP4 into a 32 KiB cache with auto-sizing off.
+It exceeds the resident-reference tolerance equally with expert-major enabled
+and disabled (scaled error 0.0117443). The legacy executor changes from MMQ to
+MMVQ, whose Q8 activation scales use different precision. This is recorded as an
+unresolved baseline numerical limitation, not counted among passing cases and
+not addressed by relaxing tolerance. Its normally auto-sized cases pass.
+Linux portability was reviewed statically; this round ran Windows tests only.

@@ -1,0 +1,1937 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4305ac6..1f01757 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -361,7 +361,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+-            if (!dp.drafting) {
++            if (!dp.drafting || common_speculative_draft_limit(params.n_max, dp.n_max) == 0) {
+                 continue;
+             }
+ 
+@@ -385,6 +385,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+             batch.add(dp.id_last, dp.pos0, seq_id, true);
+         }
+ 
++        if (n_drafting == 0) {
++            return;
++        }
++
+         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+         if (ret != 0) {
+             SPC_ERR("llama_process returned %d\n", ret);
+@@ -438,8 +442,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if ((params.n_max <= (int) result.size()) ||
+-                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
++                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                    llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -812,7 +816,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+-            if (!dp.drafting) {
++            if (!dp.drafting || common_speculative_draft_limit(params.n_max, dp.n_max) == 0) {
+                 continue;
+             }
+             if (pending_pos_last[seq_id] < 0) {
+@@ -854,8 +858,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+                 auto * smpl = smpls[seq_id].get();
+ 
+                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
+-                // pre-norm hidden state of this position becomes g_embd for the next step
+-                const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
++                const int32_t sampled_batch = i_batch;
+                 ++i_batch;
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+@@ -884,12 +887,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                    llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+                 }
+ 
++                // Read the next-step state only when another forward pass is actually needed.
++                const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, sampled_batch);
+                 const int32_t idx = batch.add(id, pending_pos_last[seq_id] + (i + 1), seq_id, true);
+                 batch.set_embd(idx, { prenorm, 1, (size_t) n_embd_dec });
+             }
+@@ -1760,7 +1766,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+-            if (!dp.drafting) {
++            if (!dp.drafting || common_speculative_draft_limit(params.n_max, dp.n_max) == 0) {
+                 continue;
+             }
+ 
+@@ -1829,7 +1835,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * smpl = smpls[seq_id].get();
+ 
+                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+@@ -1861,12 +1866,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if (result.size() >= size_t(common_speculative_draft_limit(params.n_max, dp.n_max)) ||
++                    llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+                 }
+ 
++                // Final proposals need no state download: the verifier supplies the accepted state.
++                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+@@ -2497,6 +2505,10 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
+     return result;
+ }
+ 
++int32_t common_speculative_draft_limit(int32_t maximum, int32_t requested) {
++    return std::max(0, requested < 0 ? maximum : std::min(maximum, requested));
++}
++
+ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+     int32_t n_max = 0;
+ 
+@@ -2983,11 +2995,22 @@ void common_speculative_draft(common_speculative * spec) {
+         int n_drafting = 0;
+ 
+         for (auto & dp : dparams) {
+-            GGML_ASSERT(!dp.drafting || dp.result->empty());
+-
+-            if (dp.drafting) {
+-                n_drafting++;
++            if (!dp.drafting) {
++                continue;
+             }
++            GGML_ASSERT(dp.result);
++            // Do not enter a drafter just to truncate its work to zero afterwards.
++            // Inactive sequences can hold checkpoint/replay results, so clear only an
++            // explicitly requested zero-width draft, never their retained state.
++            if (dp.n_max == 0) {
++                dp.result->clear();
++                if (dp.result_q) { dp.result_q->clear(); }
++                dp.drafting = false;
++                continue;
++            }
++            GGML_ASSERT(dp.result->empty());
++            if (dp.result_q) { dp.result_q->clear(); }
++            n_drafting++;
+         }
+ 
+         if (n_drafting == 0) {
+@@ -3043,6 +3066,9 @@ void common_speculative_draft(common_speculative * spec) {
+             }
+ 
+             if (dp.drafting) {
++                // A failed implementation must not leak candidate distributions into
++                // a fallback lookup, whose proposals carry no draft probabilities.
++                if (dp.result_q) { dp.result_q->clear(); }
+                 n_drafting++;
+             }
+         }
+diff --git a/common/speculative.h b/common/speculative.h
+index 4262327..ff5512d 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -29,6 +29,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
+ // return the max number of draft tokens from the initialized implementations
+ int32_t common_speculative_n_max(const common_speculative * spec);
+ 
++// Resolve a sequence's draft budget before running its next forward pass.
++// A negative request keeps the implementation's maximum; zero disables drafting.
++int32_t common_speculative_draft_limit(int32_t maximum, int32_t requested);
++
+ // validate and resolve the unconditional synthetic acceptance rates
+ std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
+ 
+diff --git a/ggml/include/ggml-cuda-moe.h b/ggml/include/ggml-cuda-moe.h
+new file mode 100644
+index 0000000..db38718
+--- /dev/null
++++ b/ggml/include/ggml-cuda-moe.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Optional runtime-only registry extension "ggml_backend_cuda_moe_api".
++// Querying the real dispatcher avoids hard-coding a batch size that varies by
++// architecture and quantization. Zero means no usable quantized vector path.
++struct ggml_backend_cuda_moe_api {
++    uint32_t version;
++    int32_t (*mmvq_batch_limit)(ggml_backend_dev_t device, enum ggml_type type);
++};
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 37ace6b..7d597c0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1,6 +1,7 @@
+ #include "ggml-cuda.h"
+ #include "ggml-cuda-upload.h"
+ #include "ggml-cuda-host-op.h"
++#include "ggml-cuda-moe.h"
+ #include "ggml-cuda-kv-growth.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+@@ -6058,6 +6059,17 @@ struct ggml_backend_cuda_device_context {
+     int op_offload_min_batch_size;
+ };
+ 
++static int32_t ggml_cuda_moe_mmvq_batch_limit(ggml_backend_dev_t device, ggml_type type) {
++    if (!device || ggml_backend_dev_backend_reg(device)!=ggml_backend_cuda_reg() ||
++        int(type)<0 || int(type)>=GGML_TYPE_COUNT || !ggml_is_quantized(type)) { return 0; }
++    const auto * context=static_cast<const ggml_backend_cuda_device_context *>(device->context);
++    const auto & info=ggml_cuda_info();
++    if (!context || context->device<0 || context->device>=info.device_count) { return 0; }
++    return get_mmvq_mmid_max_batch(type,info.devices[context->device].cc);
++}
++
++static const ggml_backend_cuda_moe_api ggml_cuda_moe_api {1,ggml_cuda_moe_mmvq_batch_limit};
++
+ bool ggml_backend_cuda_set_memory_limit(ggml_backend_dev_t device, size_t limit_bytes, bool enabled) {
+     if (!device || ggml_backend_dev_backend_reg(device) != ggml_backend_cuda_reg()) { return false; }
+     if (enabled && ggml_cuda_unified_memory_enabled()) {
+@@ -6927,6 +6939,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name,"ggml_backend_cuda_moe_api")==0) {
++        return const_cast<ggml_backend_cuda_moe_api *>(&ggml_cuda_moe_api);
++    }
+     if (strcmp(name, "ggml_backend_cuda_test_norm_silu_fusions") == 0) {
+         return (void *) ggml_backend_cuda_test_norm_silu_fusions;
+     }
+diff --git a/src/llama-model-ram-admission.h b/src/llama-model-ram-admission.h
+new file mode 100644
+index 0000000..3bb981c
+--- /dev/null
++++ b/src/llama-model-ram-admission.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++
++// History belongs to logical weight pages, including nonresident pages. It
++// survives eviction, so a reused expert need not start cold after every scan.
++// Aging is lazy: neither a reference nor an eviction walks the whole model.
++struct llama_model_ram_frequency {
++    uint64_t observations = 0;
++    uint64_t interval;
++    uint64_t stale_after;
++
++    explicit llama_model_ram_frequency(size_t capacity) : interval(
++        std::max<uint64_t>(1024, capacity > std::numeric_limits<uint64_t>::max()/16
++            ? std::numeric_limits<uint64_t>::max() : uint64_t(capacity)*16)),
++        stale_after(std::max<uint64_t>(64,capacity>std::numeric_limits<uint32_t>::max()/2
++            ? std::numeric_limits<uint32_t>::max()/2 : uint64_t(capacity)*2)) {}
++
++    uint32_t generation() const { return uint32_t(observations/interval); }
++    uint16_t estimate(uint16_t count,uint32_t stamp) const {
++        // The stamp stores the low reference clock, not a coarse generation:
++        // an old topic must stop blocking a new working set well before its
++        // once-large frequency would halve away. Modulo subtraction also
++        // follows nearby references across the 32-bit clock's wrap.
++        const uint32_t distance=uint32_t(observations)-stamp;
++        if (uint64_t(distance)>observations) { return 0; }
++        const uint64_t age=observations/interval-(observations-distance)/interval;
++        const uint16_t decayed=age>=16 ? 0 : uint16_t(count>>age);
++        return distance>stale_after ? std::min<uint16_t>(1,decayed) : decayed;
++    }
++    void observe(uint16_t & count,uint32_t & stamp) {
++        ++observations;
++        const uint16_t decayed=estimate(count,stamp);
++        count=decayed==std::numeric_limits<uint16_t>::max() ? decayed : uint16_t(decayed+1);
++        stamp=uint32_t(observations);
++    }
++};
++
++// Preserve the existing tier order and current-batch protection. Only when its
++// oldest eligible page has demonstrated reuse do we examine a bounded sample
++// for a colder page. Sequential one-use traffic therefore keeps its O(1)
++// selection. Ties keep the oldest candidate, retaining recency as the fallback.
++template<class Iterator,class Eligible,class Score>
++Iterator llama_model_ram_victim(Iterator first,Iterator end,Eligible eligible,Score score,
++                               bool adaptive,size_t scan_limit,size_t & probes) {
++    auto selected=end;
++    uint16_t best=std::numeric_limits<uint16_t>::max();
++    size_t candidates=0;
++    for (auto it=first;it!=end && probes<scan_limit;++it) {
++        ++probes;
++        if (!eligible(*it)) { continue; }
++        if (!adaptive) { return it; }
++        const uint16_t value=score(*it);
++        if (selected==end || value<best) { selected=it; best=value; }
++        if (best<=1 || ++candidates==64) { break; }
++    }
++    return selected;
++}
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+index 5ad2b0f..a10d38a 100644
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -2,6 +2,7 @@
+ #include "llama-model-ram-ready.h"
+ #include "llama-model-ram-pipeline.h"
+ #include "llama-model-ram-read-plan.h"
++#include "llama-model-ram-admission.h"
+ #include "llama-impl.h"
+ #include "llama-runtime-activity.h"
+ #include "llama-moe-runtime.h"
+@@ -229,11 +230,24 @@ struct llama_model_ram_cache::impl {
+         bool resident = false;
+         bool hot = false;
+         bool prefetched = false;
++        uint16_t frequency = 0;
+         uint64_t epoch = 0;
+         uint8_t * storage = nullptr;
+         uint32_t device_refs = 0;
++        uint32_t frequency_stamp = 0;
+         std::list<page *>::iterator position;
+     };
++    struct original_page_layout {
++        region * owner;
++        size_t index;
++        bool resident,hot,prefetched;
++        uint64_t epoch;
++        uint8_t * storage;
++        uint32_t device_refs;
++        std::list<page *>::iterator position;
++    };
++    static_assert(sizeof(page)==sizeof(original_page_layout),
++                  "RAM admission history must fit the existing page metadata padding");
+     struct region {
+         uint16_t file;
+         size_t offset, size, reserved;
+@@ -243,6 +257,7 @@ struct llama_model_ram_cache::impl {
+     };
+     size_t limit, resident = 0, peak = 0;
+     bool pooled = false;
++    bool frequency_admission = false;
+     uint8_t * arena = nullptr;
+     size_t arena_committed = 0;
+     std::vector<uint8_t *> free_slots;
+@@ -257,6 +272,7 @@ struct llama_model_ram_cache::impl {
+     std::vector<std::unique_ptr<region>> regions;
+     std::map<uintptr_t, region *> addresses;
+     std::list<page *> probation, protected_pages;
++    llama_model_ram_frequency frequency;
+     std::mutex compute_mutex;
+     std::string last_error;
+     uint8_t * staging = nullptr;
+@@ -292,7 +308,12 @@ struct llama_model_ram_cache::impl {
+     }
+ 
+     impl(size_t bytes, const llama_files & files, bool streaming) : limit(bytes / page_size * page_size),
+-            pooled(streaming && llama_moe_runtime::option("WILDLLAMA_MOE_RAM_POOL")) {
++            pooled(streaming && llama_moe_runtime::option("WILDLLAMA_MOE_RAM_POOL")),frequency(limit/page_size) {
++        // Experimental policy: unlike the established runtime components it
++        // requires an explicit opt-in. Cache it once so ordinary SLRU does not
++        // inspect the environment or update frequency history on each demand.
++        const char * admission_env=std::getenv("WILDLLAMA_MOE_RAM_ADMISSION");
++        frequency_admission=pooled && admission_env && std::strcmp(admission_env,"1")==0;
+         if (!limit) { throw std::runtime_error("MoE RAM cache: limit is smaller than a cache page"); }
+ #ifdef _WIN32
+         if (!GetProcessWorkingSetSize(GetCurrentProcess(), &old_min, &old_max)) { throw std::runtime_error("MoE RAM cache: cannot query lock allowance"); }
+@@ -443,19 +464,23 @@ struct llama_model_ram_cache::impl {
+     }
+     void evict(size_t wanted) {
+         const bool cooperative = pooled && llama_moe_runtime::option("WILDLLAMA_MOE_COOPERATIVE_CACHE");
++        const bool adaptive = frequency_admission;
+         constexpr size_t hint_probe_limit = 64;
+         for (auto * queue : { &probation, &protected_pages }) {
+         // Device residency is a soft hint within an SLRU tier. Do not scan the
+         // entire cache, or discard protected pages while probation has a victim.
+         size_t hint_probes = 0;
+         for (int preference = 0; preference < (cooperative ? 2 : 1); ++preference) {
+-            for (auto it = queue->begin(); it != queue->end(); ++it) {
+-                if (cooperative && preference == 0) {
+-                    if (hint_probes == hint_probe_limit) { break; }
+-                    ++hint_probes;
+-                }
++                size_t probes=0;
++                const bool hinted=cooperative && preference==0;
++                auto it=llama_model_ram_victim(queue->begin(),queue->end(),
++                    [&](const page * p) { return p->epoch!=epoch && (!hinted || p->device_refs); },
++                    [&](const page * p) { return frequency.estimate(p->frequency,p->frequency_stamp); },
++                    adaptive,hinted ? hint_probe_limit : std::numeric_limits<size_t>::max(),probes);
++                if (hinted) { hint_probes=probes; }
++                if (it==queue->end()) { continue; }
+                 page * p = *it;
+-                if (p->epoch == epoch || (cooperative && preference == 0 && !p->device_refs)) { continue; }
++                const uint16_t victim_frequency=adaptive ? frequency.estimate(p->frequency,p->frequency_stamp) : 0;
+                 size_t n = 1;
+                 auto end = std::next(it);
+                 while (end != queue->end() && n * page_size < std::min(wanted, io_size)) {
+@@ -465,7 +490,8 @@ struct llama_model_ram_cache::impl {
+                     }
+                     page * next = *end;
+                     if (next->epoch == epoch || next->owner != p->owner || next->index != p->index + n ||
+-                        (cooperative && preference == 0 && !next->device_refs)) { break; }
++                        (cooperative && preference == 0 && !next->device_refs) ||
++                        (adaptive && frequency.estimate(next->frequency,next->frequency_stamp)>victim_frequency)) { break; }
+                     ++n; ++end;
+                 }
+                 const int64_t start = clock();
+@@ -481,7 +507,6 @@ struct llama_model_ram_cache::impl {
+                 queue->erase(it, end);
+                 if (!pooled) { resident -= n * page_size; }
+                 return;
+-            }
+         }
+         }
+         throw std::runtime_error("MoE RAM cache: required weights exceed the limit");
+@@ -530,7 +555,13 @@ struct llama_model_ram_cache::impl {
+         if (poisoned) { throw std::runtime_error("MoE RAM cache: unusable after failed page release"); }
+         if (needed.size() > limit / page_size) { throw std::runtime_error("MoE RAM cache: this operation needs more weight pages than the limit"); }
+         size_t missing = 0;
++        const bool adaptive = frequency_admission;
+         for (page * p : needed) {
++            // A prepared upload consuming its prefetch is one demand, not two.
++            // No new history storage is allocated on a miss or an eviction.
++            if (adaptive && (!p->resident || !p->prefetched || prefetch)) {
++                frequency.observe(p->frequency,p->frequency_stamp);
++            }
+             if (p->resident) {
+                 ++hits;
+                 if (!prefetch) {
+@@ -1072,5 +1103,89 @@ bool llama_model_ram_cache::copy(ggml_backend_t backend, const ggml_tensor * src
+     }
+     return true;
+ }
++bool llama_model_ram_cache::copy_rows(ggml_backend_t backend, const ggml_tensor * src,
++                                      ggml_tensor * dst, const int32_t * rows, size_t count) {
++    auto & p = *pimpl;
++    if (!backend || !src || !dst || !p.pooled || !contains(src) || contains(dst) ||
++        !device_tensor(dst) || !llama_moe_runtime::option("WILDLLAMA_MOE_PACK_ROWS")) { return false; }
++    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || src->type != dst->type ||
++        src->ne[2] != 1 || src->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
++        src->ne[0] != dst->ne[0] || size_t(dst->ne[1]) != count || src->nb[1] != dst->nb[1]) { return false; }
++    if (!count) { return true; }
++    const size_t row_bytes = src->nb[1], capacity = io_size/2;
++    if (!rows || !row_bytes || row_bytes > capacity || row_bytes != ggml_row_size(src->type,src->ne[0])) {
++        return false;
++    }
++    // Validate the complete gather before touching a device destination.
++    for (size_t i=0; i<count; ++i) {
++        if (rows[i] < 0 || rows[i] >= src->ne[1]) {
++            throw std::runtime_error("MoE RAM cache: invalid packed row index");
++        }
++    }
++    auto * upload = p.upload_buffer(backend);
++    if (!upload || !upload->queue) { return false; }
++    const auto * api = upload->api;
++    if (!api->begin(upload->queue,backend)) { throw std::runtime_error("MoE row upload: cannot begin batch"); }
++    struct queue_guard {
++        impl::upload_staging * upload;
++        bool complete = false;
++        ~queue_guard() { if (!complete) { upload->api->synchronize(upload->queue); } }
++    } guard {upload};
++    auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(upload->buffer.get()));
++    const size_t packet_rows = capacity/row_bytes;
++    std::vector<impl::page *> needed;
++    needed.reserve(std::min(p.limit/page_size,packet_rows*2));
++    const int64_t started = p.clock();
++    for (size_t first=0; first<count;) {
++        const size_t packet = std::min(packet_rows,count-first);
++        const unsigned slot = unsigned(upload->next_slot);
++        const int64_t wait = p.clock();
++        if (!api->wait_host(upload->queue,slot)) { throw std::runtime_error("MoE row upload: source-slot wait failed"); }
++        ++p.h2d_slot_waits; p.elapsed(wait,p.h2d_wait_us);
++        auto * target = data+slot*capacity;
++        for (size_t at=0; at<packet;) {
++            ++p.epoch;
++            needed.clear();
++            size_t group = 0;
++            while (at+group<packet) {
++                const size_t before = needed.size();
++                p.range(needed,src,size_t(rows[first+at+group])*row_bytes,row_bytes);
++                if (needed.size()>p.limit/page_size) {
++                    // Only this rejected row introduced these epoch marks.
++                    // Release them before selecting victims for the admitted
++                    // prefix; the row will be reconsidered in the next group.
++                    for (size_t i=before; i<needed.size(); ++i) { needed[i]->epoch=0; }
++                    needed.resize(before);
++                    break;
++                }
++                ++group;
++            }
++            if (!group) {
++                // A single row can straddle more pages than a very small quota.
++                // read() preserves the original chunked source addressing.
++                read(src,size_t(rows[first+at])*row_bytes,target+at*row_bytes,row_bytes);
++                group=1;
++            } else {
++                p.ensure(needed);
++                const int64_t copied = p.clock();
++                for (size_t i=0; i<group; ++i) {
++                    p.copy_out(src,size_t(rows[first+at+i])*row_bytes,target+(at+i)*row_bytes,row_bytes);
++                }
++                p.elapsed(copied,p.host_copy_us);
++            }
++            at += group;
++        }
++        if (!api->copy(upload->queue,dst,target,first*row_bytes,packet*row_bytes) ||
++            !api->record(upload->queue,slot)) { throw std::runtime_error("MoE row upload: transfer failed"); }
++        p.uploaded(true,packet*row_bytes);
++        upload->next_slot ^= 1;
++        first += packet;
++    }
++    if (!api->end(upload->queue,backend)) { throw std::runtime_error("MoE row upload: incomplete batch"); }
++    guard.complete = true;
++    p.elapsed(started,p.h2d_us);
++    llama_runtime_activity::ram(p.resident,p.limit,p.bytes_read,p.h2d_bytes);
++    return true;
++}
+ std::unique_lock<std::mutex> llama_model_ram_cache::acquire() { return std::unique_lock<std::mutex>(pimpl->compute_mutex); }
+ const char * llama_model_ram_cache::error() const { return pimpl->last_error.c_str(); }
+diff --git a/src/llama-model-ram.h b/src/llama-model-ram.h
+index f4bc8bf..846cc0d 100644
+--- a/src/llama-model-ram.h
++++ b/src/llama-model-ram.h
+@@ -43,6 +43,10 @@ public:
+     bool prepare(ggml_tensor * node);
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size);
+     bool copy_batch(ggml_backend_t backend, const std::vector<llama_model_ram_copy> & copies);
++    // Gather original quantized rows in caller order into the existing upload
++    // ring. Source pages may be processed in quota-bounded groups. Caller holds
++    // acquire(); unsupported backends/layouts return false before any upload.
++    bool copy_rows(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const int32_t * rows, size_t count);
+     bool prefetch(const std::vector<llama_model_ram_range> & ranges);
+     void device_residency(const ggml_tensor * tensor, size_t offset, size_t size, bool resident);
+     void load_device_tensor(ggml_tensor * tensor, uint16_t file, size_t offset);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index da50b84..4826878 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -6,6 +6,8 @@
+ #include "llama-moe-partition.h"
+ #include "llama-moe-copy-plan.h"
+ #include "llama-moe-work-batch.h"
++#include "llama-moe-expert-plan.h"
++#include "llama-moe-expert-graph.h"
+ #include "ggml-cuda-host-op.h"
+ 
+ #include "llama-impl.h"
+@@ -901,14 +903,18 @@ struct llama_moe_cache::impl {
+                     ggml_backend_tensor_get_async(backend,tokens,token_ids.data(),0,token_ids.size()*sizeof(int32_t));
+                     ggml_backend_synchronize(backend);
+                 } else { ggml_backend_tensor_get(tokens,token_ids.data(),0,token_ids.size()*sizeof(int32_t)); }
+-                std::vector<llama_model_ram_copy> copies;
+-                for (size_t i = 0; i < token_ids.size(); ++i) {
+-                    if (token_ids[i] < 0 || token_ids[i] >= w->ne[1]) { throw std::runtime_error("gpu-exclusive: invalid selected host row ID"); }
+-                    copies.push_back({ w, dst, token_ids[i] * w->nb[1], i * dst->nb[1], w->nb[1] });
+-                }
+-                bool copied = model.ram_cache && model.ram_cache->contains(w) && model.ram_cache->copy_batch(backend, copies);
++                bool copied = model.ram_cache && model.ram_cache->contains(w) &&
++                    model.ram_cache->copy_rows(backend,w,dst,token_ids.data(),token_ids.size());
+                 if (!copied) {
++                    std::vector<llama_model_ram_copy> copies;
++                    copies.reserve(token_ids.size());
++                    for (size_t i = 0; i < token_ids.size(); ++i) {
++                        if (token_ids[i] < 0 || token_ids[i] >= w->ne[1]) { throw std::runtime_error("gpu-exclusive: invalid selected host row ID"); }
++                        copies.push_back({ w, dst, token_ids[i] * w->nb[1], i * dst->nb[1], w->nb[1] });
++                    }
++                    copied = model.ram_cache && model.ram_cache->contains(w) && model.ram_cache->copy_batch(backend, copies);
+                     for (const auto & c : copies) {
++                        if (copied) { break; }
+                         if (model.ram_cache && model.ram_cache->contains(w)) {
+                             model.ram_cache->copy(backend, w, dst, c.src_offset, c.dst_offset, c.size);
+                         } else {
+diff --git a/src/llama-moe-executor.inl b/src/llama-moe-executor.inl
+index 552a5ff..0a96d8b 100644
+--- a/src/llama-moe-executor.inl
++++ b/src/llama-moe-executor.inl
+@@ -11,6 +11,8 @@
+         std::vector<llama_moe_partition::window> windows;
+         size_t capacity = 0;
+         size_t expert_count = 0;
++        llama_moe_expert_plan::plan expert_major;
++        bool expert_major_ready = false;
+     };
+     std::unordered_map<const ggml_tensor *, executor_route> executor_routes;
+     struct executor_work {
+@@ -156,6 +158,108 @@
+         return false;
+     }
+ 
++    bool executor_compute_expert_major(const ggml_tensor * input, ggml_tensor * output, const ggml_tensor * weight,
++                                      const std::vector<llama_moe_cache::tile> & tiles, executor_route & route,
++                                      size_t k, size_t tokens) {
++        if (tokens < 32 || !ggml_is_quantized(weight->type) ||
++            !llama_moe_runtime::option("WILDLLAMA_MOE_EXPERT_MAJOR") ||
++            !llama_moe_expert_graph::geometry(input,output,k,tokens)) { return false; }
++        const size_t kernel_capacity=llama_moe_expert_graph::vector_batch_limit(executor_backend.get(),weight->type);
++        if (!kernel_capacity) { return false; }
++        // Reordering must not silently replace vector quantization with
++        // the matrix kernel's different activation/rounding contract.
++        for (const auto & window:route.windows) {
++            if (window.tokens>kernel_capacity) { return false; }
++        }
++        if (!route.expert_major_ready) {
++            route.expert_major=llama_moe_expert_plan::make(route.ids.data(),tokens,k,route.capacity,
++                route.expert_count,route.windows);
++            route.expert_major_ready=true;
++        }
++        const auto & plan=route.expert_major;
++        if (!plan.profitable) { return false; }
++        const size_t alignment=ggml_backend_buft_get_alignment(devices[0].buft);
++        std::vector<size_t> capacities;
++        capacities.reserve(tiles.size());
++        size_t work_count=0;
++        for (const auto & tile:tiles) {
++            const size_t maximum=std::min(kernel_capacity,llama_moe_expert_graph::entry_capacity(size_t(input->ne[0]),size_t(tile.rows),
++                route.ids.size(),alignment,executor_workspace_size));
++            if (!maximum) { return false; }
++            capacities.push_back(maximum);
++            for (const auto & group:plan.groups) {
++                work_count=executor_sum(work_count,(group.entry_count+maximum-1)/maximum);
++            }
++        }
++        // Tiny row tiles may leave too little existing scratch for gathering.
++        // Do not multiply kernel launches merely to save expert upload calls.
++        if (work_count>executor_product(executor_product(route.windows.size(),tiles.size()),2)) { return false; }
++        const size_t batch_limit=llama_moe_runtime::option("WILDLLAMA_MOE_EXECUTOR_BATCH") ? 4 : 1;
++        llama_moe_work_batch<llama_moe_expert_graph::work> pending(batch_limit);
++        auto synchronize=[&] { ggml_backend_synchronize(executor_backend.get()); };
++        const uint64_t uploaded_before=stream_stats.h2d_bytes;
++        try {
++            for (const auto & selected:plan.groups) {
++                ids.assign(plan.experts.begin()+selected.expert_begin,
++                    plan.experts.begin()+selected.expert_begin+selected.expert_count);
++                for (size_t ti=0; ti<tiles.size(); ++ti) {
++                    const auto & tile=tiles[ti];
++                    const auto binding=stream_maps.find(tile.slot_map);
++                    if (binding==stream_maps.end()) { throw std::runtime_error("expert-major cache binding is missing"); }
++                    prepare_stream_binding(executor_backend.get(),binding->second);
++                    const auto & group=stream_groups[binding->second.group];
++                    const int32_t * mapping=group.adaptive ? group.admission.slot_map[binding->second.key] :
++                        group.slru.slot_map[binding->second.key];
++                    for (size_t done=0; done<selected.entry_count;) {
++                        const size_t entries=std::min(capacities[ti],selected.entry_count-done);
++                        auto & item=pending.next(synchronize);
++                        item.input_rows.resize(entries); item.output_rows.resize(entries); item.slot_ids.resize(entries);
++                        for (size_t i=0; i<entries; ++i) {
++                            const int32_t entry=plan.entries[selected.entry_begin+done+i];
++                            item.output_rows[i]=entry;
++                            item.input_rows[i]=input->ne[1]==1 ? int32_t(size_t(entry)/k) : entry;
++                            item.slot_ids[i]=mapping[route.ids[size_t(entry)]];
++                        }
++                        auto graph=llama_moe_expert_graph::build(item,input,output,tile.weight,size_t(tile.row),
++                            size_t(tile.rows),k,tokens,executor_workspace.get());
++                        const auto precision=model.prec_policy.prec_src1.find(weight);
++                        if (precision!=model.prec_policy.prec_src1.end()) { ggml_prec_set_src(graph.part,precision->second,1); }
++                        if (weight->type==GGML_TYPE_NVFP4) { ggml_prec_set_acc(graph.part,GGML_PREC_BF16); }
++                        if (!ggml_backend_supports_op(executor_backend.get(),graph.gather) ||
++                            !ggml_backend_supports_op(executor_backend.get(),graph.part) ||
++                            !ggml_backend_supports_op(executor_backend.get(),graph.scatter)) {
++                            pending.flush(synchronize);
++                            return false; // the original token-major provider overwrites every output row
++                        }
++                        ggml_backend_tensor_set_async(executor_backend.get(),graph.input_ids,item.input_rows.data(),0,entries*sizeof(int32_t));
++                        ggml_backend_tensor_set_async(executor_backend.get(),graph.slots,item.slot_ids.data(),0,entries*sizeof(int32_t));
++                        ggml_backend_tensor_set_async(executor_backend.get(),graph.output_ids,item.output_rows.data(),0,entries*sizeof(int32_t));
++                        if (ggml_backend_graph_compute_async(executor_backend.get(),graph.value)!=GGML_STATUS_SUCCESS) {
++                            throw std::runtime_error("expert-major CUDA execution failed");
++                        }
++                        done+=entries;
++                    }
++                }
++            }
++            pending.flush(synchronize);
++        } catch (...) {
++            pending.flush(synchronize);
++            throw;
++        }
++        static const bool trace=[] {
++            const char * value=std::getenv("WILDLLAMA_MOE_EXPERT_MAJOR_TRACE");
++            return value && std::strcmp(value,"1")==0;
++        }();
++        if (trace) {
++            LLAMA_LOG_INFO("expert_major: layer=%d tokens=%zu entries=%zu windows=%zu window_unique=%zu "
++                "experts=%zu work=%zu scratch=%zu h2d_bytes=%llu\n",
++                llama_runtime_activity::layer(weight->name),tokens,route.ids.size(),route.windows.size(),plan.window_uploads,
++                plan.experts.size(),work_count,executor_workspace_size,
++                (unsigned long long)(stream_stats.h2d_bytes-uploaded_before));
++        }
++        return true;
++    }
++
+     bool executor_compute(ggml_backend_dev_t device, ggml_tensor * output, const ggml_tensor * weight) {
+         std::lock_guard<std::mutex> guard(executor_mutex);
+         if (!executor_backend || !executor_workspace || device != ggml_backend_get_device(executor_backend.get()) ||
+@@ -184,7 +288,7 @@
+             std::vector<int32_t> actual(count);
+             ggml_backend_tensor_get_2d(selected, actual.data(), 0, k * sizeof(int32_t), tokens,
+                                       selected->nb[1], k * sizeof(int32_t));
+-            route = executor_routes.emplace(selected, executor_route{std::move(actual), {}, 0, 0}).first;
++            route = executor_routes.emplace(selected, executor_route{std::move(actual), {}, 0, 0, {}, false}).first;
+             if (llama_expert_trace::enabled()) {
+                 uint64_t bytes = 0;
+                 if (layer >= 0 && layer < int(model.layers.size())) {
+@@ -199,7 +303,9 @@
+             route_plan.windows = llama_moe_partition::plan(route_plan.ids.data(), tokens, k, capacity, size_t(weight->ne[2]));
+             route_plan.capacity = capacity;
+             route_plan.expert_count = size_t(weight->ne[2]);
++            route_plan.expert_major_ready = false;
+         }
++        if (executor_compute_expert_major(input,output,weight,weight_tiles->second,route_plan,k,tokens)) { return true; }
+         // The child backend keeps one ordered stream. Uploads fence previous
+         // consumers before reusing a bank. Retain each graph and its own source
+         // IDs until a bounded drain, rather than waiting after every row tile.
+diff --git a/src/llama-moe-expert-graph.h b/src/llama-moe-expert-graph.h
+new file mode 100644
+index 0000000..1576199
+--- /dev/null
++++ b/src/llama-moe-expert-graph.h
+@@ -0,0 +1,153 @@
++#pragma once
++
++#include "ggml-cpp.h"
++#include "ggml-cuda-moe.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace llama_moe_expert_graph {
++inline size_t vector_batch_limit(ggml_backend_t backend, ggml_type type) {
++    if (!backend || !ggml_is_quantized(type)) { return 0; }
++    auto * device=ggml_backend_get_device(backend);
++    const auto * api=static_cast<const ggml_backend_cuda_moe_api *>(ggml_backend_reg_get_proc_address(
++        ggml_backend_dev_backend_reg(device),"ggml_backend_cuda_moe_api"));
++    if (!api || api->version!=1 || !api->mmvq_batch_limit) { return 0; }
++    const int32_t limit=api->mmvq_batch_limit(device,type);
++    return limit>0 ? size_t(limit) : 0;
++}
++inline size_t sum(size_t a, size_t b) {
++    if (b>std::numeric_limits<size_t>::max()-a) { throw std::length_error("expert-major workspace sum overflow"); }
++    return a+b;
++}
++inline size_t product(size_t a, size_t b) {
++    if (b && a>std::numeric_limits<size_t>::max()/b) { throw std::length_error("expert-major workspace product overflow"); }
++    return a*b;
++}
++inline size_t align(size_t bytes, size_t alignment) {
++    if (!alignment) { throw std::invalid_argument("expert-major workspace alignment is zero"); }
++    return bytes%alignment ? sum(bytes,alignment-bytes%alignment) : bytes;
++}
++struct layout {
++    size_t part=0, input_ids=0, slot_ids=0, output_ids=0, bytes=0;
++};
++inline layout carve(size_t input_rows, size_t output_rows, size_t entries, size_t alignment) {
++    layout result;
++    result.part=align(product(product(input_rows,entries),sizeof(float)),alignment);
++    result.input_ids=align(sum(result.part,product(product(output_rows,entries),sizeof(float))),alignment);
++    const size_t ids=product(entries,sizeof(int32_t));
++    result.slot_ids=align(sum(result.input_ids,ids),alignment);
++    result.output_ids=align(sum(result.slot_ids,ids),alignment);
++    result.bytes=align(sum(result.output_ids,ids),alignment);
++    return result;
++}
++inline size_t entry_capacity(size_t input_rows, size_t output_rows, size_t entries,
++                             size_t alignment, size_t available) {
++    if (!input_rows || !output_rows || !entries || !alignment) { return 0; }
++    size_t lo=0, hi=std::min(entries,size_t(std::numeric_limits<int32_t>::max()));
++    while (lo<hi) {
++        const size_t middle=lo+(hi-lo+1)/2;
++        if (carve(input_rows,output_rows,middle,alignment).bytes<=available) { lo=middle; }
++        else { hi=middle-1; }
++    }
++    return lo;
++}
++struct work {
++    ggml_context_ptr ctx;
++    std::vector<int32_t> input_rows, slot_ids, output_rows;
++};
++struct graph {
++    ggml_cgraph * value=nullptr;
++    ggml_tensor * gather=nullptr, * part=nullptr, * scatter=nullptr;
++    ggml_tensor * input_ids=nullptr, * slots=nullptr, * output_ids=nullptr;
++};
++
++inline bool geometry(const ggml_tensor * input, const ggml_tensor * output, size_t k, size_t tokens) {
++    return input && output && k && tokens && input->type==GGML_TYPE_F32 && output->type==GGML_TYPE_F32 &&
++           input->ne[0]>0 && input->ne[2]==int64_t(tokens) && input->ne[3]==1 &&
++           (input->ne[1]==1 || input->ne[1]==int64_t(k)) && input->nb[0]==sizeof(float) &&
++           (input->ne[1]==1 || input->nb[2]==input->nb[1]*k) &&
++           output->ne[1]==int64_t(k) && output->ne[2]==int64_t(tokens) && output->ne[3]==1 &&
++           output->nb[0]==sizeof(float) && output->nb[2]==output->nb[1]*k &&
++           tokens<=size_t(std::numeric_limits<int32_t>::max())/k;
++}
++inline ggml_tensor * alias(ggml_context * ctx, const ggml_tensor * source) {
++    auto * buffer=source->buffer;
++    for (const ggml_tensor * root=source; !buffer && root->view_src;) { root=root->view_src; buffer=root->buffer; }
++    if (!buffer || !source->data) { throw std::runtime_error("expert-major tensor is not allocated"); }
++    auto * result=ggml_new_tensor_4d(ctx,source->type,source->ne[0],source->ne[1],source->ne[2],source->ne[3]);
++    std::memcpy(result->nb,source->nb,sizeof(result->nb));
++    result->buffer=buffer; result->data=source->data; result->extra=source->extra;
++    return result;
++}
++inline void view(ggml_tensor * tensor) {
++    if (ggml_backend_view_init(tensor)!=GGML_STATUS_SUCCESS) { throw std::runtime_error("expert-major view initialization failed"); }
++}
++inline void allocate(ggml_backend_buffer_t workspace, ggml_tensor * tensor, size_t offset) {
++    auto * bytes=static_cast<uint8_t *>(ggml_backend_buffer_get_base(workspace));
++    if (ggml_backend_tensor_alloc(workspace,tensor,bytes+offset)!=GGML_STATUS_SUCCESS) {
++        throw std::runtime_error("expert-major bounded workspace allocation failed");
++    }
++}
++
++// All async host index arrays belong to `item`. The caller retains it through
++// its stream fence. The workspace is the EXISTING dynamic-prefill reservation;
++// no tensor allocator or extra device buffer is used here.
++inline graph build(work & item, const ggml_tensor * input, ggml_tensor * output,
++                   const ggml_tensor * weight, size_t output_row, size_t rows,
++                   size_t k, size_t tokens, ggml_backend_buffer_t workspace) {
++    const size_t entries=item.slot_ids.size();
++    if (!entries || item.input_rows.size()!=entries || item.output_rows.size()!=entries ||
++        !geometry(input,output,k,tokens) || !workspace || !weight || weight->ne[0]!=input->ne[0] ||
++        weight->ne[1]!=int64_t(rows) || output_row>size_t(output->ne[0]) || rows>size_t(output->ne[0])-output_row) {
++        throw std::invalid_argument("invalid expert-major graph geometry");
++    }
++    const size_t source_rows=input->ne[1]==1 ? tokens : product(tokens,k);
++    for (size_t entry=0; entry<entries; ++entry) {
++        if (item.input_rows[entry]<0 || size_t(item.input_rows[entry])>=source_rows ||
++            item.output_rows[entry]<0 || size_t(item.output_rows[entry])>=product(tokens,k) ||
++            item.slot_ids[entry]<0 || item.slot_ids[entry]>=weight->ne[2]) {
++            throw std::invalid_argument("expert-major graph contains an out-of-range index");
++        }
++    }
++    const size_t alignment=ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(workspace));
++    const auto area=carve(size_t(input->ne[0]),rows,entries,alignment);
++    if (area.bytes>ggml_backend_buffer_get_size(workspace)) { throw std::length_error("expert-major graph exceeds existing workspace"); }
++    item.ctx.reset(ggml_init({32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false),nullptr,true}));
++    auto * ctx=item.ctx.get();
++    if (!ctx) { throw std::runtime_error("expert-major metadata allocation failed"); }
++    auto * source=alias(ctx,input);
++    auto * target=alias(ctx,output);
++    auto * bank=alias(ctx,weight);
++    auto * source_view=ggml_view_2d(ctx,source,input->ne[0],int64_t(source_rows),
++        input->ne[1]==1 ? input->nb[2] : input->nb[1],0);
++    view(source_view);
++    graph result;
++    result.input_ids=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,int64_t(entries));
++    result.slots=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,1,int64_t(entries));
++    result.output_ids=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,int64_t(entries));
++    allocate(workspace,result.input_ids,area.input_ids);
++    allocate(workspace,result.slots,area.slot_ids);
++    allocate(workspace,result.output_ids,area.output_ids);
++    result.gather=ggml_get_rows(ctx,source_view,result.input_ids);
++    allocate(workspace,result.gather,0);
++    auto * inputs=ggml_reshape_3d(ctx,result.gather,input->ne[0],1,int64_t(entries));
++    view(inputs);
++    result.part=ggml_mul_mat_id(ctx,bank,inputs,result.slots);
++    allocate(workspace,result.part,area.part);
++    auto * values=ggml_reshape_2d(ctx,result.part,int64_t(rows),int64_t(entries));
++    view(values);
++    auto * destination=ggml_view_2d(ctx,target,int64_t(rows),int64_t(product(tokens,k)),output->nb[1],output_row*sizeof(float));
++    view(destination);
++    result.scatter=ggml_set_rows(ctx,destination,values,result.output_ids);
++    view(result.scatter);
++    result.value=ggml_new_graph_custom(ctx,32,false);
++    ggml_build_forward_expand(result.value,result.scatter);
++    return result;
++}
++}
+diff --git a/src/llama-moe-expert-plan.h b/src/llama-moe-expert-plan.h
+new file mode 100644
+index 0000000..23eeb5e
+--- /dev/null
++++ b/src/llama-moe-expert-plan.h
+@@ -0,0 +1,72 @@
++#pragma once
++
++#include "llama-moe-partition.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace llama_moe_expert_plan {
++struct group {
++    size_t expert_begin = 0, expert_count = 0;
++    size_t entry_begin = 0, entry_count = 0;
++};
++struct plan {
++    // Stable routed-entry permutation. The destination is ALWAYS the original
++    // rank/token row, so no reduction order or selected expert is changed.
++    std::vector<int32_t> entries;
++    std::vector<int32_t> experts;
++    std::vector<group> groups;
++    size_t window_uploads = 0;
++    bool profitable = false;
++};
++
++inline plan make(const int32_t * ids, size_t tokens, size_t k, size_t capacity,
++                 size_t expert_count, const std::vector<llama_moe_partition::window> & windows) {
++    plan result;
++    if (!capacity || !expert_count || !k || (tokens && !ids) ||
++        tokens > size_t(std::numeric_limits<int32_t>::max()) / k ||
++        expert_count > size_t(std::numeric_limits<int32_t>::max())) {
++        throw std::invalid_argument("invalid expert-major route dimensions");
++    }
++    const size_t count = tokens*k;
++    std::vector<size_t> offsets(expert_count+1,0);
++    for (size_t entry=0; entry<count; ++entry) {
++        if (ids[entry]<0 || size_t(ids[entry])>=expert_count) {
++            throw std::invalid_argument("invalid expert-major routed expert");
++        }
++        ++offsets[size_t(ids[entry])+1];
++    }
++    for (size_t expert=0; expert<expert_count; ++expert) {
++        if (offsets[expert+1]) { result.experts.push_back(int32_t(expert)); }
++        offsets[expert+1]+=offsets[expert];
++    }
++    for (const auto & window:windows) {
++        if (window.unique > std::numeric_limits<size_t>::max()-result.window_uploads) {
++            throw std::length_error("expert-major traffic estimate overflow");
++        }
++        result.window_uploads+=window.unique;
++    }
++    // Reordering has gather/scatter costs. Leave short windows, an expert union
++    // that fits, and low repetition on the original token-major path. This is
++    // an upload estimate, not a prediction of wall time or actual cache hits.
++    result.profitable = tokens>=32 && result.experts.size()>capacity &&
++                        result.window_uploads/result.experts.size()>=2;
++    if (!result.profitable) { return result; }
++    result.entries.resize(count);
++    auto cursor=offsets;
++    for (size_t entry=0; entry<count; ++entry) {
++        result.entries[cursor[size_t(ids[entry])]++]=int32_t(entry);
++    }
++    for (size_t begin=0; begin<result.experts.size(); begin+=capacity) {
++        const size_t end=std::min(begin+capacity,result.experts.size());
++        const size_t first=offsets[size_t(result.experts[begin])];
++        const size_t last=offsets[size_t(result.experts[end-1])+1];
++        result.groups.push_back({begin,end-begin,first,last-first});
++    }
++    return result;
++}
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 560bb24..2a08f66 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -165,6 +165,18 @@ if (NOT WIN32)
+ endif()
+ 
+ llama_build_and_test(test-moe-work-batch.cpp LABEL "main behavior" LINK ggml)
++llama_build_and_test(test-speculative-depth.cpp LABEL "main behavior")
++if (TARGET ggml-cpu)
++    add_dependencies(test-speculative-depth ggml-cpu)
++    target_compile_definitions(test-speculative-depth PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++endif()
++llama_build_and_test(test-moe-expert-plan.cpp LABEL "main behavior" LINK ggml)
++llama_build(test-moe-ram-admission.cpp LINK llama)
++target_sources(test-moe-ram-admission PRIVATE ../src/llama-model-ram.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
++llama_test(test-moe-ram-admission ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-ram-admission-fixtures LABEL "main behavior")
++llama_build(test-moe-packed-rows.cpp LINK llama)
++target_sources(test-moe-packed-rows PRIVATE ../src/llama-model-ram.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
++llama_test(test-moe-packed-rows ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-packed-row-fixtures LABEL "main behavior")
+ llama_build(test-moe-read-plan.cpp LINK llama)
+ target_sources(test-moe-read-plan PRIVATE ../src/llama-model-ram.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
+ llama_test(test-moe-read-plan ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-read-plan-fixtures LABEL "main behavior")
+@@ -173,6 +185,9 @@ target_sources(test-moe-copy-plan PRIVATE ../src/llama-model-ram.cpp ../src/llam
+ llama_test(test-moe-copy-plan ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-copy-plan-fixtures LABEL "main behavior")
+ if (GGML_CUDA)
+     llama_test(test-moe-work-batch NAME test-moe-work-batch-cuda ARGS --gpu LABEL "backend cuda")
++    llama_test(test-moe-packed-rows NAME test-moe-packed-rows-cuda ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-packed-row-fixtures --gpu LABEL "backend cuda")
++    llama_test(test-moe-expert-plan NAME test-moe-expert-plan-cuda ARGS --gpu LABEL "backend cuda")
++    set_tests_properties(test-moe-packed-rows-cuda test-moe-expert-plan-cuda PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+     llama_test(test-moe-copy-plan NAME test-moe-copy-plan-cuda ARGS ${CMAKE_CURRENT_BINARY_DIR}/moe-copy-plan-fixtures --gpu LABEL "backend cuda")
+     set_tests_properties(test-moe-work-batch-cuda test-moe-copy-plan-cuda PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+ endif()
+diff --git a/tests/test-moe-expert-plan.cpp b/tests/test-moe-expert-plan.cpp
+new file mode 100644
+index 0000000..cc40679
+--- /dev/null
++++ b/tests/test-moe-expert-plan.cpp
+@@ -0,0 +1,318 @@
++#include "../src/llama-moe-expert-plan.h"
++#include "../src/llama-moe-expert-graph.h"
++#include "../src/llama-moe-work-batch.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++void require(bool value,const char * message) { if (!value) { throw std::runtime_error(message); } }
++template<class Function> void rejects(Function function) {
++    bool failed=false;
++    try { function(); } catch (const std::exception &) { failed=true; }
++    require(failed,"invalid expert-major input was accepted");
++}
++
++void planner() {
++    std::mt19937 random(20261027);
++    for (size_t trial=0; trial<500; ++trial) {
++        const size_t tokens=32+random()%257, k=1+random()%7, experts=1+random()%64;
++        const size_t capacity=std::max(k,size_t(1+random()%experts));
++        std::vector<int32_t> ids(tokens*k);
++        for (auto & id:ids) { id=int32_t(random()%experts); }
++        const auto original=ids;
++        const auto windows=llama_moe_partition::plan(ids.data(),tokens,k,capacity,experts);
++        const auto plan=llama_moe_expert_plan::make(ids.data(),tokens,k,capacity,experts,windows);
++        require(ids==original,"expert-major planning changed routing IDs");
++        if (!plan.profitable) { continue; }
++        std::vector<unsigned> seen(ids.size());
++        size_t total=0, next=0;
++        for (const auto & group:plan.groups) {
++            require(group.expert_count<=capacity && group.entry_begin==next,"expert-major group exceeded cache or skipped output rows");
++            const auto first=plan.experts.begin()+group.expert_begin;
++            const auto end=first+group.expert_count;
++            for (size_t at=group.entry_begin; at<group.entry_begin+group.entry_count; ++at) {
++                const int32_t entry=plan.entries[at];
++                require(entry>=0 && size_t(entry)<ids.size() && ++seen[size_t(entry)]==1,"expert-major output row repeated");
++                require(std::find(first,end,ids[size_t(entry)])!=end,"group does not own its routed expert");
++                if (at>group.entry_begin && ids[size_t(entry)]==ids[size_t(plan.entries[at-1])]) {
++                    require(entry>plan.entries[at-1],"within-expert token/rank order changed");
++                }
++                ++total;
++            }
++            next+=group.entry_count;
++        }
++        require(total==ids.size() && std::all_of(seen.begin(),seen.end(),[](unsigned n){return n==1;}),
++            "selected expert contributions were dropped");
++    }
++    const int32_t valid[]={0,1};
++    rejects([&]{llama_moe_expert_plan::make(valid,1,2,0,2,{});});
++    rejects([&]{llama_moe_expert_plan::make(nullptr,1,2,2,2,{});});
++    rejects([&]{llama_moe_expert_plan::make(valid,SIZE_MAX,2,2,2,{});});
++    const int32_t bad[]={2};
++    rejects([&]{llama_moe_expert_plan::make(bad,1,1,1,2,{});});
++    std::vector<int32_t> same(128,0);
++    auto windows=llama_moe_partition::plan(same.data(),64,2,2,8);
++    require(!llama_moe_expert_plan::make(same.data(),64,2,2,8,windows).profitable,"all-resident union selected gather/scatter");
++    for (size_t bytes:{size_t(0),size_t(255),size_t(4096),size_t(65536)}) {
++        const auto capacity=llama_moe_expert_graph::entry_capacity(256,64,4096,256,bytes);
++        require(!capacity || llama_moe_expert_graph::carve(256,64,capacity,256).bytes<=bytes,"gather scratch exceeded old workspace");
++        require(capacity==4096 || llama_moe_expert_graph::carve(256,64,capacity+1,256).bytes>bytes,
++            "workspace capacity did not use its available bound");
++    }
++    rejects([]{llama_moe_expert_graph::carve(SIZE_MAX,64,2,256);});
++    rejects([]{llama_moe_expert_graph::carve(256,64,2,0);});
++    std::puts("PASS expert-major planner: exact contribution permutation, stable rank/token order, bounded unique groups, cost gate and scratch overflow");
++}
++
++struct measurement {
++    std::vector<float> output;
++    uint64_t weight_bytes=0, weight_uploads=0, graphs=0;
++    double milliseconds=0;
++};
++
++measurement execute(ggml_backend_t backend,bool expert_major,bool down,bool tiled,
++                    ggml_type format=GGML_TYPE_F32,bool duplicates=false) {
++    constexpr size_t ni=256,no=64,experts=8,k=3,tokens=128,slots=3,guard=1;
++    const size_t tile_rows=tiled ? no/2 : no;
++    constexpr size_t count=k*tokens;
++    std::vector<int32_t> ids(count);
++    for (size_t token=0;token<tokens;++token) {
++        ids[token*k]=int32_t(2*(token%4)); ids[token*k+1]=ids[token*k]+1;
++        ids[token*k+2]=duplicates ? ids[token*k] : int32_t((size_t(ids[token*k])+2)%experts);
++    }
++    const auto windows=llama_moe_partition::plan(ids.data(),tokens,k,slots,experts);
++    const auto plan=llama_moe_expert_plan::make(ids.data(),tokens,k,slots,experts,windows);
++    require(plan.profitable && plan.entries.size()==count,"fixture did not exercise expert-major execution");
++    std::vector<float> weights(ni*no*experts), input_data(ni*tokens*(down?k:1));
++    std::mt19937 random(70119);
++    for (size_t e=0;e<experts;++e) for (size_t row=0;row<no;++row) for (size_t col=0;col<ni;++col) {
++        weights[(e*no+row)*ni+col]=format==GGML_TYPE_F32 ? float(int((e+row+col)%7)-3)/8.0f :
++            float(int(random()%2001)-1000)/7300.0f;
++    }
++    for (size_t row=0;row<input_data.size()/ni;++row) for (size_t col=0;col<ni;++col) {
++        input_data[row*ni+col]=format==GGML_TYPE_F32 ? float(int((row*13+col)%11)-5)/16.0f :
++            float(int((row*13+col)%101)-50)/117.0f+0.0031f*float(row%7);
++    }
++    const size_t weight_row_bytes=ggml_row_size(format,ni);
++    std::vector<uint8_t> encoded(weight_row_bytes*no*experts);
++    if (format==GGML_TYPE_F32) { std::memcpy(encoded.data(),weights.data(),encoded.size()); }
++    else {
++        std::vector<float> importance(ni,1.0f);
++        require(ggml_quantize_chunk(format,weights.data(),encoded.data(),0,no*experts,ni,importance.data())==encoded.size(),
++            "quantized fixture weight size changed");
++    }
++    ggml_context_ptr permanent(ggml_init({8*ggml_tensor_overhead(),nullptr,true}));
++    require(permanent!=nullptr,"cannot allocate expert-major fixture metadata");
++    auto * input=ggml_new_tensor_3d(permanent.get(),GGML_TYPE_F32,ni,down?k:1,tokens);
++    auto * storage=ggml_new_tensor_2d(permanent.get(),GGML_TYPE_F32,no+2*guard,count);
++    auto * bank=ggml_new_tensor_3d(permanent.get(),format,ni,tile_rows,slots);
++    ggml_backend_buffer_ptr permanent_buffer(ggml_backend_alloc_ctx_tensors(permanent.get(),backend));
++    require(permanent_buffer!=nullptr,"cannot allocate fixture tensors");
++    ggml_backend_buffer_clear(permanent_buffer.get(),0);
++    ggml_backend_tensor_set(input,input_data.data(),0,input_data.size()*sizeof(float));
++    std::vector<float> guards((no+2*guard)*count,-12345.0f);
++    ggml_backend_tensor_set(storage,guards.data(),0,guards.size()*sizeof(float));
++    auto * output=ggml_view_3d(permanent.get(),storage,no,k,tokens,(no+2*guard)*sizeof(float),
++        k*(no+2*guard)*sizeof(float),guard*sizeof(float));
++    llama_moe_expert_graph::view(output);
++    const size_t alignment=ggml_backend_buft_get_alignment(ggml_backend_buffer_get_type(permanent_buffer.get()));
++    const size_t output_size=llama_moe_expert_graph::align(tile_rows*count*sizeof(float),alignment);
++    const size_t workspace_size=output_size+llama_moe_expert_graph::align(count*sizeof(int32_t),alignment);
++    ggml_backend_buffer_ptr workspace(ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(permanent_buffer.get()),workspace_size));
++    require(workspace!=nullptr,"cannot allocate original-size expert scratch");
++    auto max_entries=llama_moe_expert_graph::entry_capacity(ni,tile_rows,count,alignment,workspace_size);
++    if (ggml_is_quantized(format) && ggml_backend_dev_type(ggml_backend_get_device(backend))==GGML_BACKEND_DEVICE_TYPE_GPU) {
++        const size_t limit=llama_moe_expert_graph::vector_batch_limit(backend,format);
++        require(limit>0,"CUDA quantized vector dispatch limit query is unavailable");
++        for (const auto & window:windows) { require(window.tokens<=limit,"quantized baseline does not use the vector kernel family"); }
++        max_entries=std::min(max_entries,limit);
++    }
++    require(max_entries>0,"original scratch cannot hold one gathered row");
++    llama_moe_work_batch<llama_moe_expert_graph::work> pending;
++    auto drain=[&]{ggml_backend_synchronize(backend);};
++    measurement result;
++    auto upload=[&](const int32_t * selected,size_t n,size_t row) {
++        for (size_t slot=0;slot<n;++slot) {
++            ggml_backend_tensor_set_async(backend,bank,encoded.data()+(size_t(selected[slot])*no+row)*weight_row_bytes,
++                slot*weight_row_bytes*tile_rows,weight_row_bytes*tile_rows);
++            result.weight_bytes+=weight_row_bytes*tile_rows; ++result.weight_uploads;
++        }
++    };
++    const auto start=std::chrono::steady_clock::now();
++    try {
++        if (expert_major) {
++            for (const auto & group:plan.groups) for (size_t row=0;row<no;row+=tile_rows) {
++                upload(plan.experts.data()+group.expert_begin,group.expert_count,row);
++                for (size_t done=0;done<group.entry_count;) {
++                    const size_t n=std::min(max_entries,group.entry_count-done);
++                    auto & item=pending.next(drain);
++                    item.input_rows.resize(n); item.output_rows.resize(n); item.slot_ids.resize(n);
++                    for (size_t i=0;i<n;++i) {
++                        const int32_t entry=plan.entries[group.entry_begin+done+i];
++                        item.input_rows[i]=down ? entry : int32_t(size_t(entry)/k);
++                        item.output_rows[i]=entry;
++                        const auto first=plan.experts.begin()+group.expert_begin;
++                        item.slot_ids[i]=int32_t(std::find(first,first+group.expert_count,ids[size_t(entry)])-first);
++                    }
++                    auto graph=llama_moe_expert_graph::build(item,input,output,bank,row,tile_rows,k,tokens,workspace.get());
++                    ggml_backend_tensor_set_async(backend,graph.input_ids,item.input_rows.data(),0,n*sizeof(int32_t));
++                    ggml_backend_tensor_set_async(backend,graph.slots,item.slot_ids.data(),0,n*sizeof(int32_t));
++                    ggml_backend_tensor_set_async(backend,graph.output_ids,item.output_rows.data(),0,n*sizeof(int32_t));
++                    require(ggml_backend_graph_compute_async(backend,graph.value)==GGML_STATUS_SUCCESS,"production expert-major graph failed");
++                    ++result.graphs; done+=n;
++                }
++            }
++        } else {
++            for (const auto & window:windows) for (size_t row=0;row<no;row+=tile_rows) {
++                std::vector<int32_t> selected(ids.begin()+window.begin*k,ids.begin()+(window.begin+window.tokens)*k);
++                std::sort(selected.begin(),selected.end()); selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
++                upload(selected.data(),selected.size(),row);
++                auto & item=pending.next(drain);
++                item.slot_ids.resize(window.tokens*k);
++                for (size_t i=0;i<item.slot_ids.size();++i) {
++                    item.slot_ids[i]=int32_t(std::find(selected.begin(),selected.end(),ids[window.begin*k+i])-selected.begin());
++                }
++                item.ctx.reset(ggml_init({32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false),nullptr,true}));
++                auto * ctx=item.ctx.get(); require(ctx!=nullptr,"cannot allocate baseline graph metadata");
++                auto * source=llama_moe_expert_graph::alias(ctx,input);
++                auto * target=llama_moe_expert_graph::alias(ctx,output);
++                auto * weight=llama_moe_expert_graph::alias(ctx,bank);
++                auto * inputs=ggml_view_3d(ctx,source,ni,input->ne[1],int64_t(window.tokens),input->nb[1],input->nb[2],window.begin*input->nb[2]);
++                llama_moe_expert_graph::view(inputs);
++                auto * indices=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,k,int64_t(window.tokens));
++                llama_moe_expert_graph::allocate(workspace.get(),indices,output_size);
++                auto * part=ggml_mul_mat_id(ctx,weight,inputs,indices);
++                llama_moe_expert_graph::allocate(workspace.get(),part,0);
++                auto * destination=ggml_view_3d(ctx,target,tile_rows,k,int64_t(window.tokens),output->nb[1],output->nb[2],
++                    window.begin*output->nb[2]+row*sizeof(float));
++                llama_moe_expert_graph::view(destination);
++                auto * copy=ggml_cpy(ctx,part,destination); llama_moe_expert_graph::view(copy);
++                auto * graph=ggml_new_graph_custom(ctx,32,false); ggml_build_forward_expand(graph,copy);
++                ggml_backend_tensor_set_async(backend,indices,item.slot_ids.data(),0,item.slot_ids.size()*sizeof(int32_t));
++                require(ggml_backend_graph_compute_async(backend,graph)==GGML_STATUS_SUCCESS,"token-major baseline graph failed");
++                ++result.graphs;
++            }
++        }
++        pending.flush(drain);
++    } catch (...) { pending.flush(drain); throw; }
++    result.milliseconds=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
++    ggml_backend_tensor_get(storage,guards.data(),0,guards.size()*sizeof(float));
++    result.output.resize(no*count);
++    for (size_t entry=0;entry<count;++entry) {
++        require(guards[entry*(no+2*guard)]==-12345.0f && guards[entry*(no+2*guard)+no+guard]==-12345.0f,
++            "expert-major scatter overwrote an output row guard");
++        for (size_t row=0;row<no;++row) {
++            const float actual=guards[entry*(no+2*guard)+row+guard];
++            require(std::isfinite(actual),"expert-major quantized output is nonfinite");
++            if (format==GGML_TYPE_F32) {
++                float expected=0;
++                for (size_t col=0;col<ni;++col) {
++                    expected+=weights[(size_t(ids[entry])*no+row)*ni+col]*input_data[(down ? entry : entry/k)*ni+col];
++                }
++                if (actual!=expected) {
++                    std::fprintf(stderr,"dot mismatch: mode=%s down=%d tiled=%d format=%s entry=%zu token=%zu rank=%zu expert=%d "
++                        "row=%zu actual=%.9g expected=%.9g diff=%.9g\n",
++                        expert_major ? "expert-major" : "token-major",down,tiled,ggml_type_name(format),entry,entry/k,entry%k,ids[entry],
++                        row,actual,expected,actual-expected);
++                    throw std::runtime_error("expert-major gather/matmul/scatter changed an exact dot product");
++                }
++            }
++            result.output[entry*no+row]=actual;
++        }
++    }
++    return result;
++}
++
++float compare_quantized(const measurement & baseline,const measurement & grouped,ggml_type format,bool down) {
++    require(baseline.output.size()==grouped.output.size(),"quantized comparison shape changed");
++    float largest=0;
++    for (size_t i=0;i<baseline.output.size();++i) {
++        const float difference=std::abs(baseline.output[i]-grouped.output[i])/std::max(1.0f,std::abs(baseline.output[i]));
++        if (!std::isfinite(grouped.output[i]) || difference>2e-4f) {
++            std::fprintf(stderr,"quant mismatch: format=%s down=%d entry=%zu row=%zu baseline=%.9g grouped=%.9g scaled_diff=%.9g\n",
++                ggml_type_name(format),down,i/64,i%64,baseline.output[i],grouped.output[i],difference);
++            throw std::runtime_error("quantized gather/matmul/scatter exceeds model-fixture tolerance");
++        }
++        largest=std::max(largest,difference);
++    }
++    for (size_t entry=0;entry<baseline.output.size()/64;++entry) {
++        const auto a=baseline.output.begin()+entry*64,b=grouped.output.begin()+entry*64;
++        require(std::max_element(a,a+64)-a==std::max_element(b,b+64)-b,"quantized per-entry top-1 changed");
++    }
++    require(grouped.weight_bytes*16<=baseline.weight_bytes,"quantized weight traffic did not improve");
++    return largest;
++}
++
++void quantized_pairs(ggml_backend_t backend,bool gpu) {
++    for (ggml_type format:{GGML_TYPE_Q4_K,GGML_TYPE_IQ3_S}) {
++        for (bool down:{false,true}) {
++            const bool tiled=down;
++            // Warm both kernels, allocations and the quantizer before measuring.
++            compare_quantized(execute(backend,false,down,tiled,format),execute(backend,true,down,tiled,format),format,down);
++            std::vector<double> old_times,new_times;
++            float maximum=0;
++            measurement baseline,grouped;
++            for (int repeat=0;repeat<3;++repeat) {
++                if (repeat%2==0) {
++                    baseline=execute(backend,false,down,tiled,format);
++                    grouped=execute(backend,true,down,tiled,format);
++                } else {
++                    grouped=execute(backend,true,down,tiled,format);
++                    baseline=execute(backend,false,down,tiled,format);
++                }
++                maximum=std::max(maximum,compare_quantized(baseline,grouped,format,down));
++                old_times.push_back(baseline.milliseconds); new_times.push_back(grouped.milliseconds);
++            }
++            std::sort(old_times.begin(),old_times.end()); std::sort(new_times.begin(),new_times.end());
++            std::printf("PASS %s real %s %s: weight bytes %llu -> %llu, finite/scaled_error=%g, all 384 top-1 rows agree; "
++                "warm median %.3f -> %.3f ms (3 alternating pairs, component only)\n",
++                gpu ? "CUDA" : "CPU",ggml_type_name(format),down ? "down/two-tiles" : "gate/full-row",
++                (unsigned long long)baseline.weight_bytes,(unsigned long long)grouped.weight_bytes,
++                maximum,old_times[1],new_times[1]);
++        }
++    }
++}
++}
++
++int main(int argc,char ** argv) {
++    try {
++        planner();
++        const bool gpu=argc>1 && std::string(argv[1])=="--gpu";
++        ggml_backend_load_all();
++        ggml_backend_ptr backend(ggml_backend_init_by_type(gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU,nullptr));
++        if (gpu && !backend) { std::puts("SKIP: no GPU backend"); return 77; }
++        require(backend!=nullptr,"no fixture backend");
++        for (bool down:{false,true}) for (bool tiled:{false,true}) {
++            const auto old=execute(backend.get(),false,down,tiled), grouped=execute(backend.get(),true,down,tiled);
++            require(old.output==grouped.output,"expert-major output permutation changed results");
++            require(grouped.weight_bytes*16<=old.weight_bytes,"fixture did not reduce actual weight-upload bytes");
++            require(grouped.graphs<old.graphs,"grouping multiplied small fixture compute launches");
++            std::printf("PASS %s %s %s: actual weight upload bytes %llu -> %llu, uploads %llu -> %llu, "
++                "graphs %llu -> %llu; same existing scratch and exact outputs (timing deferred to warm quantized pairs)\n",
++                gpu ? "CUDA" : "CPU",down ? "down/distinct-ranks" : "gate/shared-token",tiled ? "two-row-tiles" : "full-row",
++                (unsigned long long)old.weight_bytes,(unsigned long long)grouped.weight_bytes,
++                (unsigned long long)old.weight_uploads,(unsigned long long)grouped.weight_uploads,
++                (unsigned long long)old.graphs,(unsigned long long)grouped.graphs);
++        }
++        // ggml_mul_mat_id explicitly leaves same-token duplicate IDs undefined
++        // across backends. Never use that invalid input as an A/B baseline.
++        // Our new provider flattens them to distinct k=1 rows, which are valid;
++        // test those rows directly against the exact F32 mathematical oracle.
++        for (bool down:{false,true}) for (bool tiled:{false,true}) {
++            execute(backend.get(),true,down,tiled,GGML_TYPE_F32,true);
++            std::printf("PASS %s expert-major-only duplicate ranks, %s %s: exact CPU dot-product oracle and output guards\n",
++                gpu ? "CUDA" : "CPU",down ? "down/distinct-ranks" : "gate/shared-token",tiled ? "two-row-tiles" : "full-row");
++        }
++        quantized_pairs(backend.get(),gpu);
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}
+diff --git a/tests/test-moe-packed-rows.cpp b/tests/test-moe-packed-rows.cpp
+new file mode 100644
+index 0000000..f3c6d9a
+--- /dev/null
++++ b/tests/test-moe-packed-rows.cpp
+@@ -0,0 +1,157 @@
++#include "../src/llama-model-ram.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
++void enable() {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_MOE_RUNTIME","1");
++#else
++    setenv("WILDLLAMA_MOE_RUNTIME","1",1);
++#endif
++}
++constexpr size_t page=65536, rows=16384, width=160, prefix=31, view_row=17;
++struct fixture {
++    std::filesystem::path path;
++    std::vector<uint8_t> bytes;
++    explicit fixture(const char * directory) : path(std::filesystem::path(directory)/
++        ("moe-packed-rows-"+std::to_string(std::random_device{}())+".bin")),
++        bytes(prefix+ggml_row_size(GGML_TYPE_Q5_0,width)*rows+13) {
++        for (size_t i=0; i<bytes.size(); ++i) { bytes[i]=uint8_t(i*17+i/113); }
++        write();
++    }
++    ~fixture() { std::error_code ec; std::filesystem::remove(path,ec); }
++    void write() {
++        std::ofstream stream(path,std::ios::binary|std::ios::trunc);
++        stream.write(reinterpret_cast<const char *>(bytes.data()),bytes.size());
++        require(stream.good(),"cannot write packed-row fixture");
++    }
++};
++struct result { uint64_t calls=0; size_t peak=0; double ms=0; };
++
++result run(ggml_backend_t backend, fixture & file, size_t count, size_t quota, bool packed, bool gpu, int failure=0) {
++    const size_t row_bytes=ggml_row_size(GGML_TYPE_Q5_0,width);
++    llama_files files;
++    files.emplace_back(new llama_file(file.path.string().c_str(),"rb"));
++    ggml_context_ptr source_context(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    ggml_context_ptr target_context(ggml_init({4*ggml_tensor_overhead(),nullptr,true}));
++    require(source_context && target_context,"cannot create packed-row contexts");
++    auto * weights=ggml_new_tensor_2d(source_context.get(),GGML_TYPE_Q5_0,width,rows);
++    auto * source=ggml_view_2d(source_context.get(),weights,width,rows-view_row,row_bytes,view_row*row_bytes);
++    auto * full=ggml_new_tensor_2d(target_context.get(),GGML_TYPE_Q5_0,width,count+2);
++    auto * destination=ggml_view_2d(target_context.get(),full,width,count,row_bytes,row_bytes);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(target_context.get(),backend));
++    require(buffer != nullptr,"cannot allocate packed-row destination");
++    llama_model_ram_cache cache(quota,files,true);
++    cache.bind(weights,0,prefix);
++    source->data=static_cast<uint8_t *>(weights->data)+view_row*row_bytes;
++    std::vector<int32_t> ids(count);
++    for (size_t i=0; i<count; ++i) { ids[i]=int32_t((i*73+19)%(rows-view_row)); }
++    if (count>2) { ids[count-1]=int32_t(rows-view_row-1); ids[count-2]=ids[0]; }
++    if (failure==2) {
++        const size_t first_packet=(2*1024*1024)/row_bytes;
++        require(count>first_packet,"late failure needs more than one upload packet");
++        std::fill(ids.begin(),ids.begin()+first_packet,0);
++        std::fill(ids.begin()+first_packet,ids.end(),int32_t(rows-view_row-1));
++    }
++    std::vector<uint8_t> expected(count*row_bytes), actual((count+2)*row_bytes);
++    for (size_t i=0; i<count; ++i) {
++        std::copy_n(file.bytes.data()+prefix+(view_row+size_t(ids[i]))*row_bytes,row_bytes,expected.data()+i*row_bytes);
++    }
++    auto guard=cache.acquire();
++    auto transfer=[&] {
++        if (packed && cache.copy_rows(backend,source,destination,ids.data(),count)) { return; }
++        std::vector<llama_model_ram_copy> copies;
++        copies.reserve(count);
++        for (size_t i=0; i<count; ++i) { copies.push_back({source,destination,size_t(ids[i])*row_bytes,i*row_bytes,row_bytes}); }
++        if (!cache.copy_batch(backend,copies)) {
++            for (const auto & copy:copies) { require(cache.copy(backend,copy.src,copy.dst,copy.src_offset,copy.dst_offset,copy.size),"row fallback rejected"); }
++        }
++    };
++    auto verify=[&] {
++        ggml_backend_synchronize(backend);
++        ggml_backend_tensor_get(full,actual.data(),0,actual.size());
++        require(std::all_of(actual.begin(),actual.begin()+row_bytes,[](uint8_t x){return x==0xa5;}) &&
++                std::all_of(actual.end()-row_bytes,actual.end(),[](uint8_t x){return x==0xa5;}),
++                "packed rows overwrote destination guards");
++        require(!memcmp(actual.data()+row_bytes,expected.data(),expected.size()),"packed quantized row bytes differ");
++        const auto stats=cache.stats(guard);
++        require(stats.peak<=quota && stats.resident<=quota,"packed gather exceeded weight RAM quota");
++        require(stats.io_buffer_bytes==4*1024*1024+4*4096 || stats.io_buffer_bytes==4*1024*1024+4096,
++                "packed gather grew the SSD staging allocation");
++    };
++    ggml_backend_buffer_clear(buffer.get(),0xa5);
++    if (failure && gpu) {
++        const auto failure_before=cache.stats(guard);
++        std::filesystem::resize_file(file.path,failure==2 ? 2*page : prefix);
++        bool rejected=false;
++        try { transfer(); } catch (const std::exception &) { rejected=true; }
++        require(rejected,"truncated packed-row read succeeded");
++        if (failure==2) {
++            require(cache.stats(guard).h2d_calls>failure_before.h2d_calls,
++                    "late I/O failure did not follow an actual pending upload");
++        }
++        file.write();
++    }
++    transfer(); verify();
++    const auto before=cache.stats(guard);
++    const auto start=std::chrono::steady_clock::now();
++    transfer(); verify();
++    const auto after=cache.stats(guard);
++    result output {after.h2d_calls-before.h2d_calls,after.peak,
++        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()};
++    if (gpu && packed) {
++        const size_t packet_rows=(2*1024*1024)/row_bytes;
++        require(output.calls==(count+packet_rows-1)/packet_rows,"packed gather retained per-row uploads");
++        require(after.h2d_bytes-before.h2d_bytes==count*row_bytes,"packed gather changed uploaded payload");
++        const int32_t saved=ids.back(); ids.back()=-1;
++        bool rejected=false;
++        try { cache.copy_rows(backend,source,destination,ids.data(),count); }
++        catch (const std::exception &) { rejected=true; }
++        require(rejected && cache.stats(guard).h2d_calls==after.h2d_calls,"invalid row was not rejected before device mutation");
++        ids.back()=saved;
++        transfer(); verify();
++    }
++    return output;
++}
++}
++
++int main(int argc, char ** argv) {
++    try {
++        require(argc==2 || (argc==3 && std::string(argv[2])=="--gpu"),"usage: test-moe-packed-rows DIRECTORY [--gpu]");
++        std::filesystem::create_directories(argv[1]);
++        enable(); ggml_backend_load_all();
++        const bool gpu=argc==3;
++        ggml_backend_ptr backend(ggml_backend_init_by_type(gpu ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU,nullptr));
++        if (gpu && !backend) { std::puts("SKIP: no GPU backend"); return 77; }
++        require(backend != nullptr,"test backend unavailable");
++        fixture file(argv[1]);
++        const auto baseline=run(backend.get(),file,8192,2*1024*1024,false,gpu);
++        const auto packed=run(backend.get(),file,8192,2*1024*1024,true,gpu);
++        require(baseline.peak==packed.peak,"packed gather changed the source working set");
++        if (gpu) {
++            require(baseline.calls==8192 && packed.calls==1,"sparse-row upload reduction absent");
++            const auto tiny=run(backend.get(),file,1024,page,true,gpu,true);
++            require(tiny.peak==page && tiny.calls==1,"single-page quota gather changed");
++            const auto multiple=run(backend.get(),file,40000,2*1024*1024,true,gpu);
++            require(multiple.calls==3,"upload ring was not renewed across multiple packets");
++            run(backend.get(),file,20000,2*1024*1024,true,gpu,2);
++        }
++        std::printf("PASS %s packed Q5_0 rows: exact caller order, duplicates, tensor view, guard rows, EOF/recovery, quotas; "
++                    "8192 rows H2D calls %llu -> %llu; warm ms %.4f -> %.4f (component only)\n",
++                    gpu ? "CUDA" : "CPU fallback",(unsigned long long)baseline.calls,(unsigned long long)packed.calls,baseline.ms,packed.ms);
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}
+diff --git a/tests/test-moe-ram-admission.cpp b/tests/test-moe-ram-admission.cpp
+new file mode 100644
+index 0000000..434437c
+--- /dev/null
++++ b/tests/test-moe-ram-admission.cpp
+@@ -0,0 +1,187 @@
++#include "../src/llama-model-ram-admission.h"
++#include "../src/llama-model-ram.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <list>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr size_t page=65536,capacity=64,source_pages=256;
++void require(bool condition,const char * message) { if (!condition) { throw std::runtime_error(message); } }
++void environment(const char * name,const char * value) {
++#ifdef _WIN32
++    _putenv_s(name,value);
++#else
++    setenv(name,value,1);
++#endif
++}
++
++void test_history_and_work_bound() {
++    llama_model_ram_frequency history(capacity);
++    uint16_t frequency=0; uint32_t stamp=0;
++    for (size_t n=0;n<31;++n) { history.observe(frequency,stamp); }
++    require(history.estimate(frequency,stamp)==31,"demand frequency was not retained");
++    history.observations+=history.stale_after+1;
++    require(history.estimate(frequency,stamp)<=1,"retired topic kept blocking a new working set");
++    history.observations=history.interval-1;
++    frequency=31; stamp=uint32_t(history.observations);
++    history.observe(frequency,stamp);
++    require(frequency==16,"observed page did not age before its new demand");
++    history.observations+=16*history.interval;
++    require(history.estimate(frequency,stamp)==0,"stale history stayed permanently hot");
++    history.observations+=7;
++    frequency=UINT16_MAX; stamp=uint32_t(history.observations);
++    history.observe(frequency,stamp);
++    require(frequency==UINT16_MAX,"frequency saturation overflowed");
++    history.observations=uint64_t(UINT32_MAX)-3;
++    frequency=31; stamp=uint32_t(history.observations);
++    history.observations+=8;
++    require(history.estimate(frequency,stamp)==15,"reference-clock wrap lost lazy aging");
++    struct candidate { uint16_t value; bool eligible; };
++    std::list<candidate> pages;
++    for (size_t n=0;n<128;++n) { pages.push_back({100,true}); }
++    auto sixty_fourth=std::next(pages.begin(),63);
++    sixty_fourth->value=2;
++    std::next(sixty_fourth)->value=1;
++    size_t probes=0;
++    auto pick=llama_model_ram_victim(pages.begin(),pages.end(),[](const auto & p){return p.eligible;},
++        [](const auto & p){return p.value;},true,SIZE_MAX,probes);
++    require(pick==sixty_fourth && probes==64,"victim selection exceeded its bounded eligible sample");
++    pages.front().value=1; probes=0;
++    pick=llama_model_ram_victim(pages.begin(),pages.end(),[](const auto & p){return p.eligible;},
++        [](const auto & p){return p.value;},true,SIZE_MAX,probes);
++    require(pick==pages.begin() && probes==1,"one-use stream lost its constant-work fallback");
++    pages.front().eligible=false; probes=0;
++    pick=llama_model_ram_victim(pages.begin(),pages.end(),[](const auto & p){return p.eligible;},
++        [](const auto & p){return p.value;},true,1,probes);
++    require(pick==pages.end() && probes==1,"cooperative residency scan exceeded its queue prefix");
++    probes=0; size_t scores=0;
++    pick=llama_model_ram_victim(pages.begin(),pages.end(),[](const auto & p){return p.eligible;},
++        [&](const auto & p){++scores;return p.value;},false,SIZE_MAX,probes);
++    require(pick==std::next(pages.begin()) && scores==0,"disabled policy changed the SLRU fallback");
++    printf("PASS RAM admission history: saturation, lazy aging, wrap, 64-candidate bound and O(1) cold fallback\n");
++}
++
++struct fixture {
++    std::filesystem::path path;
++    std::vector<uint8_t> raw;
++    explicit fixture(const char * directory) :
++        path(std::filesystem::path(directory)/("moe-admission-"+std::to_string(std::random_device{}())+".bin")),
++        raw(source_pages*page) {
++        for (size_t i=0;i<raw.size();++i) { raw[i]=uint8_t(i*17+i/263); }
++        write();
++    }
++    ~fixture() { std::error_code error; std::filesystem::remove(path,error); }
++    void write() const {
++        std::ofstream output(path,std::ios::binary|std::ios::trunc);
++        output.write(reinterpret_cast<const char *>(raw.data()),raw.size());
++        require(output.good(),"cannot write RAM-admission fixture");
++    }
++};
++
++llama_model_ram_stats replay(const fixture & source,const std::vector<size_t> & trace,bool adaptive,bool failure_checks) {
++    environment("WILDLLAMA_MOE_RAM_ADMISSION",adaptive ? "1" : "0");
++    llama_files files;
++    files.emplace_back(new llama_file(source.path.string().c_str(),"rb"));
++    ggml_context_ptr context(ggml_init({2*ggml_tensor_overhead(),nullptr,true}));
++    require(context!=nullptr,"cannot create RAM-admission fixture context");
++    auto * weights=ggml_new_tensor_1d(context.get(),GGML_TYPE_I8,source.raw.size());
++    llama_model_ram_cache cache(capacity*page,files,true);
++    cache.bind(weights,0,0);
++    std::vector<uint8_t> actual(page);
++    auto guard=cache.acquire();
++    for (size_t index:trace) {
++        require(index<source_pages,"trace page outside fixture");
++        cache.read(weights,index*page,actual.data(),page);
++        require(!memcmp(actual.data(),source.raw.data()+index*page,page),"admission changed requested weight bytes");
++    }
++    const auto measured=cache.stats(guard);
++    require(measured.resident<=capacity*page && measured.peak<=capacity*page,"admission exceeded its weight quota");
++    require(measured.bytes_read==measured.read_calls*page,"single-page trace changed direct-read accounting");
++    if (failure_checks) {
++        // Protect a complete different working set, forcing the final page out
++        // of either policy before truncating its backing file.
++        require(cache.prefetch({{weights,0,capacity*page}}),"cannot replace failure-test working set");
++        std::filesystem::resize_file(source.path,3*page);
++        bool rejected=false;
++        try { cache.read(weights,(source_pages-1)*page,actual.data(),page); }
++        catch (const std::exception &) { rejected=true; }
++        require(rejected,"frequency history masked a truncated backing file");
++        require(cache.stats(guard).resident<=capacity*page,"failed admission enlarged the weight quota");
++        source.write();
++        cache.read(weights,(source_pages-1)*page,actual.data(),page);
++        require(!memcmp(actual.data(),source.raw.data()+(source_pages-1)*page,page),"admission did not recover exact bytes");
++        const auto cold=cache.stats(guard);
++        cache.read(weights,(source_pages-1)*page,actual.data(),page);
++        require(cache.stats(guard).bytes_read==cold.bytes_read,"recovered resident page missed again");
++    }
++    return measured;
++}
++
++void compare(const char * name,const fixture & source,const std::vector<size_t> & trace,
++             bool require_reduction,bool equal_cold,bool failure_checks=false,bool nonregression=false) {
++    const auto before=replay(source,trace,false,failure_checks),after=replay(source,trace,true,failure_checks);
++    require(before.io_buffer_bytes==after.io_buffer_bytes && before.peak==after.peak,
++            "admission changed staging or managed residency peak");
++    if (require_reduction) {
++        require(after.bytes_read*100<before.bytes_read*95,"hot trace did not reduce actual SSD traffic by at least five percent");
++    }
++    if (equal_cold) { require(after.bytes_read==before.bytes_read,"cold stream changed its SSD traffic"); }
++    if (nonregression) { require(after.bytes_read<=before.bytes_read,"random/skew workload regressed SSD traffic"); }
++    if (!require_reduction && !equal_cold && !nonregression) {
++        require(after.read_calls<=before.read_calls+capacity,"phase adaptation imposed more than one cache of extra misses");
++    }
++    printf("RAM admission %s: references=%zu SSD_reads=%llu/%llu SSD_bytes=%llu/%llu saved=%.2f%% peak=%zu/%zu\n",
++        name,trace.size(),(unsigned long long)before.read_calls,(unsigned long long)after.read_calls,
++        (unsigned long long)before.bytes_read,(unsigned long long)after.bytes_read,
++        before.bytes_read ? 100.0*(double(before.bytes_read)-double(after.bytes_read))/double(before.bytes_read) : 0.0,
++        before.peak,after.peak);
++}
++}
++
++int main(int argc,char ** argv) {
++    try {
++        require(argc==2,"RAM-admission test needs an explicit temporary directory");
++        std::filesystem::create_directories(argv[1]);
++        environment("WILDLLAMA_MOE_RUNTIME","1");
++        environment("WILDLLAMA_MOE_RAM_POOL","1");
++        test_history_and_work_bound();
++        fixture source(argv[1]);
++        std::vector<size_t> trace;
++        for (size_t round=0;round<8;++round) { for (size_t k=0;k<48;++k) { trace.push_back(k); } }
++        for (size_t round=0;round<20;++round) {
++            for (size_t k=0;k<48;++k) { trace.push_back(k); }
++            for (size_t k=0;k<48;++k) { trace.push_back(64+(round%4)*48+k); }
++        }
++        compare("hot48-with-scan48",source,trace,true,false,true);
++        std::mt19937 random(8422);
++        trace.clear();
++        for (size_t n=0;n<5000;++n) { trace.push_back(random()%10 ? random()%56 : 64+random()%192); }
++        compare("skew90-hot56",source,trace,false,false,false,true);
++        trace.clear();
++        for (size_t k=0;k<source_pages;++k) { trace.push_back(k); }
++        compare("one-use-sequential",source,trace,false,true);
++        trace.clear();
++        for (size_t round=0;round<8;++round) { for (size_t k=0;k<96;++k) { trace.push_back(k); } }
++        compare("uniform-cycle96",source,trace,false,true);
++        trace.clear();
++        for (size_t phase=0;phase<4;++phase) {
++            for (size_t n=0;n<1250;++n) { trace.push_back(random()%10 ? phase*48+random()%48 : 192+random()%64); }
++        }
++        compare("changing-hot-set",source,trace,false,false);
++        printf("PASS bounded RAM admission: exact bytes, fixed quotas, reduced real SSD reads on hot/scan traces, cold fallback, aging, failure and recovery\n");
++        return 0;
++    } catch (const std::exception & error) {
++        fprintf(stderr,"FAIL: %s\n",error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-speculative-depth.cpp b/tests/test-speculative-depth.cpp
+new file mode 100644
+index 0000000..457036a
+--- /dev/null
++++ b/tests/test-speculative-depth.cpp
+@@ -0,0 +1,268 @@
++#include "common.h"
++#include "speculative.h"
++#include "ggml-cpp.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr int dim = 32, vocab = 64, preferred = 7;
++
++void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++// Tiny, deterministic in-memory models. No downloaded weights, tokenizer,
++// files or GPU allocation are needed to exercise the real drafting loops.
++llama_model_ptr fixture(const char * architecture, bool eos = false) {
++    const std::string arch(architecture);
++    const bool eagle = arch == "eagle3";
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", architecture);
++    gguf_set_val_str(metadata.get(), "general.name", "speculative-depth-fixture");
++    auto u32 = [&](const char * key, uint32_t value) {
++        gguf_set_val_u32(metadata.get(), (arch + "." + key).c_str(), value);
++    };
++    u32("context_length", 512);
++    u32("embedding_length", dim);
++    u32("block_count", eagle ? 1 : 3); // Two real hybrid trunk blocks plus the MTP block.
++    u32("feed_forward_length", 64);
++    u32("attention.head_count", 2);
++    u32("attention.head_count_kv", 1);
++    u32("rope.dimension_count", 16);
++    gguf_set_val_f32(metadata.get(), (arch + ".attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
++    if (eagle) {
++        const int32_t layers[] = {0, 0, 1};
++        gguf_set_arr_data(metadata.get(), "eagle3.target_layers", GGUF_TYPE_INT32, layers, 3);
++        u32("target_hidden_size", dim);
++    } else {
++        u32("nextn_predict_layers", 1);
++        u32("full_attention_interval", 2);
++        u32("ssm.conv_kernel", 4);
++        u32("ssm.inner_size", 128);
++        u32("ssm.state_size", 128);
++        u32("ssm.time_step_rank", 1);
++        u32("ssm.group_count", 1);
++        const uint32_t sections[] = {4, 4, 0, 0};
++        gguf_set_arr_data(metadata.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
++    }
++    gguf_set_val_str(metadata.get(), "tokenizer.ggml.model", "test");
++    std::vector<std::string> tokens;
++    std::vector<const char *> names;
++    std::vector<float> scores(vocab, 0);
++    for (int i = 0; i < vocab; ++i) { tokens.push_back("tok_" + std::to_string(i)); }
++    for (const auto & token : tokens) { names.push_back(token.c_str()); }
++    gguf_set_arr_str(metadata.get(), "tokenizer.ggml.tokens", names.data(), names.size());
++    gguf_set_arr_data(metadata.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    if (eos) { gguf_set_val_u32(metadata.get(), "tokenizer.ggml.eos_token_id", preferred); }
++
++    const auto initialize = [](ggml_tensor * tensor, void *) {
++        require(tensor->type == GGML_TYPE_F32, "unexpected fixture tensor type");
++        const std::string name(tensor->name);
++        const bool weight = name.size() >= 7 && name.compare(name.size()-7, 7, ".weight") == 0;
++        std::vector<float> values(ggml_nelements(tensor), 0);
++        if (name.find("norm") != std::string::npos || name.find("rope_freqs") != std::string::npos ||
++            name.find(".scale") != std::string::npos || name.find("_scale") != std::string::npos) {
++            std::fill(values.begin(), values.end(), 1.0f);
++        } else if (weight && (name == "token_embd.weight" || name.find("nextn.embed_tokens") != std::string::npos)) {
++            for (size_t i = 0; i < values.size(); ++i) { values[i] = 0.125f + float(i % dim)*0.001f; }
++        } else if (weight && (name == "output.weight" || name.find("shared_head_head") != std::string::npos)) {
++            require(tensor->ne[0] == dim && tensor->ne[1] == vocab, "unexpected fixture output projection shape");
++            for (int i = 0; i < dim; ++i) { values.at(preferred*dim+i) = 1.0f; }
++        } else if (weight && (name.find("nextn.eh_proj") != std::string::npos || name == "fc.weight")) {
++            require(tensor->ne[0] >= dim && tensor->ne[1] == dim, "unexpected fixture hidden projection shape");
++            for (int i = 0; i < dim; ++i) { values.at(size_t(i)*tensor->ne[0]+i) = 1.0f; }
++        }
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(float));
++    };
++    auto params = llama_model_default_params();
++    ggml_backend_dev_t devices[] = {nullptr}; // Explicitly select no offload device, including host-pinned GPU buffers.
++    params.devices = devices;
++    params.n_gpu_layers = 0;
++    params.load_mode = LLAMA_LOAD_MODE_NONE;
++    params.use_extra_bufts = false;
++    params.no_host = true;
++    params.load_mtp = !eagle;
++    llama_model_ptr model(llama_model_init_from_user(metadata.get(), initialize, nullptr, params));
++    require(model != nullptr, "cannot create tiny speculative model");
++    require(llama_model_size(model.get()) < 4*1024*1024, "speculative fixture exceeded its weight bound");
++    return model;
++}
++
++struct outcome {
++    std::vector<llama_tokens> tokens;
++    int computed_rows = 0;
++};
++
++struct forward_counter {
++    uint64_t rows = 0;
++    bool valid = true;
++
++    static bool observe(ggml_tensor * tensor, bool ask, void * user_data) {
++        if (std::strcmp(tensor->name, "result_output") != 0) { return false; }
++        if (!ask) {
++            auto & count = *static_cast<forward_counter *>(user_data);
++            count.valid = count.valid && tensor->type == GGML_TYPE_F32 && tensor->ne[0] == vocab &&
++                          tensor->ne[2] == 1 && tensor->ne[3] == 1;
++            count.rows += uint64_t(ggml_nrows(tensor));
++        }
++        return true;
++    }
++};
++
++outcome run(llama_model * target, llama_model * draft, common_speculative_type type,
++            const std::vector<int> & limits, bool inactive_last = false) {
++    const uint32_t sequences = uint32_t(limits.size());
++    std::fprintf(stderr, "speculative-depth: %s, sequences=%u, first limit=%d, replay=%d\n",
++                 common_speculative_type_to_str(type).c_str(), sequences, limits[0], inactive_last);
++    auto params = llama_context_default_params();
++    params.n_ctx = 128*sequences;
++    params.n_batch = 64;
++    params.n_ubatch = 64;
++    params.n_seq_max = sequences;
++    params.n_threads = params.n_threads_batch = 1;
++    params.no_perf = false;
++    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    llama_context_ptr ctx_target(llama_init_from_model(target, params));
++    require(ctx_target != nullptr, "cannot create target fixture context");
++    forward_counter forwards;
++    params.cb_eval = forward_counter::observe;
++    params.cb_eval_user_data = &forwards;
++    params.ctx_other = ctx_target.get();
++    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) { params.ctx_type = LLAMA_CONTEXT_TYPE_MTP; }
++    llama_context_ptr ctx_draft(llama_init_from_model(draft, params));
++    require(ctx_draft != nullptr, "cannot create draft fixture context");
++
++    common_params_speculative config;
++    config.types = {type};
++    config.draft.ctx_tgt = ctx_target.get();
++    config.draft.ctx_dft = ctx_draft.get();
++    config.draft.n_max = 48;
++    config.draft.n_min = 0;
++    config.draft.p_min = 0;
++    config.draft.backend_sampling = false;
++    common_speculative_ptr speculative(common_speculative_init(config, sequences));
++    require(speculative != nullptr, "cannot initialize real draft implementation");
++
++    const llama_tokens prompt = {3, 4, 5};
++    common_batch prefill(ctx_target.get());
++    for (uint32_t seq = 0; seq < sequences; ++seq) {
++        for (size_t i = 0; i < prompt.size(); ++i) { prefill.add(prompt[i], llama_pos(i), seq, true); }
++    }
++    std::fprintf(stderr, "speculative-depth: target prefill\n");
++    require(llama_process(ctx_target.get(), LLAMA_PROCESS_TYPE_DECODE, prefill.get()) == 0,
++            "target fixture prefill failed");
++    std::fprintf(stderr, "speculative-depth: draft prefill\n");
++    require(common_speculative_process(speculative.get(), prefill), "draft fixture prefill failed");
++    for (uint32_t seq = 0; seq < sequences; ++seq) { common_speculative_begin(speculative.get(), seq, prompt); }
++    const float * logits = llama_get_logits_ith(ctx_target.get(), -1);
++    const std::vector<float> target_logits(logits, logits + vocab);
++
++    outcome result;
++    result.tokens.resize(sequences);
++    std::vector<std::vector<std::vector<llama_token_data>>> candidates(sequences);
++    for (uint32_t seq = 0; seq < sequences; ++seq) {
++        auto & dp = common_speculative_get_draft_params(speculative.get(), seq);
++        dp.drafting = !(inactive_last && seq == sequences-1);
++        dp.n_max = limits[seq];
++        dp.pos0 = llama_pos(prompt.size());
++        dp.id_last = preferred;
++        dp.prompt = &prompt;
++        dp.result = &result.tokens[seq];
++        dp.result_q = &candidates[seq];
++        dp.temp = 0;
++        dp.seed = 1;
++        if (limits[seq] == 0) {
++            // A disabled request must clear stale output without a forward. Inactive
++            // checkpoint/replay state is different: it must remain untouched.
++            result.tokens[seq] = {19};
++            candidates[seq] = {{{19, 0, 1}}};
++        }
++    }
++    // Public perf counters clamp each zero count to one for printing divisions,
++    // so their difference undercounts the first generated row. Count actual
++    // executed output rows with the scheduler callback instead. Synchronize both
++    // snapshots because the final unused hidden state is no longer downloaded.
++    llama_synchronize(ctx_draft.get());
++    const auto before = llama_perf_context(ctx_draft.get());
++    const uint64_t rows_before = forwards.rows;
++    std::fprintf(stderr, "speculative-depth: actual draft forwards\n");
++    common_speculative_draft(speculative.get());
++    llama_synchronize(ctx_draft.get());
++    const auto after = llama_perf_context(ctx_draft.get());
++    require(forwards.valid, "unexpected draft output geometry in the executed-forward counter");
++    result.computed_rows = int(forwards.rows - rows_before);
++    const int public_perf_delta = after.n_eval + after.n_p_eval - before.n_eval - before.n_p_eval;
++    std::fprintf(stderr, "speculative-depth: executed output rows=%d, public perf delta=%d\n",
++                 result.computed_rows, public_perf_delta);
++    for (uint32_t seq = 0; seq < sequences; ++seq) {
++        require(!common_speculative_get_draft_params(speculative.get(), seq).drafting,
++                "drafting flag left active");
++        if (limits[seq] == 0) {
++            const bool preserved = inactive_last && seq == sequences-1;
++            require(result.tokens[seq].size() == (preserved ? 1 : 0) && candidates[seq].size() == (preserved ? 1 : 0),
++                    "zero-width cleanup changed inactive replay state or retained stale candidates");
++        }
++    }
++    logits = llama_get_logits_ith(ctx_target.get(), -1);
++    require(std::equal(target_logits.begin(), target_logits.end(), logits), "drafting changed the target logits");
++    return result;
++}
++
++void check_implementation(llama_model * target, llama_model * draft, common_speculative_type type) {
++    const auto full = run(target, draft, type, {-1});
++    const auto limited = run(target, draft, type, {1});
++    const auto oversized = run(target, draft, type, {96});
++    const auto zero = run(target, draft, type, {0});
++    const auto replay = run(target, draft, type, {0}, true);
++    const auto mixed = run(target, draft, type, {1, 4, 0, -1});
++    require(full.tokens[0].size() == 48 && full.computed_rows == 48, "global draft maximum changed");
++    require(oversized.tokens[0].size() == 48 && oversized.computed_rows == 48,
++            "per-sequence request exceeded the implementation maximum");
++    require(limited.tokens[0].size() == 1 && limited.computed_rows == 1,
++            "draft limit was applied after computing discarded tokens");
++    require(limited.tokens[0][0] == full.tokens[0][0], "shorter depth changed the retained proposal prefix");
++    require(zero.computed_rows == 0 && replay.computed_rows == 0, "zero-width draft executed a forward");
++    require(mixed.tokens[0].size() == 1 && mixed.tokens[1].size() == 4 && mixed.tokens[2].empty() &&
++            mixed.tokens[3].size() == 48 && mixed.computed_rows == 53,
++            "mixed sequence budgets were not enforced before forwarding");
++    std::printf("PASS %s: real forward rows 48 -> 1 -> 0, mixed 53, unchanged retained prefix/target logits\n",
++                common_speculative_type_to_str(type).c_str());
++}
++}
++
++int main() {
++    try {
++        require(common_speculative_draft_limit(48, 1) == 1 && common_speculative_draft_limit(48, 0) == 0 &&
++                common_speculative_draft_limit(48, -1) == 48 && common_speculative_draft_limit(3, 48) == 3 &&
++                common_speculative_draft_limit(0, -1) == 0, "invalid effective draft budget");
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH) != nullptr, "cannot load the fixture's CPU backend");
++#else
++        ggml_backend_load_all();
++#endif
++        auto target = fixture("qwen35");
++        auto eagle = fixture("eagle3");
++        check_implementation(target.get(), target.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
++        check_implementation(target.get(), target.get(), COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
++        check_implementation(target.get(), eagle.get(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
++        auto eos = fixture("qwen35", true);
++        auto eos_eagle = fixture("eagle3", true);
++        for (const auto type : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
++                                COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3}) {
++            const auto end = run(eos.get(), type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ? eos_eagle.get() : eos.get(),
++                                 type, {-1});
++            require(end.tokens[0] == llama_tokens{preferred} && end.computed_rows == 1,
++                    "drafter continued computing after proposing end-of-generation");
++        }
++        std::puts("PASS real CPU MTP/simple/EAGLE3 depth, EOS, zero and replay isolation; no downloads");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}
