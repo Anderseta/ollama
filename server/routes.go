@@ -765,10 +765,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			ThinkingClose:   thinkingClose,
 		}, func(cr llm.CompletionResponse) {
 			res := api.GenerateResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now().UTC(),
-				Response:  cr.Content,
-				Done:      cr.Done,
+				PromptProgress: cr.PromptProgress,
+				Model:          req.Model,
+				CreatedAt:      time.Now().UTC(),
+				Response:       cr.Content,
+				Done:           cr.Done,
 				Metrics: api.Metrics{
 					PromptEvalCount:       cr.PromptEvalCount,
 					PromptEvalCachedCount: cr.PromptEvalCachedCount,
@@ -780,6 +781,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				Logprobs: toAPILogprobs(cr.Logprobs),
 			}
 
+			if cr.PromptProgress != nil && cr.Content == "" && !cr.Done {
+				sendResponse(ctx, ch, res)
+				return
+			}
 			if builtinParser != nil {
 				content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
 				if err != nil {
@@ -2933,6 +2938,7 @@ func (s *Server) PsHandler(c *gin.Context) {
 			ExpiresAt:     v.expiresAt,
 			ContextLength: contextLength,
 			Runner:        runner,
+			Loading:       v.loading,
 		}
 
 		models = append(models, mr)
@@ -3433,10 +3439,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			ThinkingClose:   thinkingCloseForCompletion(builtinParser, thinkTagParser),
 		}, func(r llm.CompletionResponse) {
 			res := api.ChatResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now().UTC(),
-				Message:   api.Message{Role: "assistant", Content: r.Content},
-				Done:      r.Done,
+				PromptProgress: r.PromptProgress,
+				Model:          req.Model,
+				CreatedAt:      time.Now().UTC(),
+				Message:        api.Message{Role: "assistant", Content: r.Content},
+				Done:           r.Done,
 				Metrics: api.Metrics{
 					PromptEvalCount:       r.PromptEvalCount,
 					PromptEvalCachedCount: r.PromptEvalCachedCount,
@@ -3452,6 +3459,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				res.DoneReason = r.DoneReason.String()
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+			}
+			if r.PromptProgress != nil && r.Content == "" && !r.Done {
+				sendResponse(ctx, ch, res)
+				return
 			}
 
 			if builtinParser != nil {
@@ -3492,17 +3503,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			if len(req.Tools) > 0 {
 				toolCalls, content := toolParser.Add(res.Message.Content)
-				if len(content) > 0 {
-					res.Message.Content = content
-				} else if len(toolCalls) > 0 {
-					for i := range toolCalls {
-						toolCalls[i].ID = toolCallId()
-					}
-					res.Message.ToolCalls = toolCalls
-					res.Message.Content = ""
-				} else if res.Message.Thinking != "" {
-					// don't return, fall through to send
-				} else {
+				res.Message.Content = content
+				for i := range toolCalls {
+					toolCalls[i].ID = toolCallId()
+				}
+				res.Message.ToolCalls = toolCalls
+				if content == "" && len(toolCalls) == 0 && res.Message.Thinking == "" {
 					//  Send logprobs while content is being buffered by the parser for tool calls
 					if len(res.Logprobs) > 0 && !r.Done {
 						logprobRes := res
@@ -3599,6 +3605,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 
 		err := r.Chat(streamCtx, nativeReq, func(r llm.ChatResponse) {
 			res := api.ChatResponse{
+				PromptProgress:     r.PromptProgress,
 				Model:              req.Model,
 				CreatedAt:          time.Now().UTC(),
 				Message:            r.Message,
@@ -3646,49 +3653,25 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 		return req.Messages, nil
 	}
 
-	lastMsgIdx := len(req.Messages) - 1
-	currMsgIdx := 0
-	starts := promptTruncationStarts(req.Messages)
-	var system []api.Message
 	var previousPrompt string
 	var previousTokenCount int
 	haveTokenCount := false
-	changedSinceRender := true
-
-	for i := 0; i <= lastMsgIdx; i++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if i > 0 {
-			if req.Messages[i-1].Role == "system" {
-				system = append(system, req.Messages[i-1])
-			} else {
-				changedSinceRender = true
-			}
-		}
-		if !starts[i] {
-			continue
-		}
-		if !changedSinceRender {
-			// Removing only preserved system messages produces the same input.
-			continue
-		}
-
+	currMsgIdx, err := fittingPromptStart(ctx, req.Messages, opts.NumCtx, monotonicPromptLimit(m, req.Messages, true), func(i int) (int, error) {
 		renderReq := req
-		renderReq.Messages = append(slices.Clone(system), req.Messages[i:]...)
+		renderReq.Messages = promptMessagesFrom(req.Messages, i)
 		var ctxLen int
 		if counter, ok := r.(interface {
 			ApplyChatTemplateWithTokenCount(context.Context, llm.ChatRequest) (string, int, error)
 		}); ok {
 			_, count, err := counter.ApplyChatTemplateWithTokenCount(ctx, renderReq)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			ctxLen = count
 		} else {
 			prompt, err := r.ApplyChatTemplate(ctx, renderReq)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			// Keep one exact prompt/count during preparation only. Templates can
 			// ignore old turns; avoid repeated tokenization without hashing or
@@ -3696,40 +3679,30 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 			if !haveTokenCount || prompt != previousPrompt {
 				tokens, err := r.Tokenize(ctx, prompt)
 				if err != nil {
-					return nil, err
+					return 0, err
 				}
 				previousPrompt, previousTokenCount = prompt, len(tokens)
 				haveTokenCount = true
 			}
 			ctxLen = previousTokenCount
 		}
-		changedSinceRender = false
 		if m != nil && m.ProjectorPaths != nil {
 			for _, msg := range renderReq.Messages {
 				ctxLen += 768 * len(msg.Images)
 			}
 		}
 
-		if ctxLen <= opts.NumCtx {
-			currMsgIdx = i
-			break
-		}
-		// If the last result belongs to an oversized tool group, retain its
-		// valid owner boundary rather than returning an orphan tool response.
-		currMsgIdx = i
+		return ctxLen, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	if currMsgIdx > 0 {
 		slog.Debug("truncating native chat messages which exceed context length", "truncated", currMsgIdx)
 	}
 
-	system = system[:0]
-	for j := range currMsgIdx {
-		if req.Messages[j].Role == "system" {
-			system = append(system, req.Messages[j])
-		}
-	}
-	return append(slices.Clone(system), req.Messages[currMsgIdx:]...), nil
+	return promptMessagesFrom(req.Messages, currMsgIdx), nil
 }
 
 func countChatImages(msgs []api.Message) int {

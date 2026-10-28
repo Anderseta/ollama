@@ -76,7 +76,9 @@ type Scheduler struct {
 	// happen in parallel
 	activeLoading  llm.LlamaServer
 	activeActivity *runnerActivityEntry
+	activeStatus   *loadedModel
 	loaded         map[string]*runnerRef
+	loadedSnapshot atomic.Pointer[loadedRunnerSnapshot]
 
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
@@ -89,15 +91,20 @@ type Scheduler struct {
 // are read-only after resolution, so callers may use them after releasing
 // loadedMu even if a runner unloads in the meantime.
 func (s *Scheduler) loadedModelsForName(name model.Name, requestedRunner string) []*Model {
-	s.loadedMu.Lock()
-	runners := make([]*runnerRef, 0, len(s.loaded))
-	for _, runner := range s.loaded {
-		runners = append(runners, runner)
+	snapshot := s.loadedSnapshot.Load()
+	if snapshot == nil {
+		// Support a zero-value Scheduler as well. Initialized schedulers always
+		// publish a registry, so live model resolution never takes this lock.
+		s.loadedMu.Lock()
+		snapshot = &loadedRunnerSnapshot{runners: make([]*runnerRef, 0, len(s.loaded))}
+		for _, runner := range s.loaded {
+			snapshot.runners = append(snapshot.runners, runner)
+		}
+		s.loadedMu.Unlock()
 	}
-	s.loadedMu.Unlock()
 
 	var models []*Model
-	for _, runner := range runners {
+	for _, runner := range snapshot.runners {
 		m := runner.model.Load()
 		if m == nil || !model.ParseName(m.Name).EqualFold(name) {
 			continue
@@ -138,6 +145,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		waitForRecovery: 5 * time.Second,
 	}
 	sched.loadFn = sched.load
+	sched.loadedSnapshot.Store(&loadedRunnerSnapshot{})
 	return sched
 }
 
@@ -258,13 +266,19 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	}
 
 	key := schedulerModelKey(req.model)
-	s.loadedMu.Lock()
-	runner := s.loaded[key]
-	s.loadedMu.Unlock()
-	if runner != nil && !runner.needsReload(c, req) {
-		req.useLoadedRunner(runner, s.finishedReqCh)
+	var runner *runnerRef
+	if snapshot := s.loadedSnapshot.Load(); snapshot != nil {
+		runner = snapshot.byKey[key]
+	}
+	if c.Err() == nil && runner != nil && !runner.needsReload(c, req) && req.useLoadedRunner(runner, s.finishedReqCh) {
+		return req.successCh, req.errCh
+	}
+	if err := c.Err(); err != nil {
+		req.errCh <- err
 	} else {
 		select {
+		case <-c.Done():
+			req.errCh <- c.Err()
 		case s.pendingReqCh <- req:
 		default:
 			req.errCh <- ErrMaxQueue
@@ -303,7 +317,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			}
 			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
 
+		pendingLoop:
 			for {
+				if ctx.Err() != nil {
+					s.discardPendingLoading(pending)
+					return
+				}
+				if pending.ctx.Err() != nil {
+					s.discardPendingLoading(pending)
+					break
+				}
 				var runnerToExpire *runnerRef
 				pendingKey := schedulerModelKey(pending.model)
 				s.loadedMu.Lock()
@@ -316,14 +339,19 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				s.loadedMu.Unlock()
 
 				if runner != nil {
-					if runner.needsReload(ctx, pending) {
+					if runner.needsReload(pending.ctx, pending) {
+						if pending.ctx.Err() != nil {
+							break
+						}
 						slog.Debug("reloading", "runner", runner)
 						runnerToExpire = runner
 					} else {
 						// Runner is usable, return it
 						logutil.Trace("using existing loaded runner", "model", pendingKey)
-						pending.useLoadedRunner(runner, s.finishedReqCh)
-						break
+						if pending.useLoadedRunner(runner, s.finishedReqCh) || pending.ctx.Err() != nil {
+							break
+						}
+						continue // the runner unloaded between its health check and reservation
 					}
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
@@ -356,6 +384,13 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// Update free memory from currently loaded models
 					logutil.Trace("updating free space", "gpu_count", len(gpus), "model", pending.model.ModelPath)
 					s.updateFreeSpace(gpus)
+					if ctx.Err() != nil || pending.ctx.Err() != nil {
+						s.discardPendingLoading(pending)
+						if ctx.Err() != nil {
+							return
+						}
+						break
+					}
 
 					if loadedCount == 0 {
 						// No models loaded. Load the model but prefer the best fit.
@@ -382,8 +417,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// load() has already set oomRetryAttempted so a second
 					// crash falls through to the fail-fast path.
 					if pending.oomRetryAttempted {
-						if !s.evictAllAndWait(ctx, pendingKey) {
-							return
+						if !s.evictAllAndWait(ctx, pending.ctx, pendingKey) {
+							s.discardPendingLoading(pending)
+							if ctx.Err() != nil {
+								return
+							}
+							break
 						}
 						continue
 					}
@@ -397,24 +436,23 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					slog.Debug("runner to expire was nil, retrying")
 					continue
 				}
-				// Trigger an expiration to unload once it's done
-				runnerToExpire.refMu.Lock()
-				slog.Debug("resetting model to expire immediately to make room", "runner", runnerToExpire, "refCount", runnerToExpire.refCount)
-				if runnerToExpire.expireTimer != nil {
-					runnerToExpire.expireTimer.Stop()
-					runnerToExpire.expireTimer = nil
+				enqueued, ok := s.expireIdleRunner(ctx, pending.ctx, runnerToExpire)
+				if !ok {
+					s.discardPendingLoading(pending)
+					break
 				}
-				runnerToExpire.sessionDuration = 0
-				if runnerToExpire.refCount <= 0 {
-					s.expiredCh <- runnerToExpire
+				if !enqueued {
+					continue
 				}
-				runnerToExpire.refMu.Unlock()
 				// Wait for the unload to happen
 				slog.Debug("waiting for pending requests to complete and unload to occur", "runner", runnerToExpire)
 				select {
 				case <-ctx.Done():
 					slog.Debug("shutting down scheduler pending loop")
 					return
+				case <-pending.ctx.Done():
+					s.discardPendingLoading(pending)
+					break pendingLoop
 				case <-s.unloadedCh:
 					slog.Debug("unload completed", "runner", runnerToExpire)
 					continue
@@ -446,6 +484,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			runner.refMu.Lock()
 			runner.refCount--
 			if runner.refCount <= 0 {
+				runner.notifyIdleLocked()
 				if runner.sessionDuration <= 0 {
 					slog.Debug("runner with zero duration has gone idle, expiring to unload", "runner", runner)
 					if runner.expireTimer != nil {
@@ -473,6 +512,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				}
 			}
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
+			runner.publishStatusLocked()
 			runner.refMu.Unlock()
 		case runner := <-s.expiredCh:
 			slog.Debug("runner expired event received", "runner", runner)
@@ -521,6 +561,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				finished := s.waitForVRAMRecovery(runner, runnersSnapshot)
 				runner.unload()
 				delete(s.loaded, runner.modelKey)
+				s.publishLoadedSnapshotLocked()
 				s.loadedMu.Unlock()
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
@@ -535,9 +576,14 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 // Complete the pending request and send the runner back to the requester
 // Wires up a finished event after the request context is completed
 // Updates session duration, and resets expiration timer
-func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) {
-	runner.refMu.Lock()
+func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) bool {
+	if !runner.refMu.lockContext(pending.ctx, pending.ctx) {
+		return false
+	}
 	defer runner.refMu.Unlock()
+	if !runner.matchesRequestLocked(pending) {
+		return false
+	}
 	runner.refCount++
 	runner.lastUsed = time.Now()
 	runner.useCount++
@@ -548,12 +594,111 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	if pending.sessionDuration != nil {
 		runner.sessionDuration = pending.sessionDuration.Duration
 	}
+	runner.publishStatusLocked()
 	pending.successCh <- runner
 	go func() {
 		<-pending.ctx.Done()
 		slog.Debug("context for request finished", "runner", runner)
 		finished <- pending
 	}()
+	return true
+}
+
+func (s *Scheduler) discardPendingLoading(req *LlmRequest) {
+	wantPath := req.model.ModelPath
+	if wantPath == "" {
+		wantPath = req.model.ShortName
+	}
+	s.loadedMu.Lock()
+	loading := s.activeLoading
+	if loading != nil && loading.ModelPath() == wantPath {
+		s.activeLoading, s.activeActivity = nil, nil
+		s.activeStatus = nil
+		s.publishLoadedSnapshotLocked()
+	} else {
+		loading = nil
+	}
+	s.loadedMu.Unlock()
+	if loading != nil {
+		loading.Close()
+	}
+}
+
+func (runner *runnerRef) notifyIdleLocked() {
+	if runner.idleCh != nil {
+		close(runner.idleCh)
+		runner.idleCh = nil
+	}
+}
+
+func (runner *runnerRef) waitForIdle(ctx, requestCtx context.Context) bool {
+	for {
+		if ctx.Err() != nil || requestCtx.Err() != nil {
+			return false
+		}
+		if !runner.refMu.lockContext(ctx, requestCtx) {
+			return false
+		}
+		if runner.refCount == 0 || runner.unloaded {
+			runner.refMu.Unlock()
+			return true
+		}
+		if runner.idleCh == nil {
+			runner.idleCh = make(chan struct{})
+		}
+		idle := runner.idleCh
+		runner.refMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-requestCtx.Done():
+			return false
+		case <-idle:
+		}
+	}
+}
+
+// Waiting requests must not change a busy model's keep-alive policy: the
+// request may be cancelled before it needs any of that model's memory.
+func (s *Scheduler) expireIdleRunner(ctx, requestCtx context.Context, runner *runnerRef) (enqueued, ok bool) {
+	for runner.waitForIdle(ctx, requestCtx) {
+		if !runner.refMu.lockContext(ctx, requestCtx) {
+			return false, false
+		}
+		if ctx.Err() != nil || requestCtx.Err() != nil {
+			runner.refMu.Unlock()
+			return false, false
+		}
+		if runner.unloaded {
+			runner.refMu.Unlock()
+			return false, true
+		}
+		if runner.refCount > 0 {
+			runner.refMu.Unlock()
+			continue
+		}
+		select {
+		case s.expiredCh <- runner:
+			if runner.expireTimer != nil {
+				runner.expireTimer.Stop()
+				runner.expireTimer = nil
+			}
+			runner.sessionDuration = 0
+			runner.publishStatusLocked()
+			runner.refMu.Unlock()
+			return true, true
+		default:
+			runner.refMu.Unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return false, false
+		case <-requestCtx.Done():
+			return false, false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return false, false
 }
 
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
@@ -717,6 +862,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 		s.activeLoading = llama
 		s.activeActivity = newRunnerActivity(req.model, llama, launchOpts)
+		s.activeStatus = &loadedModel{model: req.model, runner: loadedRunnerName(req.model, llama),
+			contextLength: req.opts.NumCtx, sessionDuration: sessionDuration, loading: true, llama: llama}
+		s.publishLoadedSnapshotLocked()
 	} else {
 		wantPath := req.model.ModelPath
 		if wantPath == "" {
@@ -752,9 +900,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			if !requireFull {
 				// No other models loaded, yet we still don't fit, so report an error
 				slog.Info("model is too large for system memory", "requireFull", requireFull)
-				s.activeLoading.Close()
-				s.activeLoading = nil
-				s.activeActivity = nil
+				llama.Close()
+				s.loadedMu.Lock()
+				s.activeLoading, s.activeActivity, s.activeStatus = nil, nil, nil
+				s.publishLoadedSnapshotLocked()
+				s.loadedMu.Unlock()
 				req.errCh <- err
 				return false
 			}
@@ -762,11 +912,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		}
 
 		slog.Info("Load failed", "model", req.model.ModelPath, "error", err)
-		s.activeLoading.Close()
-		s.activeLoading = nil
-		s.activeActivity = nil
-
+		llama.Close()
 		s.loadedMu.Lock()
+		s.activeLoading, s.activeActivity, s.activeStatus = nil, nil, nil
+		s.publishLoadedSnapshotLocked()
 		loadedCount := len(s.loaded)
 		s.loadedMu.Unlock()
 		otherLoaded := loadedCount > 0
@@ -817,14 +966,7 @@ iGPUScan:
 		req.opts.NumCtx = effectiveNumCtx
 		req.contextShift = resolveContextShift(req.shift, req.model)
 	}
-	runnerName := req.model.Runner
-	if req.model.IsMLX() && runnerName == "" {
-		runnerName = manifest.RunnerMLX
-	} else if llm.IsLlamaCPP(llama) {
-		// The loaded process is authoritative: a llama.cpp server may serve
-		// the model even when the manifest metadata says ggml.
-		runnerName = manifest.RunnerLlamaCPP
-	}
+	runnerName := loadedRunnerName(req.model, llama)
 	runner := &runnerRef{
 		modelPath:       req.model.ModelPath,
 		modelKey:        schedulerModelKey(req.model),
@@ -847,6 +989,7 @@ iGPUScan:
 	}
 	runner.model.Store(req.model)
 	runner.numParallel = numParallel
+	runner.publishStatusLocked()
 	runner.refMu.Lock() // hold lock until running or aborted
 
 	s.loadedMu.Lock()
@@ -859,13 +1002,19 @@ iGPUScan:
 	}
 	s.activeLoading = nil
 	s.activeActivity = nil
+	s.activeStatus = nil
 	s.loaded[runner.modelKey] = runner
+	s.publishLoadedSnapshotLocked()
 	slog.Info("loaded runners", "count", len(s.loaded))
 	s.loadedMu.Unlock()
 
 	go func() {
 		defer runner.refMu.Unlock()
-		if err = llama.WaitUntilRunning(req.ctx); err != nil {
+		err = llama.WaitUntilRunning(req.ctx)
+		if err == nil {
+			err = req.ctx.Err()
+		}
+		if err != nil {
 			slog.Error("error loading llama server", "error", err)
 			req.errCh <- err
 			slog.Debug("triggering expiration for failed load", "runner", runner)
@@ -881,6 +1030,7 @@ iGPUScan:
 		runner.loadDuration = time.Since(loadStarted)
 		runner.lastUsed = time.Now()
 		runner.useCount++
+		runner.publishStatusLocked()
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
@@ -1491,8 +1641,10 @@ type runnerRef struct {
 	lastUsed     time.Time
 	loadDuration time.Duration
 	useCount     uint64
-	refMu        sync.Mutex
+	refMu        contextMutex
 	refCount     uint // prevent unloading if > 0
+	idleCh       chan struct{}
+	unloaded     bool
 
 	llama        llm.LlamaServer
 	pid          int
@@ -1509,6 +1661,7 @@ type runnerRef struct {
 
 	// model is atomic so lookups can read it without contending on refMu.
 	model        atomic.Pointer[Model]
+	status       atomic.Pointer[loadedModel]
 	modelPath    string
 	modelKey     string
 	numParallel  int
@@ -1522,6 +1675,8 @@ type runnerRef struct {
 
 // The refMu must already be held when calling unload
 func (runner *runnerRef) unload() {
+	runner.notifyIdleLocked()
+	runner.unloaded = true
 	if runner.expireTimer != nil {
 		runner.expireTimer.Stop()
 		runner.expireTimer = nil
@@ -1530,6 +1685,7 @@ func (runner *runnerRef) unload() {
 		runner.llama.Close()
 	}
 	runner.model.Store(nil)
+	runner.status.Store(nil)
 	runner.Options = nil
 	runner.gpus = nil
 	runner.contextShift = false
@@ -1537,16 +1693,36 @@ func (runner *runnerRef) unload() {
 
 func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool {
 	slog.Debug("evaluating already loaded", "model", schedulerModelKey(req.model))
-	runner.refMu.Lock()
-	defer runner.refMu.Unlock()
+	if !runner.refMu.lockContext(ctx, ctx) {
+		return true
+	}
+	if !runner.matchesRequestLocked(req) {
+		runner.refMu.Unlock()
+		return true
+	}
 
 	timeout := 10 * time.Second
 	if runner.loading {
 		timeout = 2 * time.Minute // Initial load can take a long time for big models on slow systems...
 	}
-
-	if runner.Options == nil {
+	llama := runner.llama
+	runner.refMu.Unlock()
+	// A health check is I/O, never a runner critical section. An unload can
+	// proceed while it waits; validate again before granting a reference.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if llama.Ping(ctx) != nil || !runner.refMu.lockContext(ctx, ctx) {
 		return true
+	}
+	defer runner.refMu.Unlock()
+	return !runner.matchesRequestLocked(req)
+}
+
+// The caller holds refMu. The same validation runs after Ping and directly
+// before reservation, closing the health-check/unload race.
+func (runner *runnerRef) matchesRequestLocked(req *LlmRequest) bool {
+	if runner.unloaded || runner.Options == nil || runner.llama == nil || req.model == nil {
+		return false
 	}
 
 	// Don't reload runner if num_gpu=-1 was provided
@@ -1572,22 +1748,19 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 		contextShift = resolveContextShift(req.shift, req.model)
 	}
 	if runner.contextShift != contextShift {
-		return true
+		return false
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	loaded := runner.model.Load()
 	if loaded == nil ||
 		!reflect.DeepEqual(loaded.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(loaded.ProjectorPaths, req.model.ProjectorPaths) || // have the projectors changed?
 		loaded.DraftPath != req.model.DraftPath || !slices.Equal(loaded.DraftShardPaths, req.model.DraftShardPaths) ||
-		(!loaded.IsMLX() && !reflect.DeepEqual(optsExisting, optsNew)) || // have the runner options changed?
-		runner.llama.Ping(ctx) != nil {
-		return true
+		(!loaded.IsMLX() && !reflect.DeepEqual(optsExisting, optsNew)) { // have the runner options changed?
+		return false
 	}
 
-	return false
+	return true
 }
 
 // Free memory reporting on GPUs can lag for a while even after the runner
@@ -1753,7 +1926,7 @@ func (a ByDurationAndName) Less(i, j int) bool {
 // the one being loaded (matched by modelKey) and waits for all unload events
 // to drain. Returns false if the context was cancelled mid-wait so the caller
 // can exit the scheduling loop. Used by the OOM retry path in processPending.
-func (s *Scheduler) evictAllAndWait(ctx context.Context, keepKey string) bool {
+func (s *Scheduler) evictAllAndWait(ctx, requestCtx context.Context, keepKey string) bool {
 	s.loadedMu.Lock()
 	runnersToExpire := make([]*runnerRef, 0, len(s.loaded))
 	for key, r := range s.loaded {
@@ -1770,24 +1943,29 @@ func (s *Scheduler) evictAllAndWait(ctx context.Context, keepKey string) bool {
 
 	slog.Info("evicting all other loaded models for OOM retry", "count", len(runnersToExpire))
 	for _, runner := range runnersToExpire {
-		runner.refMu.Lock()
-		if runner.expireTimer != nil {
-			runner.expireTimer.Stop()
-			runner.expireTimer = nil
+		if !runner.waitForIdle(ctx, requestCtx) {
+			return false
 		}
-		runner.sessionDuration = 0
-		if runner.refCount <= 0 {
-			s.expiredCh <- runner
+	}
+	unloads := 0
+	for _, runner := range runnersToExpire {
+		enqueued, ok := s.expireIdleRunner(ctx, requestCtx, runner)
+		if !ok {
+			return false
 		}
-		runner.refMu.Unlock()
+		if enqueued {
+			unloads++
+		}
 	}
 
 	// Wait for every unload event. Each runner produces exactly one
 	// unloadedCh signal when its cleanup finishes.
-	for range runnersToExpire {
+	for range unloads {
 		select {
 		case <-ctx.Done():
 			slog.Debug("shutting down scheduler during evict-all wait")
+			return false
+		case <-requestCtx.Done():
 			return false
 		case <-s.unloadedCh:
 		}
@@ -1819,6 +1997,7 @@ func (s *Scheduler) expireRunnersForRuntimeOOM(model *Model, err error) {
 			runner.expireTimer = nil
 		}
 		runner.sessionDuration = 0
+		runner.publishStatusLocked()
 		if runner.refCount <= 0 {
 			s.expiredCh <- runner
 		}
@@ -1892,6 +2071,8 @@ func (s *Scheduler) unloadAllRunners() {
 		s.activeLoading.Close()
 		s.activeLoading = nil
 		s.activeActivity = nil
+		s.activeStatus = nil
+		s.publishLoadedSnapshotLocked()
 	}
 
 	for model, runner := range s.loaded {
@@ -1926,6 +2107,7 @@ func (s *Scheduler) expireRunner(model *Model) {
 			runner.expireTimer = nil
 		}
 		runner.sessionDuration = 0
+		runner.publishStatusLocked()
 		if runner.refCount <= 0 {
 			s.expiredCh <- runner
 		}
@@ -1936,56 +2118,93 @@ func (s *Scheduler) expireRunner(model *Model) {
 // loadedModel is a point-in-time snapshot of a loaded runner's state, safe to
 // use without holding any scheduler locks.
 type loadedModel struct {
-	model         *Model
-	runner        string
-	size          int64
-	sizeVRAM      int64
-	contextLength int
-	expiresAt     time.Time
+	model           *Model
+	runner          string
+	size            int64
+	sizeVRAM        int64
+	contextLength   int
+	expiresAt       time.Time
+	sessionDuration time.Duration
+	loading         bool
+	llama           llm.LlamaServer
+}
+
+type loadedRunnerSnapshot struct {
+	runners []*runnerRef
+	byKey   map[string]*runnerRef
+	loading *loadedModel
+}
+
+func loadedRunnerName(model *Model, runner llm.LlamaServer) string {
+	name := model.Runner
+	if model.IsMLX() && name == "" {
+		return manifest.RunnerMLX
+	}
+	if llm.IsLlamaCPP(runner) {
+		// The loaded process is authoritative even for legacy manifests.
+		return manifest.RunnerLlamaCPP
+	}
+	return name
+}
+
+// The caller holds loadedMu; published registries are immutable.
+func (s *Scheduler) publishLoadedSnapshotLocked() {
+	snapshot := &loadedRunnerSnapshot{runners: make([]*runnerRef, 0, len(s.loaded)), byKey: make(map[string]*runnerRef, len(s.loaded)), loading: s.activeStatus}
+	for key, runner := range s.loaded {
+		snapshot.runners = append(snapshot.runners, runner)
+		snapshot.byKey[key] = runner
+	}
+	s.loadedSnapshot.Store(snapshot)
+}
+
+// The caller holds refMu, or has not published this runner yet.
+func (runner *runnerRef) publishStatusLocked() {
+	status := &loadedModel{
+		model: runner.model.Load(), runner: runner.runner, size: int64(runner.totalSize),
+		sizeVRAM: int64(runner.vramSize), expiresAt: runner.expiresAt,
+		sessionDuration: runner.sessionDuration, loading: runner.loading, llama: runner.llama,
+	}
+	if runner.Options != nil {
+		status.contextLength = runner.Options.NumCtx
+	}
+	runner.status.Store(status)
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
 // reporting without exposing the scheduler's internal runner bookkeeping.
 func (s *Scheduler) loadedModels() []loadedModel {
-	s.loadedMu.Lock()
-	runners := make([]*runnerRef, 0, len(s.loaded))
-	for _, r := range s.loaded {
-		runners = append(runners, r)
+	registry := s.loadedSnapshot.Load()
+	if registry == nil {
+		return nil
 	}
-	s.loadedMu.Unlock()
-
-	// refMu must not be acquired while holding loadedMu: the expiration path
-	// locks them in the opposite order.
-	models := make([]loadedModel, 0, len(runners))
-	for _, r := range runners {
-		r.refMu.Lock()
+	models := make([]loadedModel, 0, len(registry.runners))
+	if registry.loading != nil {
+		models = append(models, registry.loading.current())
+	}
+	for _, r := range registry.runners {
+		status := r.status.Load()
 		m := r.model.Load()
-		if m == nil {
+		if m == nil || status == nil {
 			// Unloaded after the snapshot above was taken
-			r.refMu.Unlock()
 			continue
 		}
-		lm := loadedModel{
-			model:     m,
-			runner:    r.runner,
-			size:      int64(r.totalSize),
-			sizeVRAM:  int64(r.vramSize),
-			expiresAt: r.expiresAt,
-		}
-		if r.llama != nil {
-			lm.contextLength = r.llama.ContextLength()
-			total, vram := r.llama.MemorySize()
-			lm.size = int64(total)
-			lm.sizeVRAM = int64(vram)
-		}
-		// The scheduler waits to set expiresAt, so a model that is still
-		// loading may have the zero value. Estimate expiration from the
-		// session duration instead.
-		if lm.expiresAt.IsZero() {
-			lm.expiresAt = time.Now().Add(r.sessionDuration)
-		}
-		r.refMu.Unlock()
-		models = append(models, lm)
+		lm := *status
+		lm.model = m
+		models = append(models, lm.current())
 	}
 	return models
+}
+
+func (status loadedModel) current() loadedModel {
+	// Both backends expose local memory/context snapshots, without HTTP or
+	// scheduler locks. Memory may grow while the native process is loading.
+	if status.llama != nil {
+		status.contextLength = status.llama.ContextLength()
+		total, vram := status.llama.MemorySize()
+		status.size, status.sizeVRAM = int64(total), int64(vram)
+	}
+	if status.expiresAt.IsZero() {
+		status.expiresAt = time.Now().Add(status.sessionDuration)
+	}
+	return status
 }

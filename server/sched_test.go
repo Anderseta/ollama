@@ -611,6 +611,7 @@ func TestSchedGetRunnerUsesDigestKeyWhenModelPathEmpty(t *testing.T) {
 
 	s.loadedMu.Lock()
 	s.loaded[loadedRunner.modelKey] = loadedRunner
+	s.publishLoadedSnapshotLocked()
 	s.loadedMu.Unlock()
 
 	reqModel := &Model{Name: "safetensors-b", Digest: "sha-b"}
@@ -648,6 +649,7 @@ func TestSchedGetRunnerUsesManifestDigestKeyWhenModelPathEmpty(t *testing.T) {
 
 	s.loadedMu.Lock()
 	s.loaded[loadedRunner.modelKey] = loadedRunner
+	s.publishLoadedSnapshotLocked()
 	s.loadedMu.Unlock()
 
 	reqModel := &Model{Name: "list", Digest: "parent", ManifestDigest: "child-b"}
@@ -677,6 +679,7 @@ func TestSchedGetRunnerReusesSameDigestWhenModelPathEmpty(t *testing.T) {
 
 	s.loadedMu.Lock()
 	s.loaded[loadedRunner.modelKey] = loadedRunner
+	s.publishLoadedSnapshotLocked()
 	s.loadedMu.Unlock()
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
@@ -835,6 +838,9 @@ func TestSchedUseLoadedRunner(t *testing.T) {
 	finished := make(chan *LlmRequest)
 	llm1 := &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}}
 	r1 := &runnerRef{llama: llm1, sessionDuration: 1, numParallel: 1}
+	req.model = &Model{}
+	r1.Options = &req.opts
+	r1.model.Store(req.model)
 	req.useLoadedRunner(r1, finished)
 	require.Equal(t, uint(1), r1.refCount)
 	require.Equal(t, time.Duration(2), r1.sessionDuration)

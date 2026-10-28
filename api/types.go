@@ -521,9 +521,19 @@ type Logprob struct {
 	TopLogprobs []TokenLogprob `json:"top_logprobs,omitempty"`
 }
 
+// PromptProgress reports actual native prompt evaluation, before generation.
+// Cached and processed count different parts of Total; neither is output tokens.
+type PromptProgress struct {
+	Total     int     `json:"total"`
+	Cached    int     `json:"cached"`
+	Processed int     `json:"processed"`
+	ElapsedMS float64 `json:"elapsed_ms"`
+}
+
 // ChatResponse is the response returned by [Client.Chat]. Its fields are
 // similar to [GenerateResponse].
 type ChatResponse struct {
+	PromptProgress *PromptProgress `json:"prompt_progress,omitempty"`
 	// Model is the model name that generated the response.
 	Model string `json:"model"`
 
@@ -972,6 +982,7 @@ type ProcessModelResponse struct {
 	SizeVRAM      int64        `json:"size_vram"`
 	ContextLength int          `json:"context_length"`
 	Runner        string       `json:"runner,omitempty"`
+	Loading       bool         `json:"loading,omitempty"`
 }
 
 type TokenResponse struct {
@@ -1020,6 +1031,7 @@ type WebFetchResponse struct {
 
 // GenerateResponse is the response passed into [GenerateResponseFunc].
 type GenerateResponse struct {
+	PromptProgress *PromptProgress `json:"prompt_progress,omitempty"`
 	// Model is the model name that generated the response.
 	Model string `json:"model"`
 

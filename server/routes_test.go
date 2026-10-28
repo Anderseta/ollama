@@ -567,6 +567,10 @@ func TestPsHandlerUsesRunningManifestAndRunner(t *testing.T) {
 			},
 		},
 	}
+	for _, runner := range s.sched.loaded {
+		runner.publishStatusLocked()
+	}
+	s.sched.publishLoadedSnapshotLocked()
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

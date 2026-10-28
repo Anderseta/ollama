@@ -678,6 +678,9 @@ func TestListRunningHandlerShowsRunner(t *testing.T) {
 					Runner:        "mlx",
 					ExpiresAt:     time.Now().Add(time.Hour),
 				},
+				{
+					Name: "loading-model:latest", Digest: "abc", Loading: true,
+				},
 			},
 		}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -697,9 +700,15 @@ func TestListRunningHandlerShowsRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{"CONTEXT", "RUNNER", "abcdef123456", "mlx"} {
+	for _, want := range []string{"CONTEXT", "RUNNER", "abcdef123456", "mlx", "loading-model:latest", "Loading..."} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "loading-model") &&
+			(!strings.Contains(line, "Loading...") || strings.Contains(line, "100% CPU") || strings.Contains(line, "Stopping...")) {
+			t.Fatalf("in-flight model has a misleading state: %s", line)
 		}
 	}
 }

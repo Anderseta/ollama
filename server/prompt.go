@@ -29,57 +29,30 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	// Clip images are represented as 768 tokens, each an embedding.
 	imageNumTokens := 768
 
-	lastMsgIdx := len(msgs) - 1
 	currMsgIdx := 0
 
 	if truncate {
-		starts := promptTruncationStarts(msgs)
-		lastValid := 0
-		fit := false
-		// Start with all messages and remove from the front until it fits in context
-		for i := 0; i <= lastMsgIdx; i++ {
-			if err := ctx.Err(); err != nil {
-				return "", nil, err
-			}
-			if i > 0 && msgs[i-1].Role == "system" {
-				system = append(system, msgs[i-1])
-			}
-			if !starts[i] {
-				continue
-			}
-			lastValid = i
-
-			p, err := renderPrompt(m, append(system, msgs[i:]...), tools, think)
+		var err error
+		currMsgIdx, err = fittingPromptStart(ctx, msgs, opts.NumCtx, monotonicPromptLimit(m, msgs, false), func(i int) (int, error) {
+			candidate := promptMessagesFrom(msgs, i)
+			p, err := renderPrompt(m, candidate, tools, think)
 			if err != nil {
-				return "", nil, err
+				return 0, err
 			}
-
 			s, err := tokenize(ctx, p)
 			if err != nil {
-				return "", nil, err
+				return 0, err
 			}
-
 			ctxLen := len(s)
 			if m.ProjectorPaths != nil {
-				for _, msg := range msgs[i:] {
+				for _, msg := range candidate {
 					ctxLen += imageNumTokens * len(msg.Images)
 				}
 			}
-
-			if ctxLen <= opts.NumCtx {
-				currMsgIdx = i
-				fit = true
-				break
-			}
-
-			// Must always include at least the last message
-			if i == lastMsgIdx {
-				currMsgIdx = lastMsgIdx
-				break
-			}
-		}
-		if !fit {
-			currMsgIdx = lastValid
+			return ctxLen, nil
+		})
+		if err != nil {
+			return "", nil, err
 		}
 		system = nil
 		for _, message := range msgs[:currMsgIdx] {

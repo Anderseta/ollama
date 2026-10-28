@@ -27,6 +27,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -247,7 +248,24 @@ func (s *llamaServerRunner) GetPort() int {
 }
 
 func (s *llamaServerRunner) HasExited() bool {
-	return s.cmd != nil && s.cmd.ProcessState != nil && s.cmd.ProcessState.ExitCode() >= 0
+	return s.exitedProcessState() != nil
+}
+
+// Cmd.Wait writes ProcessState. Receiving done establishes the happens-before
+// relation for health checks, discovery and concurrent shutdown; reading the
+// field merely to check for nil while Wait runs is itself a data race.
+func (s *llamaServerRunner) exitedProcessState() *os.ProcessState {
+	if s.done != nil {
+		select {
+		case <-s.done:
+		default:
+			return nil
+		}
+	}
+	if s.cmd == nil {
+		return nil
+	}
+	return s.cmd.ProcessState
 }
 
 func (s *llamaServerRunner) llamaServerMediaMarker() string {
@@ -1369,12 +1387,12 @@ func (s *llamaServerRunner) lastLoadActivity() time.Time {
 // getServerStatus checks llama-server's /health endpoint.
 // llama-server returns {"status":"ok"}, {"status":"loading model"}, or {"status":"error"}.
 func (s *llamaServerRunner) getServerStatus(ctx context.Context) (ServerStatus, error) {
-	if s.cmd.ProcessState != nil {
+	if state := s.exitedProcessState(); state != nil {
 		msg := s.lastErrMsg()
-		if s.cmd.ProcessState.ExitCode() == -1 {
-			slog.Warn("llama-server process no longer running", "sys", s.cmd.ProcessState.Sys(), "string", s.cmd.ProcessState)
+		if state.ExitCode() == -1 {
+			slog.Warn("llama-server process no longer running", "sys", state.Sys(), "string", state)
 		}
-		return ServerStatusError, fmt.Errorf("llama-server process no longer running: %s %s", ExitStatus(s.cmd.ProcessState.ExitCode()), msg)
+		return ServerStatusError, fmt.Errorf("llama-server process no longer running: %s %s", ExitStatus(state.ExitCode()), msg)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/health", s.port), nil)
@@ -1384,6 +1402,9 @@ func (s *llamaServerRunner) getServerStatus(ctx context.Context) (ServerStatus, 
 
 	resp, err := s.httpClient().Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ServerStatusNotResponding, ctx.Err()
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return ServerStatusNotResponding, errors.New("server not responding")
 		}
@@ -1515,9 +1536,9 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 			return fmt.Errorf("timed out waiting for llama-server to start - %s", msg)
 		}
 
-		if s.cmd.ProcessState != nil {
+		if state := s.exitedProcessState(); state != nil {
 			msg := s.lastErrMsg()
-			return fmt.Errorf("llama-server process no longer running: %s %s", ExitStatus(s.cmd.ProcessState.ExitCode()), msg)
+			return fmt.Errorf("llama-server process no longer running: %s %s", ExitStatus(state.ExitCode()), msg)
 		}
 
 		pollCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
@@ -1577,6 +1598,7 @@ type llamaServerCompletionRequest struct {
 	Prompt              any             `json:"prompt"`
 	Stream              bool            `json:"stream"`
 	CachePrompt         bool            `json:"cache_prompt"`
+	ReturnProgress      bool            `json:"return_progress,omitempty"`
 	NPredict            int             `json:"n_predict,omitempty"`
 	NKeep               int             `json:"n_keep,omitempty"`
 	Temperature         float32         `json:"temperature"`
@@ -1729,11 +1751,12 @@ type llamaServerMultimodalPrompt struct {
 
 // llamaServerCompletionResponse is the response format from llama-server's /completion endpoint.
 type llamaServerCompletionResponse struct {
-	Content                 string                 `json:"content"`
-	Stop                    bool                   `json:"stop"`
-	StopType                string                 `json:"stop_type"`
-	Timings                 llamaServerTimings     `json:"timings"`
-	CompletionProbabilities []llamaServerTokenProb `json:"completion_probabilities"`
+	PromptProgress          *llamaServerPromptProgress `json:"prompt_progress"`
+	Content                 string                     `json:"content"`
+	Stop                    bool                       `json:"stop"`
+	StopType                string                     `json:"stop_type"`
+	Timings                 llamaServerTimings         `json:"timings"`
+	CompletionProbabilities []llamaServerTokenProb     `json:"completion_probabilities"`
 }
 
 type llamaServerChatChoice struct {
@@ -1757,9 +1780,41 @@ type llamaServerChatChoice struct {
 }
 
 type llamaServerChatResponse struct {
-	Choices []llamaServerChatChoice `json:"choices"`
-	Timings llamaServerTimings      `json:"timings"`
-	Error   any                     `json:"error"`
+	PromptProgress *llamaServerPromptProgress `json:"prompt_progress"`
+	Choices        []llamaServerChatChoice    `json:"choices"`
+	Timings        llamaServerTimings         `json:"timings"`
+	Error          any                        `json:"error"`
+}
+
+type llamaServerPromptProgress struct {
+	Total     int     `json:"total"`
+	Cache     int     `json:"cache"`
+	Processed int     `json:"processed"`
+	TimeMS    float64 `json:"time_ms"`
+}
+
+// Native progress can arrive once per microbatch. Keep public updates bounded,
+// while always publishing the first measurement and completed prefill.
+type llamaServerProgressEmitter struct {
+	last         time.Time
+	lastComplete bool
+}
+
+func (e *llamaServerProgressEmitter) next(p *llamaServerPromptProgress) *api.PromptProgress {
+	if p == nil || p.Total <= 0 || p.Cache < 0 || p.Processed < p.Cache ||
+		p.Cache > p.Total || p.Processed > p.Total ||
+		p.TimeMS < 0 || math.IsNaN(p.TimeMS) || math.IsInf(p.TimeMS, 0) {
+		return nil
+	}
+	complete := p.Processed == p.Total
+	now := time.Now()
+	if !e.last.IsZero() && now.Sub(e.last) < 250*time.Millisecond && (!complete || e.lastComplete) {
+		return nil
+	}
+	e.last, e.lastComplete = now, complete
+	// Native processed includes the reused prefix (slot.prompt.tokens.size).
+	// Expose newly evaluated tokens separately from cached tokens.
+	return &api.PromptProgress{Total: p.Total, Cached: p.Cache, Processed: p.Processed - p.Cache, ElapsedMS: p.TimeMS}
 }
 
 type llamaServerTimings struct {
@@ -1829,6 +1884,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		Prompt:              prompt,
 		Stream:              true,
 		CachePrompt:         true,
+		ReturnProgress:      true,
 		NPredict:            req.Options.NumPredict,
 		NKeep:               req.Options.NumKeep,
 		Temperature:         req.Options.Temperature,
@@ -1914,8 +1970,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		slog.Error("llama-server completion error", "error", err)
 		if msg := s.lastErrMsg(); msg != "" {
@@ -1945,6 +2001,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	var tokenRepeat int
 	var finalResp CompletionResponse
 	var hasFinalResp bool
+	var progress llamaServerProgressEmitter
 
 	for scanner.Scan() {
 		select {
@@ -1967,6 +2024,11 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			var lsResp llamaServerCompletionResponse
 			if err := json.Unmarshal(evt, &lsResp); err != nil {
 				return fmt.Errorf("error unmarshalling llama-server response: %v", err)
+			}
+			if !lsResp.Stop {
+				if p := progress.next(lsResp.PromptProgress); p != nil {
+					fn(CompletionResponse{PromptProgress: p})
+				}
 			}
 
 			// Only generated content participates in loop detection. Protocol-only
@@ -2024,6 +2086,9 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		}
 
 		if err := scanner.Err(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err := llamaServerStreamLimitError("response", err); err != nil {
 				return err
 			}
@@ -2039,6 +2104,9 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	}
 
 	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err := llamaServerStreamLimitError("response", err); err != nil {
 			return err
 		}
@@ -2245,8 +2313,8 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 
 	res, err := s.httpClient().Do(serverReq)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		slog.Error("llama-server chat error", "error", err)
 		if msg := s.lastErrMsg(); msg != "" {
@@ -2272,6 +2340,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	toolCalls := map[int]*llamaServerToolCallAccumulator{}
 	var finalResp ChatResponse
 	var hasFinalResp bool
+	var progress llamaServerProgressEmitter
 
 	for scanner.Scan() {
 		select {
@@ -2300,6 +2369,11 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 			}
 			if lsResp.Error != nil {
 				return fmt.Errorf("llama-server chat error: %v", lsResp.Error)
+			}
+			if len(lsResp.Choices) == 0 || lsResp.Choices[0].FinishReason == nil {
+				if p := progress.next(lsResp.PromptProgress); p != nil {
+					fn(ChatResponse{Message: api.Message{Role: "assistant"}, PromptProgress: p})
+				}
 			}
 			if len(lsResp.Choices) == 0 {
 				continue
@@ -2341,7 +2415,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
 				resp.GPUFirst = lsResp.Timings.GPUFirst
-				completedCalls, err := accumulatedToolCalls(toolCalls)
+				completedCalls, err := accumulatedToolCalls(toolCalls, doneReason != DoneReasonLength)
 				if err != nil {
 					if doneReason != DoneReasonLength {
 						return err
@@ -2371,6 +2445,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		}
 
 		if err := scanner.Err(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err := llamaServerStreamLimitError("chat response", err); err != nil {
 				return err
 			}
@@ -2386,6 +2463,9 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	}
 
 	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err := llamaServerStreamLimitError("chat response", err); err != nil {
 			return err
 		}
@@ -2432,7 +2512,7 @@ type llamaServerChatToolCall struct {
 	} `json:"function"`
 }
 
-func accumulatedToolCalls(accs map[int]*llamaServerToolCallAccumulator) ([]api.ToolCall, error) {
+func accumulatedToolCalls(accs map[int]*llamaServerToolCallAccumulator, allowMissingArguments bool) ([]api.ToolCall, error) {
 	if len(accs) == 0 {
 		return nil, nil
 	}
@@ -2455,8 +2535,20 @@ func accumulatedToolCalls(accs map[int]*llamaServerToolCallAccumulator) ([]api.T
 			continue
 		}
 
+		if strings.TrimSpace(acc.name.String()) == "" {
+			return nil, errors.New("llama-server returned a tool call without a function name")
+		}
 		var args api.ToolCallFunctionArguments
-		if arguments := acc.arguments.String(); strings.TrimSpace(arguments) != "" {
+		arguments := strings.TrimSpace(acc.arguments.String())
+		if arguments == "" && !allowMissingArguments {
+			// A length stop can cut the call before its arguments arrive. Only an
+			// explicit object (including {}) establishes a complete argument list.
+			return nil, fmt.Errorf("llama-server returned incomplete tool call arguments for %q", acc.name.String())
+		}
+		if arguments != "" {
+			if arguments[0] != '{' {
+				return nil, fmt.Errorf("llama-server returned invalid tool call arguments for %q: expected an object", acc.name.String())
+			}
 			if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 				return nil, fmt.Errorf("llama-server returned invalid tool call arguments for %q: %w", acc.name.String(), err)
 			}
@@ -2493,6 +2585,7 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 	body := map[string]any{
 		"messages":          messages,
 		"stream":            stream,
+		"return_progress":   stream,
 		"cache_prompt":      true,
 		"n_predict":         req.Options.NumPredict,
 		"n_keep":            req.Options.NumKeep,
@@ -2952,7 +3045,7 @@ func (s *llamaServerRunner) Close() error {
 
 func (s *llamaServerRunner) stopProcess() error {
 	if s.cmd != nil && s.cmd.Process != nil {
-		if s.cmd.ProcessState != nil {
+		if s.exitedProcessState() != nil {
 			return nil
 		}
 		slog.Debug("stopping llama-server", "pid", s.Pid())

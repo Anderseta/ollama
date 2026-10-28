@@ -22,7 +22,7 @@ func TestAccumulatedToolCallsSparseIndices(t *testing.T) {
 		accs[index] = acc
 	}
 	accs[5] = nil // An absent call does not alter the ordering of real calls.
-	calls, err := accumulatedToolCalls(accs)
+	calls, err := accumulatedToolCalls(accs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,8 +33,32 @@ func TestAccumulatedToolCallsSparseIndices(t *testing.T) {
 	if !reflect.DeepEqual(indices, []int{0, 3, math.MaxInt}) {
 		t.Fatalf("tool call indices = %v", indices)
 	}
-	if _, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{-1: {}}); err == nil {
+	if _, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{-1: {}}, true); err == nil {
 		t.Fatal("negative tool call index was accepted")
+	}
+}
+
+func TestAccumulatedToolCallsRequireCompleteArgumentsAtLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name, function, arguments string
+		allowMissing, wantError   bool
+	}{
+		{"legacy empty at normal stop", "lookup", " \n", true, false},
+		{"explicit empty object at length", "lookup", " {} ", false, false},
+		{"missing object at length", "lookup", " \n", false, true},
+		{"null is not an object", "lookup", "null", true, true},
+		{"array is not an object", "lookup", "[]", false, true},
+		{"incomplete object", "lookup", `{"query":`, false, true},
+		{"missing function name", "", "{}", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			acc := &llamaServerToolCallAccumulator{}
+			acc.append("call_0", tc.function, tc.arguments)
+			calls, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{0: acc}, tc.allowMissing)
+			if (err != nil) != tc.wantError || (err == nil && len(calls) != 1) || (err != nil && calls != nil) {
+				t.Fatalf("calls=%+v error=%v, want error=%v", calls, err, tc.wantError)
+			}
+		})
 	}
 }
 
@@ -132,7 +156,7 @@ func BenchmarkToolCallAccumulator(b *testing.B) {
 				for _, delta := range deltas {
 					acc.append(delta.ID, delta.Function.Name, delta.Function.Arguments)
 				}
-				calls, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{0: acc})
+				calls, err := accumulatedToolCalls(map[int]*llamaServerToolCallAccumulator{0: acc}, true)
 				if err != nil || len(calls) != 1 {
 					b.Fatalf("failed to reconstruct tool call: %v", err)
 				}

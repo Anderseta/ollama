@@ -1263,6 +1263,8 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
 			var procStr string
 			switch {
+			case m.Loading:
+				procStr = "Loading..."
 			case m.SizeVRAM == 0:
 				procStr = "100% CPU"
 			case m.SizeVRAM == m.Size:
@@ -1277,7 +1279,9 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 
 			var until string
 			delta := time.Since(m.ExpiresAt)
-			if delta > 0 {
+			if m.Loading {
+				until = "-"
+			} else if delta > 0 {
 				until = "Stopping..."
 			} else {
 				until = format.HumanTime(m.ExpiresAt, "Never")
@@ -1286,7 +1290,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 			if m.ContextLength > 0 {
 				ctxStr = strconv.Itoa(m.ContextLength)
 			}
-			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, m.Runner, until})
+			data = append(data, []string{m.Name, m.Digest[:min(12, len(m.Digest))], format.HumanBytes(m.Size), procStr, ctxStr, m.Runner, until})
 		}
 	}
 
