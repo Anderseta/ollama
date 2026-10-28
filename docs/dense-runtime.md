@@ -71,9 +71,10 @@ permission to exceed a quota.
 For an eligible cache, CUDA reserves the full virtual address range and maps
 physical device pages as needed. An execution commits its required padded
 prefix before modifying cell metadata or launching kernels. Expansion preserves
-existing bytes and initializes new pages. Growth is monotonic until the buffer
-is unloaded: deleting tokens or clearing a conversation does not release the
-already mapped physical pages.
+existing bytes and initializes new pages. By default, growth is monotonic until
+the buffer is unloaded: deleting tokens or clearing a conversation does not
+release the already mapped physical pages. The separate empty-cache reclamation
+option below can release eligible whole mappings without reducing context.
 
 On the local Windows device, the VMM granularity is 2 MiB. For the Qwen3.5
 configuration with Q8_0 K/V and context 131,072, the complete logical attention
@@ -93,6 +94,41 @@ states, snapshots and other allocations still need headroom.
 Managed CUDA bytes are not an operating-system-wide VRAM limit. Driver/display
 allocations and other applications have separate scopes. See
 [gpu-first-memory-validation.md](gpu-first-memory-validation.md) for accounting.
+
+### Optional reclamation after a complete cache clear
+
+Patch `014-kv-reclamation-and-prompt-state.patch` adds the native-process opt-in
+`WILDLLAMA_KV_CACHE_TRIM_EMPTY=1`. It is disabled by default and requires an
+eligible VMM-backed growing cache; conventional storage and unsupported backends
+keep their existing allocation behavior. This is independent of the initial-KV
+setting and does not enable growth by itself.
+
+The server calls `llama_memory_trim_empty(ctx)` after explicitly dropping a
+prompt. That context-level API synchronizes queued work before inspecting and
+reclaiming storage. Every attention cell must be unused; a hybrid context must
+also have no live recurrent-state cells. Ordinary `seq_rm` operations used by
+speculative rollback and restore do not automatically trim.
+
+CUDA releases only complete mappings. Any mapping intersecting a protected
+initial-prefix or quantized-tensor-padding range stays mapped in full, including
+its otherwise unused bytes. Consequently, clearing a conversation does not
+guarantee that any particular amount of VRAM will be returned. The method
+returns successfully released physical bytes, rather than an estimate based on
+the deleted token count.
+
+The full virtual reservation, tensor addresses, logical context and KV formats
+stay unchanged. Retained mappings and their data are preserved. Successfully
+unmapped pages are removed from the mapping bitmap and their physical charge
+is returned to the same CUDA allocation quota. The commitment watermark is
+lowered before reclamation, so later decode or state restore must recommit any
+larger needed extent, initialize new pages and pass the normal quota checks.
+A failed unmap leaves that mapping and its charge intact; a partial trim cannot
+make future execution assume that released pages are still present.
+
+This controls physical lifetime after a complete clear. It does not page KV to
+RAM/SSD, reclaim live prefixes or make a full logical context fit a smaller
+quota. Repeated clear/regrowth can add synchronization and allocation work. No
+throughput or latency improvement has been measured for this reclamation change.
 
 ## Correct placement estimates
 
@@ -177,6 +213,22 @@ position inputs are bounded to the committed prefix rather than touching the
 unmapped logical tail. Ordinary serialized formats and logical cache positions
 remain unchanged.
 
+Prompt-cache replacement also stages the target, draft and exposed speculative
+state before publishing a new entry or evicting existing entries. A failed
+capture keeps the prior cache entries. Restore publishes the prompt only after
+all components succeed; a failure clears both incomplete live sequences and
+speculative carryover while retaining the saved entry for retry. Staging can
+need additional temporary host memory; the published cache remains subject to
+its configured cache budget.
+
+For MTP, patches `014` and `015` treat the positional hidden-state carryover as
+part of that transaction, rather than assuming target/draft KV alone is enough.
+The cache must have the predecessor row needed by the first re-evaluated token;
+otherwise it falls back to full prompt processing before decode. See
+[Native MTP checkpoint handling](native-mtp.md#conversation-checkpoints-and-carryover)
+for last-token replay, rejected rows and the nonunitary MROPE fallback. These
+changes have not been assigned a measured performance gain.
+
 These protections do not make every driver error recoverable or provide an
 arbitrary concurrent state-restore contract. Existing context synchronization
 and single-owner requirements still apply.
@@ -218,13 +270,62 @@ Weights and model operations are preserved. Floating-point dispatch and rounding
 still require numerical regression checks; this document makes no universal
 bitwise-equivalence or tokens-per-second claim.
 
-## MTP and future work
+## Native MTP with compatible weights
 
-The inspected local dense Qwen3.5 GGUF has `nextn_predict_layers=0` and no MTP
-head tensors, despite MTP appearing in its descriptive model name. This work
-does not train, add or activate a draft head. A future target/draft experiment
-needs a compatible trained head, output/acceptance validation and joint memory
-budgeting before any speed or quality claim.
+The original local Qwen3.5 GGUF had `nextn_predict_layers=0` and no prediction
+head despite MTP appearing in its descriptive name. A subsequently verified
+Q8_0 conversion retains the same 427 target tensors and chat template, plus
+one embedded MTP head. Explicit `speculative_type: "draft-mtp"` and
+`draft_num_predict: 2` enable that head; the runtime does not train or reconstruct
+one from headless weights. Adaptive control and the independent experimental
+dense CUDA switches remained off for the measured profile.
+
+On the RTX 5060 Ti 16 GiB, three warm runs of each of two Portuguese prose tasks
+measured 39.35 → 56.90 and 37.87 → 58.09 tokens/s with MTP off/on, respectively.
+Context remained 131,072, output cap 128, batch/ubatch 512/128 and one sequence.
+These are controlled greedy timing results for this Qwen9B conversion, not a
+universal dense-model or stochastic-generation speed claim. Separate JSON,
+tool-call, thinking and conversation A→B→A checks passed with the existing
+temperature 0.6 sampling.
+
+MTP added about 908.08 MiB of tracked CUDA allocations in this configuration:
+the extra weights are only part of the cost. The draft attention cache defaults
+to F16 and consumes 512 MiB at this context, independently of the target's Q8_0
+cache under conventional full allocation. Recurrent rollback rows and workspace
+also need room. The estimator
+separates target blocks from prediction blocks and includes these cache/state
+costs; actual allocation counters and whole-device headroom still decide fit.
+
+A separate normal-profile comparison kept fit enabled with a 2,048 MiB margin,
+automatic GPU layers and the original temperature 0.6 sampler. Both modes kept
+34/34 native layers on GPU. With `kv_cache_initial_tokens: 8192`, this Qwen's
+target and MTP draft caches both used CUDA VMM growth: physical buffers changed
+from 2,176/512 MiB to 160/32 MiB, saving 2,496 MiB initially while retaining
+131,072 logical cells. Three warm runs measured 60.54 tokens/s, with no observed
+throughput or warm-prefill regression; all four fixed-seed prose outputs matched
+the full-allocation comparison. This does not measure later growth past 8,192
+cells or filled-context performance.
+
+The estimator's draft-head `InitialKV` can conservatively charge the complete
+logical head cache; it is not the measured initial physical footprint. Other
+layouts may retain full allocation. Subsequent growth still needs available
+memory and quota, and can fail explicitly; it does not reduce context or page
+KV to SSD. The optional empty-cache trimming feature remained off.
+
+A final microbatch check preserved that KV setting and compared 128 with the
+previous implicit microbatch 512. Independent uncached 2,512-token prefills
+took 1.1646 versus 1.0185 s; two resident decode requests per mode measured
+59.44 versus 60.43 tokens/s. Both kept 34/34 GPU layers. Microbatch 512 retained
+at least 4,637.42 MiB device-wide VRAM free, so it was retained without an
+observed decode regression. The controlled greedy table above still describes
+its own fixed microbatch 128; these are separate comparisons.
+
+Batched target verification can change floating-point logits and even greedy
+text. The recorded same-prefix replay isolated that effect from additional
+rollback drift; it does not establish equal task quality or all-architecture
+state correctness. See [Native MTP](native-mtp.md) and the
+[final benchmark](benchmarks/native-mtp-final-20261028.json) for exact weights,
+memory, throughput, verification semantics and diagnostic scope.
 
 ## Recorded validation
 
@@ -407,3 +508,51 @@ submissions on the actual Qwen graph, including shape `[128,32,2,1]`.
 Diagnostics print at most four events of each kind; this is not a total
 execution count or a timing attribution. Final activation evidence and
 component correctness do not by themselves establish a repeatable speedup.
+
+### Windows CUDA error 303 startup recovery
+
+The Go launcher can retry a failed startup **once** with child-local
+`CUDA_MODULE_LOADING=EAGER`, only on Windows with an assigned CUDA device and
+the specific `shared object initialization failed` CUDA diagnosis
+(`cudaErrorSharedObjectInitFailed`, error 303). A plain OOM, invalid kernel,
+illegal memory access, unrelated driver error or exit code alone does not
+qualify. An explicit parent/launch `CUDA_MODULE_LOADING` setting, including
+`LAZY` or `EAGER`, is respected. There is no retry after the runner has loaded
+successfully or after request cancellation.
+
+The failed child is stopped and reaped before resetting memory/log/activity
+accounting and starting its replacement. The retry preserves the model,
+context, sampling, GPU selection and all layer/fit options. It does not turn
+off GPU execution, lower context, alter profiles or change the global
+environment. If the EAGER attempt also fails, startup returns a clearly marked
+terminal error; it does not escalate into a new projector/CPU workaround.
+The independent projector-OOM workaround retains its own bounded scope.
+
+NVIDIA documents that lazy module loading defers allocations until kernels are
+first needed, and insufficient remaining memory can then cause module loading
+to fail. EAGER changes when these modules load. This is a reason to attempt
+this narrow recovery, not proof that every error 303 has this cause. Loading
+modules earlier can also change startup duration and the memory observed by
+the native fitter; the fit options are preserved, rather than pinning or
+reducing layer placement. See the [CUDA lazy-loading guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/lazy-loading.html).
+
+The local MTP profile test with context 131,072 and fit margin 2,048 MiB
+recorded this exact error in
+`.build/resident-mtp-20261028/mtp-profile-fit2048/private/server.log`.
+Successful loads with other settings do not isolate the cause. The similar
+[upstream Windows/RTX 5060 Ti report](https://github.com/ollama/ollama/issues/18232)
+and [proposed EAGER-retry change](https://github.com/ollama/ollama/pull/18978)
+provide related external evidence, not a guarantee for this machine.
+
+Validation of this launcher change used CPU-only predicates and a disposable
+Go helper process: strict error/platform/backend matching, explicit-mode
+preservation, cancellation, once-only behavior, reaping before restart, stale
+memory/parser/telemetry reset, unchanged launch parameters and terminal second
+failure.
+
+The subsequent final hardware run did exercise this recovery. With the original
+131,072-token context and 2,048 MiB fit margin, the non-MTP target encountered
+error 303 during startup. Exactly one EAGER replacement started successfully
+with unchanged arguments. The following MTP load succeeded without retry, and
+the native fitter retained 34/34 layers on CUDA. This is one observed recovery,
+not proof of the cause or a guarantee that every error 303 is recoverable.

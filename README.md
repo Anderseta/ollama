@@ -25,7 +25,7 @@ The goal is to spend less time moving the same weights, repeating host work, or 
 | **Model-weight RAM control** | A bounded, locked host-weight cache for supported raw GGUF MoE models. Load selected experts and embedding rows on demand instead of making the complete host weight set resident. |
 | **More efficient MoE streaming** | Coordinate RAM and GPU residency, batch nearby SSD reads, merge adjacent uploads, reuse route plans, and use event-protected upload slots. Eligible prompt batches group work by expert to avoid repeatedly transferring the same weights. |
 | **Explicit GPU policy** | Optional GPU-exclusive execution and a quota for tracked native CUDA allocations. Unsupported placement fails explicitly rather than quietly moving floating-point inference to the CPU. |
-| **Dense-model efficiency** | More accurate hybrid/recurrent KV placement estimates, corrected dense embedding placement in GPU-exclusive mode, and optional physical KV growth with unchanged logical context capacity. Experimental CUDA dense paths remain separately opt-in. |
+| **Dense-model efficiency** | More accurate hybrid/recurrent KV placement estimates, corrected dense embedding placement in GPU-exclusive mode, optional physical KV growth with unchanged logical context capacity, and measured native MTP with compatible prediction heads. Experimental CUDA dense paths remain separately opt-in. |
 | **Less runtime overhead** | More efficient fragmented tool-call assembly, batched state transfers, safer snapshots, and speculative MTP/EAGLE draft budgets enforced before unnecessary forward passes. |
 | **Visible progress** | An additive `/api/activity` endpoint reports sampled loading, context preparation, prefill, generation, memory-cache counters, and weight-transfer activity. WildGoose can present these observations in its interface. |
 
@@ -169,6 +169,15 @@ The [expert-reuse validation artifact](docs/benchmarks/moe-expert-reuse-20261027
 
 The record also preserves limitations: expert grouping is disabled for F32 weights after a numerical regression, and a forced 32 KiB MXFP4-cache diagnostic exceeds its resident-reference tolerance equally with grouping enabled and disabled. It is an unresolved baseline kernel-precision difference, not counted as a passing comparison. See [runtime efficiency](docs/runtime-efficiency.md) and the [batching artifact](docs/benchmarks/moe-batching-20261027.json) for controls, scopes, and additional results.
 
+A separate trained-model comparison measured **native MTP depth two** on Qwen3.5 9B DARK ROAST Q8_0 with an RTX 5060 Ti 16 GiB. Each result is the median of three warm, 128-token greedy runs at the same 131,072-token configured context:
+
+| Fixed Portuguese task | Same GGUF, MTP off | MTP on | Observed change |
+| --- | --- | --- | --- |
+| Document backups | 39.35 tokens/s | 56.90 tokens/s | +44.6% |
+| Library recovery | 37.87 tokens/s | 58.09 tokens/s | +53.4% |
+
+This controlled table used conventional full KV allocation: tracked CUDA increased by about **908 MiB**, remaining below a 13 GiB managed quota. Separate JSON, tools, thinking and conversation A→B→A checks passed at temperature 0.6. In a further comparison using the preserved normal profile, an initial physical KV allocation of 8,192 cells reduced target-plus-draft KV buffers by **2,496 MiB**, while keeping the logical context at 131,072 and showing no throughput regression in three warm runs. A final 2,512-token prefill check supported retaining the original implicit microbatch 512, with 34/34 GPU layers, over 4.5 GiB device VRAM free and no observed decode regression. Batched verification can change floating-point logits and generated text; these local results do not establish universal quality or speed gains. See [MTP verification and memory](docs/native-mtp.md) and the [final benchmark](docs/benchmarks/native-mtp-final-20261028.json); the [initial record](docs/benchmarks/native-mtp-20261028.json) is preserved.
+
 ## Compatibility and current scope
 
 - **Windows + NVIDIA CUDA** is the primary runtime validation target for the new selective-weight and GPU-first paths. Linux portability has been reviewed, but these paths still need wider Linux runtime testing; macOS and other backends are not validated for these additions.
@@ -185,6 +194,8 @@ The record also preserves limitations: expert grouping is disabled for F32 weigh
 - [GPU-first execution](docs/gpu-first-moe-inference.md) and [memory validation](docs/gpu-first-memory-validation.md)
 - [Coordinated expert residency and transfer pipeline](docs/moe-residency-pipeline.md)
 - [Dense-model runtime](docs/dense-runtime.md)
+- [Native MTP and speculative decoding](docs/native-mtp.md)
+- [GPU capabilities and measured dispatch policies](docs/cuda-tuning.md)
 - [Runtime efficiency and measured results](docs/runtime-efficiency.md)
 - [Live activity API and WildGoose integration](docs/runtime-activity.md)
 - [Brand assets and regeneration](docs/branding.md)

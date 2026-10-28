@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-28",
+  "artifact": "native_qwen9b_embedded_mtp_comparison",
+  "status": "completed",
+  "scope": "One Windows RTX 5060 Ti, one Qwen9B Q8_0 conversion, two short synthetic Portuguese prompts; not a quality or universal-speed benchmark.",
+  "model": {
+    "name": "Qwen3.5 9B The Defiant Fable DARK ROAST Uncensored Heretic NEO IMATRIX MAX MTP",
+    "architecture": "qwen35_dense_hybrid",
+    "quantization": "Q8_0",
+    "repository": "mradermacher/Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF",
+    "revision": "46f0623297f0df3e9b09d4eb1c63e2c1756e591a",
+    "filename": "Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP.Q8_0.gguf",
+    "source_url": "https://huggingface.co/mradermacher/Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/tree/46f0623297f0df3e9b09d4eb1c63e2c1756e591a",
+    "headless_file_sha256": "cd4180e7306d30ce43a7afa0350f4db770880b5e59fce40793494066296306fd",
+    "embedded_head_file_sha256": "c6a135fd113fb6745933b974790762bb949c07aa304de0fa1903e7fd7adb51cb",
+    "headless_file_bytes": 9527503264,
+    "embedded_head_file_bytes": 9786061216,
+    "trunk_blocks": 32,
+    "embedded_prediction_blocks": 1,
+    "common_tensors_compared": 427,
+    "common_tensor_bytes": 9516533760,
+    "common_tensor_bytes_equal": true,
+    "chat_template_equal": true,
+    "added_head_tensors": 15,
+    "added_head_weight_bytes": 258557952,
+    "complete_download_sha256_verified": true
+  },
+  "hardware": {
+    "os": "Windows",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_nominal_vram_gib": 16,
+    "cuda_compute_capability": "12.0",
+    "driver": "621.01",
+    "model_storage": "local SSD"
+  },
+  "payload": {
+    "native_base": "llama.cpp b11845 plus WildLlama compatibility patches",
+    "native_backend": "CUDA cuda_v12",
+    "build_cuda_toolkit": "12.8",
+    "go_toolchain": "go1.26.10 windows/amd64",
+    "sha256": {
+      "ollama.exe": "abd5b9a1209656877400e777e3571e8c18e90f084e6a3742d82cc146577eebfb",
+      "llama-server.exe": "49ab62c7a56928c1ea4c92453f942b6dd257d202d1da8180693e42d366f6ceef",
+      "llama.dll": "3bf3d5215583a530d5059e7b949c9a7431a02e0be680e5c89e847803115a28ff",
+      "ggml-cuda.dll": "308b152ba726dd5c5f6c9c251520cb5011ad05dacb4b3a17e1343323514e717e"
+    }
+  },
+  "methodology": {
+    "sanitization": "No personal paths, GPU UUIDs, environments, raw generated outputs, prompt-token arrays or per-token logit dumps. Fixed synthetic benchmark instructions are public.",
+    "isolation": "Separate laboratory server/model store; verified hardlinks avoid duplicating weight blobs. No production service, profile or model changed by the benchmark.",
+    "variant_order": [
+      "old_regular",
+      "new_target",
+      "new_mtp2"
+    ],
+    "variant_definitions": {
+      "old_regular": "Previous headless file, speculation disabled.",
+      "new_target": "New file with identical common tensors, speculation disabled.",
+      "new_mtp2": "Same new file with embedded MTP, draft depth 2, ordinary sample-and-match verification."
+    },
+    "runs": "Each variant runs both prompts in order, each with one first run and three identical-prompt warm runs. The first prompt after loading is runner-cold; the second prompt has a resident model.",
+    "output_token_cap": 128,
+    "aggregation": "Median of the three per-request warm token rates, separately for each prompt.",
+    "tokens_s": "API eval_count / eval_duration in seconds; includes counted output tokens, not an independent kernel-only metric.",
+    "ttft": "Wall time until first visible content, thinking, or tool event in the streaming API. Tool-call TTFT can include parser buffering.",
+    "cold_caveat": "OS filesystem and device/compiler caches were not flushed. Ordered first-load times are not a demonstrated loading-speed improvement.",
+    "sampling": {
+      "temperature": 0,
+      "seed": 42,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "repeat_penalty": 1,
+      "presence_penalty": 0,
+      "frequency_penalty": 0,
+      "think": false
+    },
+    "fixed_policy": {
+      "context": 131072,
+      "parallel_sequences": 1,
+      "batch": 512,
+      "ubatch": 128,
+      "target_cache_k": "q8_0",
+      "target_cache_v": "q8_0",
+      "draft_cache_k": "f16",
+      "draft_cache_v": "f16",
+      "flash_attention": true,
+      "all_layers_on_gpu": true,
+      "gpu_exclusive": true,
+      "fit": "off",
+      "load_mode": "none",
+      "use_mmap": false,
+      "kv_cache_initial_tokens": 0,
+      "gpu_vram_limit_mib": 13312,
+      "speculative_adaptive": false,
+      "experimental_dense_cuda_optimizations": false,
+      "gpu_diagnostics": true
+    },
+    "sampling_change_for_functional_checks": "Only the extra functional checks use temperature 0.6; top_p/top_k/repeat penalty and logical context remain the same.",
+    "memory_guard": {
+      "minimum_initial_free_vram_mib": 13312,
+      "stop_below_free_vram_mib": 1024,
+      "stop_below_free_ram_gib": 4,
+      "sampling_interval_seconds": 0.5,
+      "quota_or_guard_relaxed": false
+    }
+  },
+  "synthetic_prompts": [
+    {
+      "id": "backup",
+      "language": "pt-BR",
+      "user_message": "Explique em português, em pelo menos 180 palavras, como organizar cópias de segurança de documentos pessoais. Use exemplos práticos, frases completas e parágrafos conectados.",
+      "utf8_sha256": "eb9b8911092eba7b8b06763ece706ee48e07eb34e2511c49b70e4b4ef40e0d4b",
+      "rendered_prompt_tokens": 53,
+      "warm_cached_prompt_tokens": 49
+    },
+    {
+      "id": "biblioteca",
+      "language": "pt-BR",
+      "user_message": "Uma biblioteca digitaliza atas, jornais e fotografias em três computadores. Explique em português um procedimento prático de organização, conferência e recuperação após interrupções. Escreva pelo menos 180 palavras, sem inventar números de desempenho.",
+      "utf8_sha256": "afd40e5bd3a85237be9649d352fb4ae284e8795d0375074fd9dd86435e7e8762",
+      "rendered_prompt_tokens": 64,
+      "warm_cached_prompt_tokens": 60
+    }
+  ],
+  "results": [
+    {
+      "variant": "old_regular",
+      "prompt": "backup",
+      "warm_runs": 3,
+      "warm_tps_median": 40.13309136423665,
+      "warm_ttft_ms_median": 78.99999999972351,
+      "first_ttft_seconds": 26.032000000000153,
+      "first_load_seconds": 25.7626166,
+      "warm_proposed": 0,
+      "warm_accepted": 0,
+      "warm_acceptance": null,
+      "managed_vram_mib_peak": 11868.195556640625,
+      "nvml_device_mib_peak": 14118.31640625,
+      "warm_tps": [
+        40.13309136423665,
+        39.89812263747787,
+        40.44890702629116
+      ],
+      "warm_ttft_ms": [
+        140.99999999962165,
+        77.99999999951979,
+        78.99999999972351
+      ],
+      "first_tokens_s": 39.306884508696186,
+      "output_tokens_each_run": 128
+    },
+    {
+      "variant": "old_regular",
+      "prompt": "biblioteca",
+      "warm_runs": 3,
+      "warm_tps_median": 39.80744392981575,
+      "warm_ttft_ms_median": 94.00000000005093,
+      "first_ttft_seconds": 0.10900000000037835,
+      "first_load_seconds": 0.0067876,
+      "warm_proposed": 0,
+      "warm_accepted": 0,
+      "warm_acceptance": null,
+      "managed_vram_mib_peak": 11868.195556640625,
+      "nvml_device_mib_peak": 14198.59765625,
+      "warm_tps": [
+        39.723783156557325,
+        39.80744392981575,
+        39.92314794021509
+      ],
+      "warm_ttft_ms": [
+        109.00000000037835,
+        94.00000000005093,
+        94.00000000005093
+      ],
+      "first_tokens_s": 40.431913920455266,
+      "output_tokens_each_run": 128
+    },
+    {
+      "variant": "new_target",
+      "prompt": "backup",
+      "warm_runs": 3,
+      "warm_tps_median": 39.95934137015587,
+      "warm_ttft_ms_median": 78.00000000042928,
+      "first_ttft_seconds": 23.64099999999962,
+      "first_load_seconds": 23.4232983,
+      "warm_proposed": 0,
+      "warm_accepted": 0,
+      "warm_acceptance": null,
+      "managed_vram_mib_peak": 11868.195556640625,
+      "nvml_device_mib_peak": 14032.08984375,
+      "warm_tps": [
+        39.29098195223997,
+        40.12120364864734,
+        39.95934137015587
+      ],
+      "warm_ttft_ms": [
+        109.00000000037835,
+        77.99999999951979,
+        78.00000000042928
+      ],
+      "first_tokens_s": 38.845417090526816,
+      "output_tokens_each_run": 128
+    },
+    {
+      "variant": "new_target",
+      "prompt": "biblioteca",
+      "warm_runs": 3,
+      "warm_tps_median": 38.196549896630586,
+      "warm_ttft_ms_median": 78.00000000042928,
+      "first_ttft_seconds": 0.10899999999946886,
+      "first_load_seconds": 0.004081,
+      "warm_proposed": 0,
+      "warm_accepted": 0,
+      "warm_acceptance": null,
+      "managed_vram_mib_peak": 11868.195556640625,
+      "nvml_device_mib_peak": 14148.08203125,
+      "warm_tps": [
+        38.196549896630586,
+        38.7078239701224,
+        38.0088245800693
+      ],
+      "warm_ttft_ms": [
+        125.0,
+        77.99999999951979,
+        78.00000000042928
+      ],
+      "first_tokens_s": 39.13330730560759,
+      "output_tokens_each_run": 128
+    },
+    {
+      "variant": "new_mtp2",
+      "prompt": "backup",
+      "warm_runs": 3,
+      "warm_tps_median": 56.1271560720813,
+      "warm_ttft_ms_median": 77.99999999951979,
+      "first_ttft_seconds": 6.905999999999949,
+      "first_load_seconds": 6.6552324,
+      "warm_proposed": 351,
+      "warm_accepted": 201,
+      "warm_acceptance": 0.5726495726495726,
+      "managed_vram_mib_peak": 12776.280151367188,
+      "nvml_device_mib_peak": 14932.19921875,
+      "warm_tps": [
+        54.040977415515584,
+        56.1271560720813,
+        56.76214532528257
+      ],
+      "warm_ttft_ms": [
+        109.00000000037835,
+        77.99999999951979,
+        77.99999999951979
+      ],
+      "first_tokens_s": 52.80780763435874,
+      "output_tokens_each_run": 128
+    },
+    {
+      "variant": "new_mtp2",
+      "prompt": "biblioteca",
+      "warm_runs": 3,
+      "warm_tps_median": 56.992818459617695,
+      "warm_ttft_ms_median": 61.99999999989814,
+      "first_ttft_seconds": 0.10900000000037835,
+      "first_load_seconds": 0.0037056,
+      "warm_proposed": 360,
+      "warm_accepted": 201,
+      "warm_acceptance": 0.5583333333333333,
+      "managed_vram_mib_peak": 12776.280151367188,
+      "nvml_device_mib_peak": 14892.98046875,
+      "warm_tps": [
+        57.39025011388378,
+        56.97947358979142,
+        56.992818459617695
+      ],
+      "warm_ttft_ms": [
+        110.00000000058208,
+        61.99999999989814,
+        61.99999999989814
+      ],
+      "first_tokens_s": 56.356681436813595,
+      "output_tokens_each_run": 128
+    }
+  ],
+  "speedup_vs_same_new_file_without_mtp": [
+    {
+      "prompt": "backup",
+      "ratio": 1.404606636334616,
+      "percent": 40.46066363346159
+    },
+    {
+      "prompt": "biblioteca",
+      "ratio": 1.4920933595797137,
+      "percent": 49.20933595797137
+    }
+  ],
+  "text_and_functional_validation": {
+    "old_regular_reference_checks": 8,
+    "new_target_against_old_reference_checks": 8,
+    "all_non_mtp_text_checks_equal": true,
+    "mtp_different_text_runs": 4,
+    "mtp_text_comparisons": 8,
+    "mtp_difference_policy": "Record common-prefix lengths, output hashes and token counts; greedy text equality is not an MTP gate after the independent target batching/rollback diagnostic.",
+    "generated_prose_completed": false,
+    "prose_stop_reason": "length: the timing task intentionally caps each output at 128 tokens.",
+    "functional_sampling_temperature": 0.6,
+    "functional_checks": {
+      "json": true,
+      "tool_call": true,
+      "thinking": true,
+      "temperature": 0.6
+    },
+    "functional_measurements": [
+      {
+        "case": "integration-json",
+        "tokens_s": 48.741652991925136,
+        "ttft_seconds": 0.18699999999989814,
+        "eval_count": 21,
+        "done_reason": "stop",
+        "speculative_draft_tokens": 15,
+        "speculative_accepted_tokens": 13,
+        "acceptance_ratio": 0.8666666666666667
+      },
+      {
+        "case": "integration-tools",
+        "tokens_s": 75.98690560783363,
+        "ttft_seconds": 0.8909999999996217,
+        "eval_count": 37,
+        "done_reason": "stop",
+        "speculative_draft_tokens": 24,
+        "speculative_accepted_tokens": 24,
+        "acceptance_ratio": 1.0
+      },
+      {
+        "case": "integration-thinking",
+        "tokens_s": 71.83327726417978,
+        "ttft_seconds": 0.2179999999998472,
+        "eval_count": 281,
+        "done_reason": "stop",
+        "speculative_draft_tokens": 201,
+        "speculative_accepted_tokens": 180,
+        "acceptance_ratio": 0.8955223880597015
+      }
+    ]
+  },
+  "memory": {
+    "sampled_tracked_cuda_baseline_peak_bytes": 12444705024,
+    "sampled_tracked_cuda_mtp_peak_bytes": 13396900736,
+    "tracked_cuda_increase_bytes": 952195712,
+    "tracked_cuda_increase_mib": 908.0845947265625,
+    "draft_f16_kv_at_configured_context_mib": 512,
+    "minimum_sampled_whole_device_free_vram_mib": 1378.80078125,
+    "minimum_sampled_system_free_ram_gib": 15.667304992675781,
+    "guards_triggered": false,
+    "scopes": "Tracked CUDA includes model, KV, recurrent state and compute allocations observed through runtime activity. It excludes display, other applications and implicit driver/library allocations. NVML is whole-device memory. Samples can miss short peaks. Free system RAM is not a model-weight RAM cap."
+  },
+  "target_batching_and_rollback_diagnostic": {
+    "input": "Exactly the baseline prompt tokens and its 128 generated tokens replayed as forced input, one context at a time; no draft context or model active.",
+    "prefixes_compared": 129,
+    "context": 131072,
+    "quota_mib": 13312,
+    "autoregressive_with_two_snapshots_raw_max_abs": 0.0,
+    "mtp_hidden_output_collection_autoregressive_raw_max_abs": 0.04285788536071777,
+    "three_token_batch_raw_max_abs": 0.49495935440063477,
+    "three_token_batch_max_softmax_total_variation": 0.04411530640345894,
+    "three_token_batch_argmax_differences": 3,
+    "rejected_suffix_rollback_one_and_two_match_pure_batch_reported_metrics_and_top8": true,
+    "first_original_mtp_text_difference_generated_token_index": 113,
+    "reproduced_with_target_batch_only": true,
+    "at_that_prefix": {
+      "autoregressive_top1_id": 2392,
+      "autoregressive_top1_logit": 16.963760375976562,
+      "autoregressive_top2_id": 635,
+      "autoregressive_top2_logit": 16.732574462890625,
+      "batched_top1_id": 635,
+      "batched_top1_logit": 16.907413482666016,
+      "batched_top2_id": 2392,
+      "batched_top2_logit": 16.902111053466797
+    },
+    "tiny_nonzero_qwen35_cpu_fixture": {
+      "forced_tokens": 64,
+      "maximum_raw_logit_difference": 5.960464477539063e-08,
+      "argmax_differences": 0
+    },
+    "interpretation": "The observed difference is reproducible as target batching numerics, without the MTP head. No additional rollback drift is apparent in the compared full-vocabulary summary metrics and top-eight evidence. Those metrics are not a proof of every raw bit or every architecture.",
+    "distribution_caveat": "Softmax total variation is computed on the full vocabulary at temperature 1, not the configured top_k/top_p/temperature-0.6 sampler. No exact task-quality or target-distribution-equivalence claim follows."
+  },
+  "go_validation": {
+    "toolchain": "go1.26.10 windows/amd64",
+    "cpu_only": true,
+    "focused_command": "go test ./api ./llm ./server -run 'Test(EstimateServerVRAM|NativeSpeculativeMetrics|SpeculativeActivity|SpeculativeMetrics)' -count=1 -timeout 120s",
+    "focused_result": "PASS: api, llm, server",
+    "regression_command": "go test ./api ./llm -count=1 -timeout 180s",
+    "regression_result": "PASS: complete api and llm packages",
+    "isolation": "Runtime environment prefixes cleared; model store, Go caches, AppData and temporary output redirected to the laboratory drive. HOME unchanged."
+  },
+  "limitations": [
+    "Two short fixed prose prompts and three warm repeats per variant do not establish broad statistical or cross-model performance.",
+    "The logical context was 131072, but actual input prompts contained 53 and 64 tokens. This does not measure filled-context throughput or long-history answer quality.",
+    "JSON, tool calls and thinking are functional smoke checks, not a language/reasoning quality benchmark.",
+    "No sampling parameter, context reduction, weight requantization, approximate token acceptance or expert skipping was used to claim the timing result.",
+    "Depth one, adaptive speculation, Linux, multidevice and other model architectures were not evaluated in this comparison.",
+    "A separate direct native MTP capture requesting top-eight logprobs was stopped by the unchanged one-GiB free-VRAM guard. It is diagnostic overhead outside the completed ordinary-API benchmark, not counted as a passing result."
+  ],
+  "reproduction": {
+    "instructions": "docs/native-mtp.md",
+    "probability_capture_tool": "scripts/support/mtp-logprob-trace.py",
+    "forced_target_replay": "scripts/support/mtp-logit-replay.cpp",
+    "forced_replay_build": "scripts/support/mtp-logit-replay.cmake",
+    "diagnostic_guide": "scripts/support/mtp-diagnostics.md",
+    "procedure": "Verify the pinned file digests and common target tensors. Use the public synthetic messages below with the fixed policy/sampling above. Run the three variants sequentially in a separate service/store, one first run and three warm repeats for each prompt; read streaming terminal metrics and sample the unchanged memory guards. Aggregate warm rates separately. Preserve divergent outputs privately and inspect target-only forced-prefix batching/rollback before attributing a different token to state corruption."
+  },
+  "cleanup": {
+    "laboratory_process_tree_stopped": true,
+    "laboratory_listener_closed": true,
+    "production_profiles_changed_by_benchmark": false
+  }
+}

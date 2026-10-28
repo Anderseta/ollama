@@ -1,0 +1,547 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-28",
+  "artifact": "native_mtp_final_profile_and_physical_kv_validation",
+  "status": "completed",
+  "initial_record_preserved": "native-mtp-20261028.json",
+  "initial_record_sha256": "e816e0cf14b2c5075f21381be03e7d82676666683196022fd21f53e0fad18fb8",
+  "scope": "One Windows RTX 5060 Ti 16 GiB and one pinned Qwen 9B Q8_0 conversion. Short local measurements, not a universal speed or quality benchmark.",
+  "model": {
+    "name": "Qwen3.5 9B The Defiant Fable DARK ROAST Uncensored Heretic NEO IMATRIX MAX MTP",
+    "architecture": "qwen35_dense_hybrid",
+    "quantization": "Q8_0",
+    "repository": "mradermacher/Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF",
+    "revision": "46f0623297f0df3e9b09d4eb1c63e2c1756e591a",
+    "filename": "Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP.Q8_0.gguf",
+    "source_url": "https://huggingface.co/mradermacher/Qwen3.5-9B-The-Defiant-Fable-DARK-ROAST-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/tree/46f0623297f0df3e9b09d4eb1c63e2c1756e591a",
+    "headless_file_sha256": "cd4180e7306d30ce43a7afa0350f4db770880b5e59fce40793494066296306fd",
+    "embedded_head_file_sha256": "c6a135fd113fb6745933b974790762bb949c07aa304de0fa1903e7fd7adb51cb",
+    "headless_file_bytes": 9527503264,
+    "embedded_head_file_bytes": 9786061216,
+    "trunk_blocks": 32,
+    "embedded_prediction_blocks": 1,
+    "common_tensors_compared": 427,
+    "common_tensor_bytes": 9516533760,
+    "common_tensor_bytes_equal": true,
+    "chat_template_equal": true,
+    "added_head_tensors": 15,
+    "added_head_weight_bytes": 258557952,
+    "complete_download_sha256_verified": true
+  },
+  "hardware": {
+    "os": "Windows",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_nominal_vram_gib": 16,
+    "cuda_compute_capability": "12.0",
+    "driver": "621.01",
+    "model_storage": "local SSD"
+  },
+  "payload": {
+    "native_base": "llama.cpp b11845 plus WildLlama compatibility patches through 016",
+    "go_toolchain": "go1.26.10 windows/amd64",
+    "native_backend": "CUDA cuda_v12",
+    "build_cuda_toolkit": "12.8",
+    "same_staged_payload_for_all_final_runs": true,
+    "sha256": {
+      "ollama.exe": "612765a0f40ba01bd57801524fae7aeaeb4cbbaf0b7c56ebe2696574ab1efe56",
+      "llama-server.exe": "db570992dc6bde29ac724a70f821193d3e2199c5664d17d52e578f653dba892a",
+      "llama.dll": "c72dd4edf645a579b7ed2541a1fc7e5539c9ea1d880b87fd7ac42c84e6103a96",
+      "llama-common.dll": "e7ff9051ded99df16de7994cef23cb51b4b7dd5005be2cd5535278a16fd2fac2",
+      "llama-server-impl.dll": "aa77b92961747317b958da9d381ee60e5f0a8c6d1b4311ba15a03a0d3b55da55",
+      "ggml.dll": "3be5b66f53942d0d25fd4d46977aa08e9dd6856ee79edd12812b5c61599a4a95",
+      "ggml-base.dll": "7e8d99315ea968d1f69878dd1b3f7b663e0cd241ae67ddf02320191d2239bcd7",
+      "ggml-cpu.dll": "bb93e036da7245174183b074cad9f591d35308ca29c5b107aec9a0f0554ed66c",
+      "ggml-cuda.dll": "c7051ea8930f7c35cda19bfd7ba7d9a5a7d0e6dc889d229bdde96b39efa2b6af"
+    }
+  },
+  "methodology": {
+    "sanitization": "No personal paths, UUIDs, raw logs, generated outputs, token arrays or logit arrays. Payload files are identified by basename and digest.",
+    "prompts": "Use backup and biblioteca synthetic Portuguese instructions from the preserved initial record; rendered input counts 53 and 64. KV/profile checks use backup.",
+    "warm_aggregation": "Median of per-request API eval_count/eval_duration after the first run, separately per prompt/configuration.",
+    "ttft": "Wall time until first streamed content, thinking or tool event. Parser buffering contributes to tool-call TTFT.",
+    "cold_loads": "Recorded privately but not compared as a speedup: OS filesystem and device/compiler caches were not flushed.",
+    "isolation": "Separate server and hardlinked model store; one owner of the GPU. No concurrent build or other validation workload during final inference.",
+    "fixed_capacity": {
+      "context_tokens": 131072,
+      "parallel_sequences": 1,
+      "batch": 512,
+      "timing_output_cap": 128,
+      "target_cache_k": "q8_0",
+      "target_cache_v": "q8_0",
+      "draft_cache_k": "f16",
+      "draft_cache_v": "f16",
+      "flash_attention": true,
+      "use_mmap": false,
+      "seed": 42,
+      "experimental_dense_cuda_paths": false,
+      "adaptive_speculation": false,
+      "empty_cache_trimming": false,
+      "default_ubatch_for_earlier_comparisons": 128,
+      "microbatch_override_documented_in_final_comparison": 512
+    },
+    "guards": {
+      "initial_free_vram_required_mib": 13312,
+      "stop_below_free_vram_mib": 1024,
+      "stop_below_free_system_ram_gib": 4,
+      "sample_interval_seconds": 0.5,
+      "relaxed": false
+    },
+    "memory_scopes": "Native tracked CUDA allocation is distinct from device-wide NVML usage. KV buffer measurements are physical allocated bytes, separate from their logical/virtual capacity. Free system RAM is not a model-weight RAM cap. Sampling may miss short peaks."
+  },
+  "controlled_greedy_benchmark": {
+    "requests": 30,
+    "timing_requests": 24,
+    "functional_requests": 6,
+    "sampling": {
+      "temperature": 0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "repeat_penalty": 1,
+      "presence_penalty": 0,
+      "frequency_penalty": 0,
+      "think": false
+    },
+    "gpu_policy": {
+      "gpu_exclusive": true,
+      "gpu_vram_limit_mib": 13312,
+      "fit": "off",
+      "all_layers_on_gpu": true,
+      "kv_cache_initial_tokens": 0,
+      "gpu_diagnostics": true
+    },
+    "variants": {
+      "old_regular": "Previous headless GGUF, no speculation.",
+      "new_target": "New GGUF with byte-identical common tensors, no speculation.",
+      "new_mtp2": "Same new GGUF with embedded draft-mtp depth 2 and sample-and-match verification."
+    },
+    "warm_results": [
+      {
+        "variant": "old_regular",
+        "prompt": "backup",
+        "warm_runs": 3,
+        "warm_tps_median": 39.369763898295595,
+        "warm_ttft_ms_median": 93.0000000007567,
+        "warm_proposed": 0,
+        "warm_accepted": 0,
+        "warm_acceptance": null,
+        "managed_vram_mib_peak": 11868.195556640625,
+        "nvml_device_mib_peak": 14065.2109375,
+        "warm_tokens_s": [
+          40.16864554779206,
+          39.369763898295595,
+          39.001310504972516
+        ]
+      },
+      {
+        "variant": "old_regular",
+        "prompt": "biblioteca",
+        "warm_runs": 3,
+        "warm_tps_median": 39.914159610487694,
+        "warm_ttft_ms_median": 77.99999999951979,
+        "warm_proposed": 0,
+        "warm_accepted": 0,
+        "warm_acceptance": null,
+        "managed_vram_mib_peak": 11868.195556640625,
+        "nvml_device_mib_peak": 14057.3984375,
+        "warm_tokens_s": [
+          39.5486632397338,
+          39.914159610487694,
+          40.47059716263173
+        ]
+      },
+      {
+        "variant": "new_target",
+        "prompt": "backup",
+        "warm_runs": 3,
+        "warm_tps_median": 39.346769845373345,
+        "warm_ttft_ms_median": 94.00000000096043,
+        "warm_proposed": 0,
+        "warm_accepted": 0,
+        "warm_acceptance": null,
+        "managed_vram_mib_peak": 11868.195556640625,
+        "nvml_device_mib_peak": 14061.3984375,
+        "warm_tokens_s": [
+          38.77236983994281,
+          40.6134792964857,
+          39.346769845373345
+        ]
+      },
+      {
+        "variant": "new_target",
+        "prompt": "biblioteca",
+        "warm_runs": 3,
+        "warm_tps_median": 37.867335340696556,
+        "warm_ttft_ms_median": 93.99999999914144,
+        "warm_proposed": 0,
+        "warm_accepted": 0,
+        "warm_acceptance": null,
+        "managed_vram_mib_peak": 11868.195556640625,
+        "nvml_device_mib_peak": 14427.0,
+        "warm_tokens_s": [
+          37.867335340696556,
+          38.05720354479065,
+          33.87083884837031
+        ]
+      },
+      {
+        "variant": "new_mtp2",
+        "prompt": "backup",
+        "warm_runs": 3,
+        "warm_tps_median": 56.90451866334842,
+        "warm_ttft_ms_median": 77.99999999951979,
+        "warm_proposed": 357,
+        "warm_accepted": 198,
+        "warm_acceptance": 0.5546218487394958,
+        "managed_vram_mib_peak": 12776.280151367188,
+        "nvml_device_mib_peak": 14971.3984375,
+        "warm_tokens_s": [
+          56.90451866334842,
+          57.317855721105644,
+          55.88250702897159
+        ]
+      },
+      {
+        "variant": "new_mtp2",
+        "prompt": "biblioteca",
+        "warm_runs": 3,
+        "warm_tps_median": 58.091354100387306,
+        "warm_ttft_ms_median": 78.00000000133878,
+        "warm_proposed": 354,
+        "warm_accepted": 204,
+        "warm_acceptance": 0.576271186440678,
+        "managed_vram_mib_peak": 12776.280151367188,
+        "nvml_device_mib_peak": 14971.3984375,
+        "warm_tokens_s": [
+          58.59134505129718,
+          58.006348976165285,
+          58.091354100387306
+        ]
+      }
+    ],
+    "observed_mtp_speedup_vs_same_new_gguf": [
+      {
+        "prompt": "backup",
+        "ratio": 1.4462310092283124,
+        "percent": 44.62310092283124
+      },
+      {
+        "prompt": "biblioteca",
+        "ratio": 1.5340755714056202,
+        "percent": 53.40755714056202
+      }
+    ],
+    "non_mtp_reference_checks_equal": true,
+    "new_target_checks_against_old_reference": 8,
+    "mtp_text_different_runs": 4,
+    "mtp_text_comparison_runs": 8,
+    "text_policy": "Strict text equality for common-target integrity only. MTP differences are recorded, not treated as failures. The initial record documents an independent same-prefix target batching/rollback diagnostic; this final run does not claim a new full-logit equivalence test.",
+    "sampled_tracked_cuda_without_mtp_bytes": 12444705024,
+    "sampled_tracked_cuda_with_mtp_bytes": 13396900736,
+    "sampled_tracked_cuda_mtp_increase_mib": 908.0845947265625,
+    "minimum_sampled_whole_device_free_vram_mib": 1339.6015625,
+    "minimum_sampled_free_system_ram_gib": 13.50088119506836,
+    "functional_checks": {
+      "json": true,
+      "tool_call": true,
+      "thinking": true,
+      "temperature": 0.6,
+      "cache_A_B_A": true
+    },
+    "functional_sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "repeat_penalty": 1,
+      "context_tokens": 131072
+    },
+    "conversation_cache": {
+      "same_model_order": [
+        "A",
+        "B",
+        "A"
+      ],
+      "semantic_integer_results": [
+        42,
+        57,
+        42
+      ],
+      "schema_did_not_force_answers": true,
+      "second_A_prompt_tokens": 336,
+      "second_A_cached_prompt_tokens": 332,
+      "all_completed": true,
+      "proposal_and_acceptance_counters_present": true,
+      "cache_miss_or_full_prefill_fallback_is_allowed": true
+    },
+    "cuda_startup_eager_retries": 0,
+    "guard_triggered": false
+  },
+  "preserved_normal_profile": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0,
+    "repeat_penalty": 1,
+    "presence_penalty": 0,
+    "context_tokens": 131072,
+    "batch": 512,
+    "ubatch": 128,
+    "num_gpu": -1,
+    "use_mmap": false,
+    "fit": "on",
+    "fit_target_mib": 2048,
+    "native_gpu_layers": "auto",
+    "gpu_exclusive_forced": false,
+    "managed_cuda_quota_forced": false,
+    "lab_alias_inherited_gpu_policy_explicitly_cleared": true,
+    "all_34_of_34_native_layers_on_gpu": true,
+    "request_count": 7,
+    "warm_results": [
+      {
+        "variant": "target",
+        "warm_samples": 2,
+        "warm_tokens_s": [
+          42.6080380063699,
+          42.6146058232193
+        ],
+        "median_tokens_s": 42.6113219147946,
+        "median_ttft_ms": 86.0000000002401,
+        "draft_proposed": 0,
+        "draft_accepted": 0
+      },
+      {
+        "variant": "mtp2",
+        "warm_samples": 2,
+        "warm_tokens_s": [
+          62.00519974733133,
+          60.42193391728615
+        ],
+        "median_tokens_s": 61.21356683230874,
+        "median_ttft_ms": 94.00000000005093,
+        "draft_proposed": 244,
+        "draft_accepted": 130
+      }
+    ],
+    "tool_call_semantics_passed": true,
+    "minimum_sampled_free_vram_mib": 2311.1953125,
+    "minimum_sampled_free_ram_gib": 12.175243377685547,
+    "cuda_startup_recovery": {
+      "observed_retry_count": 1,
+      "stage": "Initial target-only load before the MTP comparison.",
+      "observed_initial_error": "CUDA shared object initialization failed during startup.",
+      "retry_policy": "One Windows CUDA startup retry with child-local CUDA_MODULE_LOADING=EAGER.",
+      "native_inference_arguments_preserved": true,
+      "retry_succeeded": true,
+      "subsequent_mtp_load_needed_retry": false,
+      "underlying_cause": "Not established; success does not identify fit, compilation pressure or the driver as the cause."
+    },
+    "guard_triggered": false
+  },
+  "physical_kv_comparison": {
+    "same_normal_profile_as_above": true,
+    "mtp_type": "draft-mtp",
+    "draft_depth": 2,
+    "context_tokens": 131072,
+    "request_count": 10,
+    "first_plus_three_warm_runs_per_configuration": true,
+    "functional_tool_checks_per_configuration": 1,
+    "target_quantization_changed": false,
+    "kv_formats_changed": false,
+    "both_target_and_draft_vmm_growth_proven_active": true,
+    "physical_kv_mib": {
+      "initial0": {
+        "target": 2176,
+        "draft": 512,
+        "total": 2688
+      },
+      "initial8192": {
+        "target": 160,
+        "draft": 32,
+        "total": 192
+      },
+      "reduction_mib": 2496,
+      "reduction_gib": 2.4375
+    },
+    "logical_capacity_unchanged": {
+      "target_virtual_kv_mib": 2176,
+      "draft_virtual_kv_mib": 512,
+      "tokens": 131072
+    },
+    "warm_results": [
+      {
+        "initial_tokens": 0,
+        "warm_samples": 3,
+        "warm_tokens_s": [
+          59.9394050358182,
+          55.268180208810094,
+          53.63871642551594
+        ],
+        "median_tokens_s": 55.268180208810094,
+        "median_ttft_ms": 109.99999999876309,
+        "median_prompt_eval_seconds": 0.067773,
+        "warm_prompt_tokens": 53,
+        "warm_cached_prompt_tokens": 49,
+        "draft_proposed": 366,
+        "draft_accepted": 195,
+        "whole_device_sampled_peak_mib": 13858.4140625,
+        "minimum_sampled_free_vram_mib": 2452.5859375,
+        "minimum_sampled_free_ram_gib": 12.616737365722656,
+        "resource_samples": 35
+      },
+      {
+        "initial_tokens": 8192,
+        "warm_samples": 3,
+        "warm_tokens_s": [
+          60.536781533633146,
+          60.50187248568634,
+          60.92464573270454
+        ],
+        "median_tokens_s": 60.536781533633146,
+        "median_ttft_ms": 77.99999999951979,
+        "median_prompt_eval_seconds": 0.065235,
+        "warm_prompt_tokens": 53,
+        "warm_cached_prompt_tokens": 49,
+        "draft_proposed": 366,
+        "draft_accepted": 195,
+        "whole_device_sampled_peak_mib": 11362.4140625,
+        "minimum_sampled_free_vram_mib": 4948.5859375,
+        "minimum_sampled_free_ram_gib": 12.404499053955078,
+        "resource_samples": 33
+      }
+    ],
+    "observed_warm_tps_ratio_8192_over0": 1.0953279320020601,
+    "material_regression_threshold_ratio": 0.95,
+    "material_tps_regression_observed": false,
+    "fixed_seed_prose_texts_equal": {
+      "matched_pairs": 4,
+      "compared_pairs": 4
+    },
+    "both_tool_checks_correct": true,
+    "tool_identity_note": "Call identifiers can differ; function names and arguments were validated.",
+    "native_layers_on_gpu_both_configurations": "34/34",
+    "cuda_startup_eager_retries": 0,
+    "guard_triggered": false,
+    "interpretation": "No throughput or warm-prefill regression observed in this short comparison. Do not generalize the observed rate ratio: the three full-allocation samples varied, and the comparison is ordered. Full logical context remains available; growth past the 8192-cell initial allocation was not exercised by these short real-model prompts.",
+    "estimator_scope": "The Go head InitialKV estimate remains conservative and can charge the complete logical draft cache. It is not the measured initial physical footprint. Admission retains worst-case logical budgeting; native physical allocation evidence is reported separately."
+  },
+  "configuration_supported_by_these_checks": {
+    "preserve_existing_sampling_and_logical_context": true,
+    "speculative_type": "draft-mtp",
+    "draft_num_predict": 2,
+    "num_ubatch": 512,
+    "kv_cache_initial_tokens": 8192,
+    "speculative_adaptive": false,
+    "fit": "on",
+    "fit_target_mib": 2048,
+    "gpu_layers": "auto",
+    "experimental_dense_cuda_paths_enabled": false,
+    "empty_cache_trimming_enabled": false,
+    "reporting_agent_modified_personal_profile": false
+  },
+  "limitations": [
+    "This is one GPU/model and a small set of synthetic tasks, not a broad language-quality evaluation.",
+    "Configured context 131072 is preserved, but these real-model tests do not fill that history or exercise physical KV expansion beyond 8192 cells.",
+    "Same-seed text agreement in the KV comparison does not prove universal numerical or task-quality equivalence.",
+    "The normal-profile temperature 0.6 timing is a separate comparison from the controlled greedy/GPU-exclusive table.",
+    "Physical KV can later grow; insufficient available memory or quota causes an error rather than context reduction, expert skipping or SSD/swap paging.",
+    "No performance gain is assigned specifically to checkpoint fixes, EAGER recovery or CUDA tuning without a dedicated ablation."
+  ],
+  "cleanup": {
+    "all_owned_laboratory_go_native_processes_stopped": true,
+    "laboratory_listener_closed": true,
+    "gpu_returned_to_desktop_only_at_release": true,
+    "production_models_profiles_and_binaries_changed_by_benchmark": false
+  },
+  "promotion_smoke_reported_by_owner": {
+    "same_model_alias": true,
+    "context_tokens": 131072,
+    "temperature": 0.6,
+    "fit_target_mib": 2048,
+    "draft_depth": 2,
+    "kv_cache_initial_tokens": 8192,
+    "observed_tokens_s": 59.42,
+    "minimum_sampled_free_vram_mib": 4995.91,
+    "profile_hash_confirmation": "Owner confirmed with Node.",
+    "scope": "First promotion smoke before the final microbatch 512 check; not a comparative speedup.",
+    "num_ubatch": 128
+  },
+  "total_final_isolated_inference_requests": 53,
+  "microbatch_comparison": {
+    "same_preserved_temperature06_profile": true,
+    "context_tokens": 131072,
+    "logical_batch": 512,
+    "mtp_type": "draft-mtp",
+    "draft_depth": 2,
+    "kv_cache_initial_tokens": 8192,
+    "request_count": 6,
+    "procedure": "One independent uncached 2512-token inventory prompt per runner, then two resident short-prompt decode requests. Inventories have distinct one-letter runner markers.",
+    "results": [
+      {
+        "microbatch": 128,
+        "uncached_prefill_input_count": 2512,
+        "uncached_prefill_cached_count": 0,
+        "uncached_prefill_seconds": 1.164613,
+        "uncached_prefill_tokens_s": 2156.9396872609186,
+        "prefill_request_output_count": 64,
+        "prefill_request_generated_tokens_s": 63.034252221711164,
+        "resident_decode_output_count_each": 128,
+        "resident_decode_samples": 2,
+        "resident_decode_tokens_s": [
+          59.846307202316055,
+          59.03718650908043
+        ],
+        "resident_decode_median_tokens_s": 59.44174685569824,
+        "minimum_sampled_free_vram_mib": 4892.359375,
+        "minimum_sampled_free_ram_gib": 14.24728775024414
+      },
+      {
+        "microbatch": 512,
+        "uncached_prefill_input_count": 2512,
+        "uncached_prefill_cached_count": 0,
+        "uncached_prefill_seconds": 1.018512,
+        "uncached_prefill_tokens_s": 2466.3430573228393,
+        "prefill_request_output_count": 64,
+        "prefill_request_generated_tokens_s": 53.24844643497491,
+        "resident_decode_output_count_each": 128,
+        "resident_decode_samples": 2,
+        "resident_decode_tokens_s": [
+          59.1846208762653,
+          61.6769975637586
+        ],
+        "resident_decode_median_tokens_s": 60.43080922001195,
+        "minimum_sampled_free_vram_mib": 4637.421875,
+        "minimum_sampled_free_ram_gib": 13.941001892089844
+      }
+    ],
+    "native_gpu_layers_both": "34/34",
+    "target_physical_kv_mib_both": 160,
+    "draft_physical_kv_mib_both": 32,
+    "observed_resident_decode_ratio_512_over128": 1.0166391873831497,
+    "observed_prefill_rate_ratio_512_over128": 1.1434455362332498,
+    "required_free_vram_for_selecting512_mib": 2048,
+    "ub512_meets_required_free_vram": true,
+    "material_decode_regression_threshold_ratio": 0.95,
+    "material_decode_regression_observed": false,
+    "selected_microbatch": 512,
+    "reason": "Preserve the previous implicit microbatch: bounded prefill improved, resident decode did not regress, all native layers stayed on GPU and over 2 GiB VRAM remained free.",
+    "cuda_startup_eager_retries": 0,
+    "guard_triggered": false,
+    "scope": "One prefill per mode and two decode samples do not establish general gains. The differently marked inventories produce distinct 64-token continuations; those rates are recorded separately, outside the controlled decode comparison. The first short prompt is uncached; the second reuses 49 of 53 input tokens."
+  },
+  "final_promotion_smoke_reported_by_owner": {
+    "same_model_alias": true,
+    "context_tokens": 131072,
+    "temperature": 0.6,
+    "fit_target_mib": 2048,
+    "num_ubatch": 512,
+    "draft_depth": 2,
+    "kv_cache_initial_tokens": 8192,
+    "draft_proposed": 58,
+    "draft_accepted": 40,
+    "observed_tokens_s": 67.5,
+    "minimum_sampled_free_vram_mib": 4601.08,
+    "minimum_sampled_free_ram_gib": 14.24,
+    "status": "PASS",
+    "scope": "Owner-supplied short smoke after final profile promotion; not a comparative speedup."
+  }
+}
