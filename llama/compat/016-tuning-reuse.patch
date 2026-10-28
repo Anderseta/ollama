@@ -1,0 +1,44 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -23,6 +23,10 @@
+     ggml_cuda_mmvq_reuse_scope & operator=(const ggml_cuda_mmvq_reuse_scope &) = delete;
+ };
+ 
++// A shape-only offline policy must not disable quantization shared by
++// real graph consumers. Query the plan before its first materialization.
++bool ggml_cuda_mmvq_has_reuse_plan(const ggml_backend_cuda_context & ctx, const ggml_tensor * input);
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -25,6 +25,12 @@
+ // This points to an execution scope, not a persistent pointer/value cache. A nested
+ // backend evaluation restores its caller, and each new capture starts empty.
+ static thread_local ggml_cuda_mmvq_reuse_scope::state * mmvq_reuse_active = nullptr;
++
++bool ggml_cuda_mmvq_has_reuse_plan(const ggml_backend_cuda_context & ctx, const ggml_tensor * input) {
++    const auto * scope = mmvq_reuse_active;
++    return scope && scope->context == &ctx && ctx.curr_stream_no == 0 &&
++        scope->inputs.find(input) != scope->inputs.end();
++}
+ 
+ ggml_cuda_mmvq_reuse_scope::ggml_cuda_mmvq_reuse_scope(
+         ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, bool concurrent) : data(nullptr) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2300,6 +2300,10 @@
+         return false;
+     }
+     for (int32_t parameter : dst->op_params) { if (parameter != 0) { return false; } }
++    // Stand-alone matrix timing does not include shared input quantization
++    // savings. Keep the original MMVQ path for every planned consumer,
++    // including the first, before the shared activation is materialized.
++    if (a->type == GGML_TYPE_Q8_0 && ggml_cuda_mmvq_has_reuse_plan(ctx, b)) { return false; }
+     switch (a->type) {
+         case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:

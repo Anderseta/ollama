@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -27,20 +28,23 @@ type nativeProbeDevice struct {
 	Index   int    `json:"index"`
 	// IndexMatchesBackend means Index is in the same visible-device order that
 	// llama-server reports, so it is safe to correlate when PCI ID is missing.
-	IndexMatchesBackend bool   `json:"index_matches_backend,omitempty"`
-	Name                string `json:"name,omitempty"`
-	Description         string `json:"description,omitempty"`
-	DeviceID            string `json:"device_id,omitempty"`
-	Integrated          bool   `json:"integrated,omitempty"`
-	IntegratedKnown     bool   `json:"integrated_known"`
-	TotalMemory         uint64 `json:"total_memory,omitempty"`
-	FreeMemory          uint64 `json:"free_memory,omitempty"`
-	ComputeMajor        int    `json:"compute_major,omitempty"`
-	ComputeMinor        int    `json:"compute_minor,omitempty"`
-	CUDADriverMajor     int    `json:"cuda_driver_major,omitempty"`
-	CUDADriverMinor     int    `json:"cuda_driver_minor,omitempty"`
-	NVIDIADriverMajor   int    `json:"nvidia_driver_major,omitempty"`
-	GFXTarget           string `json:"gfx_target,omitempty"`
+	IndexMatchesBackend bool                   `json:"index_matches_backend,omitempty"`
+	Name                string                 `json:"name,omitempty"`
+	Description         string                 `json:"description,omitempty"`
+	DeviceID            string                 `json:"device_id,omitempty"`
+	Integrated          bool                   `json:"integrated,omitempty"`
+	IntegratedKnown     bool                   `json:"integrated_known"`
+	TotalMemory         uint64                 `json:"total_memory,omitempty"`
+	FreeMemory          uint64                 `json:"free_memory,omitempty"`
+	ComputeMajor        int                    `json:"compute_major,omitempty"`
+	ComputeMinor        int                    `json:"compute_minor,omitempty"`
+	CUDADriverMajor     int                    `json:"cuda_driver_major,omitempty"`
+	CUDADriverMinor     int                    `json:"cuda_driver_minor,omitempty"`
+	NVIDIADriverMajor   int                    `json:"nvidia_driver_major,omitempty"`
+	NVIDIADriverVersion string                 `json:"nvidia_driver_version,omitempty"`
+	PhysicalUUID        string                 `json:"physical_uuid,omitempty"`
+	Capabilities        *ml.DeviceCapabilities `json:"capabilities,omitempty"`
+	GFXTarget           string                 `json:"gfx_target,omitempty"`
 }
 
 type nativeProbeResult struct {
@@ -158,6 +162,9 @@ func sameNativeProbeDevice(a, b nativeProbeDevice) bool {
 	if !strings.EqualFold(a.Library, b.Library) {
 		return false
 	}
+	if a.PhysicalUUID != "" && b.PhysicalUUID != "" {
+		return strings.EqualFold(a.PhysicalUUID, b.PhysicalUUID)
+	}
 	if a.DeviceID != "" && b.DeviceID != "" {
 		return strings.EqualFold(a.DeviceID, b.DeviceID)
 	}
@@ -201,8 +208,61 @@ func mergeNativeProbeDevice(dst *nativeProbeDevice, src nativeProbeDevice) {
 	if dst.NVIDIADriverMajor == 0 && src.NVIDIADriverMajor != 0 {
 		dst.NVIDIADriverMajor = src.NVIDIADriverMajor
 	}
+	if dst.NVIDIADriverVersion == "" {
+		dst.NVIDIADriverVersion = src.NVIDIADriverVersion
+	}
+	if dst.PhysicalUUID == "" {
+		dst.PhysicalUUID = src.PhysicalUUID
+	}
+	if dst.Capabilities == nil {
+		dst.Capabilities = src.Capabilities
+	}
 	if dst.GFXTarget == "" {
 		dst.GFXTarget = src.GFXTarget
+	}
+}
+
+// cudaAllocationProp matches CUmemAllocationProp in the CUDA driver ABI.
+// Granularity queries require no context and allocate no device memory. This
+// structure is only passed when the optional VMM API and attribute exist.
+type cudaAllocationProp struct {
+	Type             int32
+	RequestedHandles int32
+	LocationType     int32
+	LocationID       int32
+	Win32HandleMeta  uintptr
+	AllocationFlags  [8]byte
+}
+
+// cudaUUIDString preserves the driver's 16 bytes without exposing them in the
+// public device API. An all-zero result is unknown, never a shared identity.
+func cudaUUIDString(uuid [16]byte) string {
+	if uuid == [16]byte{} {
+		return ""
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
+}
+
+// Attribute values are from the CUDA driver ABI. Unsupported optional
+// attributes are deliberately omitted rather than failing device discovery.
+func cudaProbeCapabilities(attribute func(int) (int, bool)) *ml.DeviceCapabilities {
+	positive := func(attr int) int {
+		value, ok := attribute(attr)
+		if !ok || value <= 0 {
+			return 0
+		}
+		return value
+	}
+	vmm, vmmKnown := attribute(102) // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+	return &ml.DeviceCapabilities{
+		Multiprocessors:           positive(16), // MULTIPROCESSOR_COUNT
+		WarpSize:                  positive(10), // WARP_SIZE
+		SharedMemoryPerBlock:      uint64(positive(8)),
+		SharedMemoryPerBlockOptin: uint64(positive(97)),
+		MemoryClockRateKHz:        positive(36),
+		MemoryBusWidthBits:        positive(37),
+		VirtualMemoryKnown:        vmmKnown && (vmm == 0 || vmm == 1),
+		VirtualMemoryManagement:   vmmKnown && vmm == 1,
 	}
 }
 

@@ -105,6 +105,16 @@ target_include_directories(test-expert-trace PRIVATE "${WILDLLAMA_NATIVE}/src")
 validation_target(test-server-component server-context)
 target_include_directories(test-server-component PRIVATE
     "${WILDLLAMA_NATIVE}/tools/server" "${WILDLLAMA_NATIVE}/tests")
+
+# Offline dense calibration is explicit; its policy tests never initialize CUDA.
+add_executable(test-cuda-tuning-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cuda-tuning-policy.cpp")
+target_compile_features(test-cuda-tuning-policy PRIVATE cxx_std_17)
+target_include_directories(test-cuda-tuning-policy PRIVATE "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
+add_test(NAME cuda-tuning-policy COMMAND test-cuda-tuning-policy)
+add_executable(wildllama-cuda-calibrate "${CMAKE_CURRENT_LIST_DIR}/cuda-calibrate.cpp")
+target_compile_features(wildllama-cuda-calibrate PRIVATE cxx_std_17)
+target_include_directories(wildllama-cuda-calibrate PRIVATE "${WILDLLAMA_NATIVE}/ggml/include" "${WILDLLAMA_NATIVE}/ggml/src")
+target_link_libraries(wildllama-cuda-calibrate PRIVATE ggml)
 add_test(NAME gpu-exclusive-scheduler COMMAND test-gpu-exclusive-scheduler)
 add_test(NAME moe-admission COMMAND test-moe-admission)
 add_test(NAME moe-budget COMMAND test-moe-budget)
@@ -160,3 +170,19 @@ install(FILES "${CMAKE_BINARY_DIR}/ollama-vendor-licenses/LLAMA_CPP_VENDORS_LICE
 if(MSVC)
     set(CMAKE_CL_SHOWINCLUDES_PREFIX "${_gpu_first_msvc_include_prefix}")
 endif()
+
+# Header-only cache-safety tests also work in standalone CPU builds.
+foreach(test_name IN ITEMS test-kv-trim-ranges test-prompt-state-transaction)
+    add_executable(${test_name} "${WILDLLAMA_NATIVE}/tests/${test_name}.cpp")
+    target_compile_features(${test_name} PRIVATE cxx_std_17)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+
+# Real tiny CPU MTP/carryover regressions (no model downloads or GPU use).
+validation_target(test-mtp-state llama-common)
+add_dependencies(test-mtp-state ggml-cpu)
+target_compile_definitions(test-mtp-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME mtp-state COMMAND test-mtp-state)
+add_executable(test-mtp-carry-state "${WILDLLAMA_NATIVE}/tests/test-mtp-carry-state.cpp")
+target_compile_features(test-mtp-carry-state PRIVATE cxx_std_17)
+add_test(NAME mtp-carry-state COMMAND test-mtp-carry-state)

@@ -171,3 +171,29 @@ Two helpers need extra context:
 - Load-op registry overrides ignore the caller-provided `file_offset` when a
   registered operation exists. The operations capture their own source offsets
   at translation time, before renames change tensor names.
+
+## Empty-cache reclamation and prompt-state transactions
+
+`014-kv-reclamation-and-prompt-state.patch` preserves a valid prompt-cache entry
+when a replacement capture fails, and restores the target, draft and speculative
+implementation state as one transaction. A failed restore clears both live
+sequences and retains the saved entry for a later retry. Saves stage their data
+before evicting older entries; that temporary capture can require additional host
+memory, while the published cache remains within its configured cache budget.
+
+With CUDA VMM KV growth enabled, `WILDLLAMA_KV_CACHE_TRIM_EMPTY=1` additionally
+allows `llama_memory_trim_empty(ctx)` to return unused physical mappings after a
+prompt is explicitly cleared. The context synchronizes first. Every attention
+cell must be unused; hybrid contexts also require no live recurrent-state cells.
+The initial prefixes and quantization-padding mappings stay mapped, and only
+whole CUDA mappings are released. Logical context capacity and tensor virtual
+addresses do not change. Later decode/state restore recommits the necessary
+physical pages under the same CUDA allocation quota. Ordinary sequence removal
+used by speculative rollback does not trim. The feature is off by default;
+unsupported backends/layouts retain the existing allocation behavior.
+
+The version-1 KV-growth API stays unchanged: reclamation is a separate optional
+`ggml_backend_cuda_kv_trim_empty` proc. `test-kv-trim-ranges` and
+`test-prompt-state-transaction` run on CPU without a model. The existing small
+`test-cuda-kv-growth` and fixture-based `test-kv-growth` also cover physical
+accounting, idempotence and byte-identical continuation after trim/regrowth.

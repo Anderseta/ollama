@@ -61,6 +61,8 @@ typedef int (*ollama_cu_device_get_attribute_fn)(int *, int, int);
 typedef int (*ollama_cu_device_get_name_fn)(char *, int, int);
 typedef int (*ollama_cu_device_total_mem_fn)(size_t *, int);
 typedef int (*ollama_cu_device_get_pci_bus_id_fn)(char *, int, int);
+typedef int (*ollama_cu_device_get_uuid_fn)(void *, int);
+typedef int (*ollama_cu_mem_get_allocation_granularity_fn)(size_t *, const void *, int);
 
 static int ollama_call_cu_init(void * fn) {
 	return ((ollama_cu_init_fn) fn)(0);
@@ -92,6 +94,14 @@ static int ollama_call_cu_device_total_mem(void * fn, size_t * total, int device
 
 static int ollama_call_cu_device_get_pci_bus_id(void * fn, char * pci, int len, int device) {
 	return ((ollama_cu_device_get_pci_bus_id_fn) fn)(pci, len, device);
+}
+
+static int ollama_call_cu_device_get_uuid(void * fn, void * uuid, int device) {
+	return ((ollama_cu_device_get_uuid_fn) fn)(uuid, device);
+}
+
+static int ollama_call_cu_mem_get_allocation_granularity(void * fn, size_t * granularity, const void * prop) {
+	return ((ollama_cu_mem_get_allocation_granularity_fn) fn)(granularity, prop, 0);
 }
 
 typedef int (*ollama_nvml_init_fn)(void);
@@ -281,6 +291,8 @@ func probeCUDADriverLinux() ([]nativeProbeDevice, error) {
 		return nil, err
 	}
 	cuDeviceGetPCIBusID, _ := dlsym(cuda, "cuDeviceGetPCIBusId")
+	cuDeviceGetUUID, _ := dlsymAny(cuda, "cuDeviceGetUuid_v2", "cuDeviceGetUuid")
+	cuMemGetAllocationGranularity, _ := dlsym(cuda, "cuMemGetAllocationGranularity")
 
 	if ret := C.ollama_call_cu_init(cuInit); ret != cuSuccess {
 		return nil, fmt.Errorf("cuInit failed: %d", int(ret))
@@ -295,7 +307,8 @@ func probeCUDADriverLinux() ([]nativeProbeDevice, error) {
 	}
 
 	nvidiaDriverMajor := 0
-	if driver, err := probeNVIDIADriverMajorLinux(); err == nil {
+	nvidiaDriverVersion, _ := probeNVIDIADriverVersionLinux()
+	if driver, err := parseNVIDIADriverMajor(nvidiaDriverVersion); err == nil {
 		nvidiaDriverMajor = driver
 	}
 
@@ -315,6 +328,23 @@ func probeCUDADriverLinux() ([]nativeProbeDevice, error) {
 		major := cudaDeviceAttribute(cuDeviceGetAttribute, cuDeviceAttributeComputeCapabilityMajor, device)
 		minor := cudaDeviceAttribute(cuDeviceGetAttribute, cuDeviceAttributeComputeCapabilityMinor, device)
 		integrated := cudaDeviceAttribute(cuDeviceGetAttribute, cuDeviceAttributeIntegrated, device) == 1
+		capabilities := cudaProbeCapabilities(func(attr int) (int, bool) {
+			return cudaDeviceAttributeChecked(cuDeviceGetAttribute, attr, device)
+		})
+		if capabilities.VirtualMemoryManagement && cuMemGetAllocationGranularity != nil {
+			prop := cudaAllocationProp{Type: 1, LocationType: 1, LocationID: int32(device)}
+			var granularity C.size_t
+			if ret := C.ollama_call_cu_mem_get_allocation_granularity(cuMemGetAllocationGranularity, &granularity, unsafe.Pointer(&prop)); ret == cuSuccess {
+				capabilities.VirtualMemoryGranularity = uint64(granularity)
+			}
+		}
+		physicalUUID := ""
+		if cuDeviceGetUUID != nil {
+			var uuid [16]byte
+			if ret := C.ollama_call_cu_device_get_uuid(cuDeviceGetUUID, unsafe.Pointer(&uuid[0]), device); ret == cuSuccess {
+				physicalUUID = cudaUUIDString(uuid)
+			}
+		}
 
 		var name [128]C.char
 		_ = C.ollama_call_cu_device_get_name(cuDeviceGetName, &name[0], C.int(len(name)), device)
@@ -344,6 +374,9 @@ func probeCUDADriverLinux() ([]nativeProbeDevice, error) {
 			CUDADriverMajor:     driverMajor,
 			CUDADriverMinor:     driverMinor,
 			NVIDIADriverMajor:   nvidiaDriverMajor,
+			NVIDIADriverVersion: nvidiaDriverVersion,
+			PhysicalUUID:        physicalUUID,
+			Capabilities:        capabilities,
 		})
 	}
 
@@ -388,41 +421,46 @@ func rocmVisibleDevicesEnvSet() bool {
 	return false
 }
 
-func probeNVIDIADriverMajorLinux() (int, error) {
+func probeNVIDIADriverVersionLinux() (string, error) {
 	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	initFn, err := dlsym(nvml, "nvmlInit_v2")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	shutdownFn, err := dlsym(nvml, "nvmlShutdown")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	driverFn, err := dlsym(nvml, "nvmlSystemGetDriverVersion")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
-		return 0, fmt.Errorf("nvmlInit_v2 failed: %d", int(ret))
+		return "", fmt.Errorf("nvmlInit_v2 failed: %d", int(ret))
 	}
 	defer C.ollama_call_nvml_shutdown(shutdownFn)
 
 	var version [80]C.char
 	if ret := C.ollama_call_nvml_system_get_driver_version(driverFn, &version[0], C.uint(len(version))); ret != 0 {
-		return 0, fmt.Errorf("nvmlSystemGetDriverVersion failed: %d", int(ret))
+		return "", fmt.Errorf("nvmlSystemGetDriverVersion failed: %d", int(ret))
 	}
-	return parseNVIDIADriverMajor(C.GoString(&version[0]))
+	return strings.TrimSpace(C.GoString(&version[0])), nil
 }
 
 func cudaDeviceAttribute(fn unsafe.Pointer, attr int, device C.int) int {
+	value, _ := cudaDeviceAttributeChecked(fn, attr, device)
+	return value
+}
+
+func cudaDeviceAttributeChecked(fn unsafe.Pointer, attr int, device C.int) (int, bool) {
 	var value C.int
 	if ret := C.ollama_call_cu_device_get_attribute(fn, &value, C.int(attr), device); ret != cuSuccess {
-		return 0
+		return 0, false
 	}
-	return int(value)
+	return int(value), true
 }
 
 func dlopenFirst(names []string, global bool) (dlHandle, error) {

@@ -1,0 +1,633 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3,6 +3,7 @@
+ #include "ggml-cuda-host-op.h"
+ #include "ggml-cuda-moe.h"
+ #include "ggml-cuda-kv-growth.h"
++#include "ggml-cuda-tuning.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
+@@ -38,6 +39,7 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/dense-reuse.h"
++#include "ggml-cuda/resident-tuning-policy.h"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -88,6 +90,9 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <exception>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
+ #include <cfloat>
+ #include <initializer_list>
+ #include <limits>
+@@ -786,6 +791,8 @@
+         physical_device(ggml_cuda_get_physical_device(device)),
+         granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+     }
++
++    size_t available_without_growth() const override { return pool_size - pool_used; }
+ 
+     ~ggml_cuda_pool_vmm() {
+         if (pool_addr != 0) {
+@@ -2261,6 +2268,48 @@
+     return true;
+ }
+ 
++// Eligible layouts are deliberately narrower than either kernel's full API.
++// Both candidates must be supported, and the original choice must already be
++// MMVQ/MMQ. Never override explicit forced-kernel builds, precision, FWHT,
++// fusion, views, split weights, expert routing, or batched/broadcast layouts.
++static bool ggml_cuda_tuning_key(ggml_backend_cuda_context & ctx, const ggml_tensor * a,
++        const ggml_tensor * b, const ggml_tensor * dst, wildllama_cuda_tuning::key & key,
++        ggml_cuda_tuning_kernel & original) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || defined(GGML_CUDA_FORCE_MMQ) || defined(GGML_CUDA_FORCE_CUBLAS)
++    GGML_UNUSED(ctx); GGML_UNUSED(a); GGML_UNUSED(b); GGML_UNUSED(dst); GGML_UNUSED(key); GGML_UNUSED(original);
++    return false;
++#else
++    if (!a || !b || !dst || !a->data || !b->data || !dst->data ||
++        !a->buffer || !b->buffer || !dst->buffer || a->view_src || b->view_src || dst->view_src ||
++        !ggml_is_matrix(a) || !ggml_is_matrix(b) || !ggml_is_matrix(dst) ||
++        !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(dst) ||
++        b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || dst->op != GGML_OP_MUL_MAT ||
++        reinterpret_cast<uintptr_t>(a->data) % 128 || reinterpret_cast<uintptr_t>(b->data) % 128 ||
++        reinterpret_cast<uintptr_t>(dst->data) % 128 ||
++        a->ne[0] != b->ne[0] ||
++        dst->ne[0] != a->ne[1] || dst->ne[1] != b->ne[1] ||
++        a->ne[0] < 256 || a->ne[0] > 16384 || a->ne[0] % 256 ||
++        a->ne[1] < 128 || a->ne[1] > 16384 || a->ne[1] % 128 || b->ne[1] < 1 || b->ne[1] > MMVQ_MAX_BATCH_SIZE) {
++        return false;
++    }
++    for (int32_t parameter : dst->op_params) { if (parameter != 0) { return false; } }
++    switch (a->type) {
++        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: break;
++        default: return false;
++    }
++    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
++    if (a->buffer->buft != buft || b->buffer->buft != buft || dst->buffer->buft != buft ||
++        ggml_backend_buffer_get_usage(a->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) { return false; }
++    const auto & hardware = ggml_cuda_info().devices[ctx.device];
++    if (hardware.physical_share_count > 1 || !ggml_cuda_should_use_mmq(a->type, hardware.cc, b->ne[1], 0)) { return false; }
++    key = {int(a->type), a->ne[0], a->ne[1], b->ne[1]};
++    original = ggml_cuda_should_use_mmvq(a->type, hardware.cc, b->ne[1]) ? GGML_CUDA_TUNING_MMVQ : GGML_CUDA_TUNING_MMQ;
++    return true;
++#endif
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -2305,6 +2354,22 @@
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (ctx.resident_tuning) {
++        wildllama_cuda_tuning::key shape;
++        ggml_cuda_tuning_kernel original;
++        if (ggml_cuda_tuning_key(ctx, src0, src1, dst, shape, original)) {
++            const auto & pool = ctx.pools[ctx.device][ctx.curr_stream_no];
++            const auto selected = ctx.resident_tuning->lookup(shape, original, pool ? pool->available_without_growth() : 0);
++            if (selected == GGML_CUDA_TUNING_MMVQ) {
++                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
++                return;
++            }
++            if (selected == GGML_CUDA_TUNING_MMQ) {
++                ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
++                return;
++            }
++        }
++    }
+     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+@@ -2315,6 +2380,206 @@
+     }
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
++
++static bool ggml_cuda_tuning_idle(ggml_backend_cuda_context & ctx) {
++    // A policy is immutable for the lifetime of any compiled CUDA graph.
++#ifdef USE_CUDA_GRAPH
++    if (ctx.any_cuda_graph_has_instance()) { return false; }
++#endif
++    if (ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) { return false; }
++    cudaStreamCaptureStatus status;
++    return cudaStreamIsCapturing(ctx.stream(), &status) == cudaSuccess && status == cudaStreamCaptureStatusNone;
++}
++
++static bool ggml_cuda_tuning_configure(ggml_backend_t backend, const char * path, const char * fingerprint) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED(backend); GGML_UNUSED(path); GGML_UNUSED(fingerprint); return false;
++#else
++    if (!backend || !ggml_backend_is_cuda(backend)) { return false; }
++    auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
++    ggml_cuda_set_device(ctx.device);
++    if (!ggml_cuda_tuning_idle(ctx)) { return false; }
++    ctx.resident_tuning.reset();
++    if (!path || !*path) { return true; }
++    try {
++        if (!fingerprint || !wildllama_cuda_tuning::fingerprint_valid(fingerprint)) { return false; }
++        const std::filesystem::path file = std::filesystem::u8path(path);
++        std::error_code error;
++        if (!file.is_absolute() || !std::filesystem::is_regular_file(file, error) || error ||
++            std::filesystem::file_size(file, error) > wildllama_cuda_tuning::max_file_bytes || error) { return false; }
++        std::ifstream input(file, std::ios::binary);
++        auto policy = std::make_shared<wildllama_cuda_tuning::policy>();
++        if (!input || !wildllama_cuda_tuning::parse(input, fingerprint, *policy)) {
++            GGML_LOG_WARN("CUDA tuning: cache rejected; using original kernel heuristics\n");
++            return false;
++        }
++        ctx.resident_tuning = std::move(policy);
++        GGML_LOG_INFO("CUDA tuning: loaded %zu bitwise-validated dense kernel policies\n", ctx.resident_tuning->count);
++        return true;
++    } catch (const std::exception &) {
++        GGML_LOG_WARN("CUDA tuning: cache unavailable; using original kernel heuristics\n");
++        return false;
++    }
++#endif
++}
++
++static bool ggml_cuda_tuning_get_stats(ggml_backend_t backend, ggml_cuda_tuning_stats * stats) {
++    if (!backend || !stats || !ggml_backend_is_cuda(backend)) { return false; }
++    auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
++    *stats = {};
++    if (ctx.resident_tuning) {
++        const auto & p = *ctx.resident_tuning;
++        *stats = {uint32_t(p.count), p.hits, p.misses, true};
++    }
++    return true;
++}
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// Fixed arena: normal quota-accounted CUDA allocation, no VMM expansion,
++// lookahead allocation or retained calibration workspace in the live context.
++struct ggml_cuda_tuning_pool final : ggml_cuda_pool {
++    int device;
++    char * data = nullptr;
++    size_t capacity, used = 0, peak = 0;
++    ggml_cuda_tuning_pool(int device, size_t capacity) : device(device), capacity(capacity) {
++        if (ggml_cuda_device_malloc(reinterpret_cast<void **>(&data), capacity, device) != cudaSuccess) {
++            (void) cudaGetLastError();
++            throw std::bad_alloc();
++        }
++    }
++    ~ggml_cuda_tuning_pool() override { if (data) { (void) ggml_cuda_device_free(data, device); } }
++    void * alloc(size_t size, size_t * actual) override {
++        if (size > SIZE_MAX - 255) { throw std::bad_alloc(); }
++        const size_t rounded = (size + 255) & ~size_t(255);
++        if (rounded > capacity - used) { throw std::bad_alloc(); }
++        void * result = data + used;
++        used += rounded;
++        peak = std::max(peak, used);
++        *actual = rounded;
++        return result;
++    }
++    void free(void * ptr, size_t size) override {
++        GGML_ASSERT(size <= used && ptr == data + used - size);
++        used -= size;
++    }
++};
++
++struct ggml_cuda_tuning_events {
++    cudaEvent_t start = nullptr, stop = nullptr;
++    ~ggml_cuda_tuning_events() {
++        if (start) { (void) cudaEventDestroy(start); }
++        if (stop) { (void) cudaEventDestroy(stop); }
++    }
++};
++#endif
++
++static ggml_cuda_tuning_status ggml_cuda_tuning_calibrate(ggml_backend_t backend, ggml_tensor * op,
++        const ggml_cuda_tuning_limits * limits, ggml_cuda_tuning_result * result) {
++    if (!result) { return GGML_CUDA_TUNING_INVALID; }
++    *result = {};
++    result->status = GGML_CUDA_TUNING_INVALID;
++    auto finish = [&](ggml_cuda_tuning_status status) { result->status = status; return status; };
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED(backend); GGML_UNUSED(op); GGML_UNUSED(limits);
++    return finish(GGML_CUDA_TUNING_UNSUPPORTED);
++#else
++    if (!backend || !ggml_backend_is_cuda(backend) || !op || !limits || limits->abi_version != 1 ||
++        limits->pairs < 3 || limits->pairs > 16 || !limits->max_time_ms || limits->max_time_ms > 10000 ||
++        !limits->max_scratch_bytes || limits->max_scratch_bytes > size_t(256) * 1024 * 1024) { return result->status; }
++    if (!limits->allow_warmup) { return finish(GGML_CUDA_TUNING_UNSUPPORTED); }
++    auto & source = *static_cast<ggml_backend_cuda_context *>(backend->context);
++    ggml_cuda_set_device(source.device);
++    if (!ggml_cuda_tuning_idle(source)) { return finish(GGML_CUDA_TUNING_CAPTURE); }
++    wildllama_cuda_tuning::key shape;
++    if (!ggml_cuda_tuning_key(source, op->src[0], op->src[1], op, shape, result->original)) {
++        return finish(GGML_CUDA_TUNING_UNSUPPORTED);
++    }
++    const auto begin = std::chrono::steady_clock::now();
++    auto stop = [&]() {
++        if (limits->abort_callback && limits->abort_callback(limits->abort_user_data)) { return GGML_CUDA_TUNING_CANCELLED; }
++        if (std::chrono::steady_clock::now() - begin >= std::chrono::milliseconds(limits->max_time_ms)) { return GGML_CUDA_TUNING_BUDGET; }
++        return GGML_CUDA_TUNING_APPROVED;
++    };
++    if (const auto reason = stop(); reason != GGML_CUDA_TUNING_APPROVED) { return finish(reason); }
++    const size_t output_bytes = ggml_nbytes(op);
++    if (output_bytes > limits->max_scratch_bytes / 4) { return finish(GGML_CUDA_TUNING_BUDGET); }
++    try {
++        std::vector<float> reference(output_bytes / sizeof(float)), candidate(reference.size());
++        const size_t arena_bytes = (limits->max_scratch_bytes - 2 * output_bytes) & ~size_t(255);
++        if (!arena_bytes) { return finish(GGML_CUDA_TUNING_BUDGET); }
++        if (cudaStreamSynchronize(source.stream()) != cudaSuccess) { return finish(GGML_CUDA_TUNING_CUDA_ERROR); }
++        ggml_backend_cuda_context calibration(source.device);
++        cudaStream_t stream = calibration.stream();
++        struct drain {
++            cudaStream_t stream;
++            ~drain() { (void) cudaStreamSynchronize(stream); }
++        } cleanup{stream};
++        calibration.pools[source.device][0] = std::make_unique<ggml_cuda_tuning_pool>(source.device, arena_bytes);
++        result->scratch_bytes = arena_bytes + 2 * output_bytes;
++        ggml_cuda_tuning_events events;
++        if (cudaEventCreate(&events.start) != cudaSuccess || cudaEventCreate(&events.stop) != cudaSuccess) {
++            return finish(GGML_CUDA_TUNING_CUDA_ERROR);
++        }
++        auto run = [&](ggml_cuda_tuning_kernel kernel, std::vector<float> & output, double & ms) {
++            if (const auto reason = stop(); reason != GGML_CUDA_TUNING_APPROVED) { return reason; }
++            if (cudaEventRecord(events.start, stream) != cudaSuccess) { return GGML_CUDA_TUNING_CUDA_ERROR; }
++            if (kernel == GGML_CUDA_TUNING_MMVQ) {
++                ggml_cuda_mul_mat_vec_q(calibration, op->src[0], op->src[1], nullptr, op);
++            } else {
++                ggml_cuda_mul_mat_q(calibration, op->src[0], op->src[1], nullptr, op);
++            }
++            if (cudaEventRecord(events.stop, stream) != cudaSuccess ||
++                cudaEventSynchronize(events.stop) != cudaSuccess) { return GGML_CUDA_TUNING_CUDA_ERROR; }
++            float elapsed;
++            if (cudaEventElapsedTime(&elapsed, events.start, events.stop) != cudaSuccess ||
++                cudaMemcpyAsync(output.data(), op->data, output_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
++                cudaStreamSynchronize(stream) != cudaSuccess) { return GGML_CUDA_TUNING_CUDA_ERROR; }
++            ms = elapsed;
++            return stop();
++        };
++        std::array<double, 16> mmvq{}, mmq{};
++        double ignored;
++        // Both candidates warm up explicitly; --no-warmup rejects before any
++        // launch. Measured pairs alternate order to avoid a fixed-order bias.
++        for (auto kernel : {GGML_CUDA_TUNING_MMVQ, GGML_CUDA_TUNING_MMQ}) {
++            const auto status = run(kernel, reference, ignored);
++            if (status != GGML_CUDA_TUNING_APPROVED) { return finish(status); }
++        }
++        for (uint32_t pair = 0; pair < limits->pairs; ++pair) {
++            for (unsigned i = 0; i < 2; ++i) {
++                const bool mv = ((pair + i) % 2) == 0;
++                const auto status = mv ? run(GGML_CUDA_TUNING_MMVQ, reference, mmvq[pair]) :
++                                         run(GGML_CUDA_TUNING_MMQ, candidate, mmq[pair]);
++                if (status != GGML_CUDA_TUNING_APPROVED) { return finish(status); }
++            }
++            if (!wildllama_cuda_tuning::has_finite_values(reference.data(), reference.size()) ||
++                !wildllama_cuda_tuning::has_finite_values(candidate.data(), candidate.size())) {
++                return finish(GGML_CUDA_TUNING_NONFINITE);
++            }
++            if (!wildllama_cuda_tuning::finite_bitwise_equal(reference.data(), candidate.data(), reference.size())) {
++                return finish(GGML_CUDA_TUNING_DIFFERENT);
++            }
++            ++result->pairs;
++            result->mmvq_ms += mmvq[pair] / limits->pairs;
++            result->mmq_ms += mmq[pair] / limits->pairs;
++        }
++        if (!wildllama_cuda_tuning::repeatable_gain(mmvq.data(), mmq.data(), limits->pairs, result->original, result->minimum_speedup)) {
++            return finish(GGML_CUDA_TUNING_NO_GAIN);
++        }
++        result->workspace_bytes = static_cast<ggml_cuda_tuning_pool *>(calibration.pools[source.device][0].get())->peak;
++        result->selected = result->original == GGML_CUDA_TUNING_MMVQ ? GGML_CUDA_TUNING_MMQ : GGML_CUDA_TUNING_MMVQ;
++        return finish(GGML_CUDA_TUNING_APPROVED);
++    } catch (const std::bad_alloc &) {
++        return finish(GGML_CUDA_TUNING_BUDGET);
++    } catch (const std::exception &) {
++        return finish(GGML_CUDA_TUNING_CUDA_ERROR);
++    }
++#endif
++}
++
++static const ggml_backend_cuda_tuning_api ggml_cuda_resident_tuning_api {
++    1, ggml_cuda_tuning_configure, ggml_cuda_tuning_get_stats, ggml_cuda_tuning_calibrate,
++};
+ 
+ // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+ // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+@@ -6939,6 +7204,11 @@
+ }
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    if (strcmp(name, "ggml_backend_cuda_tuning_api") == 0) {
++        return const_cast<ggml_backend_cuda_tuning_api *>(&ggml_cuda_resident_tuning_api);
++    }
++#endif
+     if (strcmp(name,"ggml_backend_cuda_moe_api")==0) {
+         return const_cast<ggml_backend_cuda_moe_api *>(&ggml_cuda_moe_api);
+     }
+@@ -7072,6 +7342,23 @@
+         /* .context = */ ctx,
+     };
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    // The trusted parent supplies a current installation/device fingerprint.
++    // The simple environment contract is intentionally single-GPU only: never
++    // apply one physical device's calibration to every device in a group.
++    // Multi-GPU callers can use configure() explicitly on each idle backend.
++    const char * tuning_path = std::getenv("GGML_CUDA_TUNING_CACHE");
++    if (tuning_path && *tuning_path) {
++        const auto & hardware = ggml_cuda_info();
++        if (hardware.device_count == 1 && hardware.physical_device_count == 1 && device == 0) {
++            if (!ggml_cuda_tuning_configure(cuda_backend, tuning_path, std::getenv("GGML_CUDA_TUNING_FINGERPRINT"))) {
++                GGML_LOG_WARN("CUDA tuning: unavailable/incompatible policy; original kernel heuristics retained\n");
++            }
++        } else {
++            GGML_LOG_WARN("CUDA tuning: shared environment policy ignored for multiple/virtual GPUs\n");
++        }
++    }
++#endif
+     return cuda_backend;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1206,6 +1206,9 @@
+ 
+     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+     virtual void free(void * ptr, size_t size) = 0;
++    // Optional resident-policy check: unknown/non-stack pools conservatively
++    // report zero. A calibrated choice must not grow inference workspace.
++    virtual size_t available_without_growth() const { return 0; }
+ };
+ 
+ template<typename T>
+@@ -1468,11 +1471,16 @@
+     ~ggml_cuda_execution_timing();
+ };
+ 
++// Optional offline-calibrated dense kernel policy. Incomplete on purpose here;
++// its definition is CPU-only and included by the dispatch implementation.
++namespace wildllama_cuda_tuning { struct policy; }
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+     std::unique_ptr<ggml_cuda_execution_timing> execution_timing;
++    std::shared_ptr<wildllama_cuda_tuning::policy> resident_tuning;
+ 
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+diff --git a/ggml/include/ggml-cuda-tuning.h b/ggml/include/ggml-cuda-tuning.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-cuda-tuning.h
+@@ -0,0 +1,81 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Optional ABI obtained through ggml_backend_reg_get_proc_address with
++// "ggml_backend_cuda_tuning_api". Unsupported backends return null. Configure
++// only on a quiescent backend, before graph execution/capture. Never supplies
++// approximate kernels, changes model weights, or calibrates during inference.
++enum ggml_cuda_tuning_kernel {
++    GGML_CUDA_TUNING_DEFAULT = 0,
++    GGML_CUDA_TUNING_MMVQ = 1,
++    GGML_CUDA_TUNING_MMQ = 2,
++};
++
++enum ggml_cuda_tuning_status {
++    GGML_CUDA_TUNING_APPROVED = 0,
++    GGML_CUDA_TUNING_UNSUPPORTED,
++    GGML_CUDA_TUNING_INVALID,
++    GGML_CUDA_TUNING_CAPTURE,
++    GGML_CUDA_TUNING_BUDGET,
++    GGML_CUDA_TUNING_CANCELLED,
++    GGML_CUDA_TUNING_NONFINITE,
++    GGML_CUDA_TUNING_DIFFERENT,
++    GGML_CUDA_TUNING_NO_GAIN,
++    GGML_CUDA_TUNING_CUDA_ERROR,
++};
++
++struct ggml_cuda_tuning_limits {
++    uint32_t abi_version;       // 1
++    uint32_t pairs;             // 3..16 alternating timed pairs
++    uint32_t max_time_ms;       // 1..10000; no new work after this deadline
++    size_t max_scratch_bytes;   // <=256 MiB: fixed GPU arena + host output copies
++    bool allow_warmup;         // false honors --no-warmup: no kernels launched
++    bool (*abort_callback)(void * user_data);
++    void * abort_user_data;
++};
++
++struct ggml_cuda_tuning_result {
++    enum ggml_cuda_tuning_status status;
++    enum ggml_cuda_tuning_kernel original;
++    enum ggml_cuda_tuning_kernel selected;
++    uint32_t pairs;
++    double mmvq_ms;
++    double mmq_ms;
++    double minimum_speedup;
++    size_t scratch_bytes;
++    size_t workspace_bytes;     // observed fixed-arena peak; dispatch never grows its pool for a policy
++};
++
++struct ggml_cuda_tuning_stats {
++    uint32_t entries;
++    uint64_t hits;              // direct dispatch/capture only, not graph replays
++    uint64_t misses;
++    bool enabled;
++};
++
++struct ggml_backend_cuda_tuning_api {
++    uint32_t abi_version;       // 1
++    // fingerprint: SHA-256 identity from the trusted runtime, including exact
++    // native payload, complete kernel driver, physical UUID/PCI and hardware
++    // capabilities. Never reuse a fingerprint across devices or driver builds.
++    // Absolute cache_path is read only, bounded to 64 KiB and 128 entries.
++    // Null/empty path disables. Failed configuration also clears old policy.
++    bool (*configure)(ggml_backend_t backend, const char * cache_path, const char * fingerprint);
++    bool (*get_stats)(ggml_backend_t backend, struct ggml_cuda_tuning_stats * stats);
++    // Stand-alone calibration only, on an idle backend, with fully resident
++    // 2D contiguous quantized weights and F32 input/output; op is MUL_MAT.
++    // Every pair must be finite and bitwise equal. Gain must exceed 5% in
++    // every pair; otherwise selected stays DEFAULT. Deadline/abort cannot
++    // preempt an already launched CUDA kernel: cleanup drains it safely.
++    enum ggml_cuda_tuning_status (*calibrate)(ggml_backend_t backend, struct ggml_tensor * op,
++        const struct ggml_cuda_tuning_limits * limits, struct ggml_cuda_tuning_result * result);
++};
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/resident-tuning-policy.h b/ggml/src/ggml-cuda/resident-tuning-policy.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/resident-tuning-policy.h
+@@ -0,0 +1,159 @@
++#pragma once
++
++// CPU-only policy parsing/validation shared by the CUDA consumer and the
++// explicit calibration tool. No file I/O, CUDA calls, or policy search work
++// happens on the default inference path.
++#include "ggml-cuda-tuning.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstring>
++#include <iomanip>
++#include <istream>
++#include <limits>
++#include <ostream>
++#include <sstream>
++#include <string>
++#include <tuple>
++
++namespace wildllama_cuda_tuning {
++constexpr size_t max_entries = 128;
++constexpr size_t max_file_bytes = 65536;
++constexpr double required_speedup = 1.05;
++
++struct key {
++    int type = 0;
++    int64_t k = 0, m = 0, n = 0;
++    bool operator<(const key & other) const {
++        return std::tie(type, k, m, n) < std::tie(other.type, other.k, other.m, other.n);
++    }
++    bool operator==(const key & other) const {
++        return type == other.type && k == other.k && m == other.m && n == other.n;
++    }
++};
++
++struct entry {
++    key shape;
++    ggml_cuda_tuning_kernel original = GGML_CUDA_TUNING_DEFAULT;
++    ggml_cuda_tuning_kernel selected = GGML_CUDA_TUNING_DEFAULT;
++    uint32_t pairs = 0;
++    double minimum_speedup = 0;
++    size_t workspace_bytes = 0;
++};
++
++inline bool fingerprint_valid(const std::string & value) {
++    if (value.size() != 64) { return false; }
++    for (char c : value) {
++        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return false; }
++    }
++    return true;
++}
++
++inline bool valid(const entry & e) {
++    return e.shape.type >= 0 && e.shape.type < GGML_TYPE_COUNT &&
++        e.shape.k >= 256 && e.shape.k <= 16384 && e.shape.k % 256 == 0 &&
++        e.shape.m >= 128 && e.shape.m <= 16384 && e.shape.m % 128 == 0 &&
++        e.shape.n >= 1 && e.shape.n <= 8 && e.pairs >= 3 && e.pairs <= 16 &&
++        (e.original == GGML_CUDA_TUNING_MMVQ || e.original == GGML_CUDA_TUNING_MMQ) &&
++        (e.selected == GGML_CUDA_TUNING_MMVQ || e.selected == GGML_CUDA_TUNING_MMQ) &&
++        e.original != e.selected && e.workspace_bytes > 0 && e.workspace_bytes <= size_t(256) * 1024 * 1024 && std::isfinite(e.minimum_speedup) &&
++        e.minimum_speedup >= required_speedup && e.minimum_speedup < 1000.0;
++}
++
++inline bool finite_bitwise_equal(const float * a, const float * b, size_t n) {
++    for (size_t i = 0; i < n; ++i) {
++        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) { return false; }
++    }
++    return std::memcmp(a, b, n * sizeof(float)) == 0;
++}
++
++inline bool has_finite_values(const float * values, size_t n) {
++    return std::all_of(values, values + n, [](float value) { return std::isfinite(value); });
++}
++
++// Every paired result must favor the same alternative by at least 5%. Averages
++// alone cannot approve a noisy winner. Reject nonfinite/zero event durations.
++inline bool repeatable_gain(const double * mmvq, const double * mmq, size_t count,
++                            ggml_cuda_tuning_kernel original, double & minimum_speedup) {
++    if (count < 3 || count > 16 ||
++        (original != GGML_CUDA_TUNING_MMVQ && original != GGML_CUDA_TUNING_MMQ)) { return false; }
++    minimum_speedup = std::numeric_limits<double>::infinity();
++    for (size_t i = 0; i < count; ++i) {
++        if (!std::isfinite(mmvq[i]) || !std::isfinite(mmq[i]) || mmvq[i] <= 0 || mmq[i] <= 0) { return false; }
++        const double speedup = original == GGML_CUDA_TUNING_MMVQ ? mmvq[i] / mmq[i] : mmq[i] / mmvq[i];
++        minimum_speedup = std::min(minimum_speedup, speedup);
++    }
++    return std::isfinite(minimum_speedup) && minimum_speedup >= required_speedup && minimum_speedup < 1000.0;
++}
++
++struct policy {
++    std::array<entry, max_entries> entries{};
++    size_t count = 0;
++    uint64_t hits = 0, misses = 0;
++
++    ggml_cuda_tuning_kernel lookup(const key & shape, ggml_cuda_tuning_kernel original, size_t available_workspace) {
++        const auto end = entries.begin() + count;
++        const auto found = std::lower_bound(entries.begin(), end, shape,
++            [](const entry & e, const key & k) { return e.shape < k; });
++        if (found != end && found->shape == shape && found->original == original && found->workspace_bytes <= available_workspace) {
++            ++hits;
++            return found->selected;
++        }
++        ++misses;
++        return GGML_CUDA_TUNING_DEFAULT;
++    }
++};
++
++// Strict bounded text format, v1. The producer certifies "bitwise finite";
++// loading never broadens that validation or accepts a tolerance field.
++inline bool parse(std::istream & in, const std::string & expected_fingerprint, policy & out) {
++    out = {};
++    if (!fingerprint_valid(expected_fingerprint)) { return false; }
++    std::string bytes;
++    std::array<char, 4096> chunk{};
++    while (in) {
++        in.read(chunk.data(), chunk.size());
++        if (size_t(in.gcount()) > max_file_bytes - bytes.size()) { return false; }
++        bytes.append(chunk.data(), size_t(in.gcount()));
++    }
++    if (in.bad()) { return false; }
++    std::istringstream source(bytes);
++    std::string magic, fingerprint, validation;
++    unsigned version;
++    if (!(source >> magic >> version >> fingerprint >> validation) || magic != "wildllama-cuda-policy" ||
++        version != 1 || fingerprint != expected_fingerprint || validation != "bitwise-finite") { return false; }
++    policy parsed;
++    while (source >> std::ws && !source.eof()) {
++        if (parsed.count == max_entries) { return false; }
++        entry e;
++        int original, selected;
++        if (!(source >> e.shape.type >> e.shape.k >> e.shape.m >> e.shape.n >>
++              original >> selected >> e.pairs >> e.minimum_speedup >> e.workspace_bytes)) { return false; }
++        e.original = ggml_cuda_tuning_kernel(original);
++        e.selected = ggml_cuda_tuning_kernel(selected);
++        if (!valid(e)) { return false; }
++        parsed.entries[parsed.count++] = e;
++    }
++    std::sort(parsed.entries.begin(), parsed.entries.begin() + parsed.count,
++        [](const entry & a, const entry & b) { return a.shape < b.shape; });
++    for (size_t i = 1; i < parsed.count; ++i) {
++        if (parsed.entries[i - 1].shape == parsed.entries[i].shape) { return false; }
++    }
++    out = parsed;
++    return true;
++}
++
++inline bool serialize(std::ostream & out, const std::string & fingerprint, const policy & value) {
++    if (!fingerprint_valid(fingerprint) || value.count > max_entries) { return false; }
++    out << "wildllama-cuda-policy 1 " << fingerprint << " bitwise-finite\n";
++    out << std::setprecision(17);
++    for (size_t i = 0; i < value.count; ++i) {
++        const auto & e = value.entries[i];
++        if (!valid(e)) { return false; }
++        out << e.shape.type << ' ' << e.shape.k << ' ' << e.shape.m << ' ' << e.shape.n << ' '
++            << int(e.original) << ' ' << int(e.selected) << ' ' << e.pairs << ' ' << e.minimum_speedup << ' ' << e.workspace_bytes << '\n';
++    }
++    return bool(out);
++}
++} // namespace wildllama_cuda_tuning

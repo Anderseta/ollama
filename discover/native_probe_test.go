@@ -1,11 +1,118 @@
 package discover
 
 import (
+	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 	"unsafe"
 
 	"github.com/ollama/ollama/ml"
 )
+
+func TestCUDAAllocationPropLayout(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit CUDA driver allocation ABI")
+	}
+	var prop cudaAllocationProp
+	if unsafe.Sizeof(prop) != 32 || unsafe.Offsetof(prop.LocationID) != 12 ||
+		unsafe.Offsetof(prop.Win32HandleMeta) != 16 || unsafe.Offsetof(prop.AllocationFlags) != 24 {
+		t.Fatalf("CUmemAllocationProp layout mismatch: size=%d metadata=%d flags=%d", unsafe.Sizeof(prop), unsafe.Offsetof(prop.Win32HandleMeta), unsafe.Offsetof(prop.AllocationFlags))
+	}
+}
+
+func TestCUDAProbeCapabilitiesOptionalAttributes(t *testing.T) {
+	attrs := map[int]int{16: 36, 10: 32, 8: 49152, 97: 101376, 36: 14000000, 37: 128, 102: 1}
+	got := cudaProbeCapabilities(func(attr int) (int, bool) { value, ok := attrs[attr]; return value, ok })
+	want := &ml.DeviceCapabilities{Multiprocessors: 36, WarpSize: 32, SharedMemoryPerBlock: 49152,
+		SharedMemoryPerBlockOptin: 101376, MemoryClockRateKHz: 14000000, MemoryBusWidthBits: 128,
+		VirtualMemoryKnown: true, VirtualMemoryManagement: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("capabilities = %+v, want %+v", got, want)
+	}
+	missing := cudaProbeCapabilities(func(int) (int, bool) { return 0, false })
+	if !reflect.DeepEqual(missing, &ml.DeviceCapabilities{}) {
+		t.Fatalf("unavailable driver attributes acquired capabilities: %+v", missing)
+	}
+	unsupported := cudaProbeCapabilities(func(attr int) (int, bool) {
+		if attr == 102 {
+			return 0, true
+		}
+		return -1, true
+	})
+	if !reflect.DeepEqual(unsupported, &ml.DeviceCapabilities{VirtualMemoryKnown: true}) {
+		t.Fatalf("unsupported VMM or negative attributes misreported: %+v", unsupported)
+	}
+}
+
+func TestCUDAUUIDString(t *testing.T) {
+	if got := cudaUUIDString([16]byte{}); got != "" {
+		t.Fatalf("zero UUID = %q, want unknown", got)
+	}
+	uuid := [16]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	if got := cudaUUIDString(uuid); got != "00010203-0405-0607-0809-0a0b0c0d0e0f" {
+		t.Fatalf("UUID bytes changed: %q", got)
+	}
+}
+
+func TestNativeCapabilitiesMergeAndPublicDevice(t *testing.T) {
+	capabilities := &ml.DeviceCapabilities{Multiprocessors: 36, WarpSize: 32, VirtualMemoryKnown: true,
+		VirtualMemoryManagement: true, VirtualMemoryGranularity: 65536}
+	base := []nativeProbeDevice{
+		{Library: "CUDA", Index: 0, IndexMatchesBackend: true, DeviceID: "0000:02:00.0"},
+		{Library: "CUDA", Index: 1, IndexMatchesBackend: true, DeviceID: "0000:01:00.0"},
+	}
+	// Supplement order differs. PCI identity, rather than physical ordinal,
+	// determines which backend-visible device receives the capabilities.
+	supplement := []nativeProbeDevice{{Library: "CUDA", Index: 0, DeviceID: "0000:01:00.0",
+		PhysicalUUID: "private-device-uuid", NVIDIADriverVersion: "621.01", NVIDIADriverMajor: 621,
+		CUDADriverMajor: 13, CUDADriverMinor: 1, ComputeMajor: 12, Capabilities: capabilities}}
+	devices := mergeNativeProbeDevices(base, supplement)
+	if devices[0].Capabilities != nil || !reflect.DeepEqual(devices[1].Capabilities, capabilities) {
+		t.Fatalf("capabilities attached to wrong filtered device: %+v", devices)
+	}
+	// Metadata must survive the isolated subprocess JSON transport.
+	data, err := json.Marshal(devices)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &devices); err != nil {
+		t.Fatal(err)
+	}
+	output := `system_info: n_threads = 4 | CUDA : ARCHS = 1200 |
+Available devices:
+  CUDA0: Example GPU (16000 MiB, 15000 MiB free)
+  CUDA1: Example GPU (16000 MiB, 15000 MiB free)
+`
+	public := parseLlamaServerDevicesWithNative(output, "", []string{"/lib/ollama", "/lib/ollama/cuda_v13"}, devices)
+	if len(public) != 2 || public[0].Capabilities != nil || !reflect.DeepEqual(public[1].Capabilities, capabilities) {
+		t.Fatalf("native capabilities lost or reassigned: %+v", public)
+	}
+	if public[1].PhysicalUUID != "private-device-uuid" || public[1].NVIDIADriverVersion != "621.01" || public[1].Driver() != "13.1" {
+		t.Fatalf("UUID/full driver metadata lost: %+v", public[1])
+	}
+	data, err = json.Marshal(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "private-device-uuid") {
+		t.Fatalf("internal UUID exposed to public API: %s", data)
+	}
+}
+
+func TestNativeProbeUUIDPreventsWrongMerge(t *testing.T) {
+	a := nativeProbeDevice{Library: "CUDA", Index: 0, IndexMatchesBackend: true, DeviceID: "0000:01:00.0", PhysicalUUID: "partition-a"}
+	b := a
+	b.PhysicalUUID = "partition-b"
+	if sameNativeProbeDevice(a, b) {
+		t.Fatal("different UUIDs were merged despite a shared PCI bus (for example MIG partitions)")
+	}
+	b = a
+	b.Index, b.DeviceID = 2, "0000:09:00.0"
+	if !sameNativeProbeDevice(a, b) {
+		t.Fatal("stable UUID identity was lost after visible ordinal/PCI reassignment")
+	}
+}
 
 func TestGGMLBackendDevPropsLayout(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {

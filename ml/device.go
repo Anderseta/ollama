@@ -46,6 +46,15 @@ type DeviceInfo struct {
 	// when discovered by multiple backends
 	PCIID string `json:"pci_id,omitempty"`
 
+	// PhysicalUUID is an optional driver-provided physical device identity. Keep
+	// hardware serial identities internal; public clients need capabilities, not
+	// a stable identifier that can track a user's machine.
+	PhysicalUUID string `json:"-"`
+
+	// Capabilities contains optional, measured driver properties. Missing data
+	// must not be interpreted as support or change the backend's default policy.
+	Capabilities *DeviceCapabilities `json:"capabilities,omitempty"`
+
 	// TotalMemory is the total amount of memory the device can use for loading models
 	TotalMemory uint64 `json:"total_memory"`
 
@@ -67,6 +76,11 @@ type DeviceInfo struct {
 	// NVIDIADriverMajor is the NVIDIA kernel driver branch. CUDA driver APIs
 	// expose a separate CUDA compatibility version, so keep this distinct.
 	NVIDIADriverMajor int `json:"-"`
+
+	// NVIDIADriverVersion is the full kernel driver version, distinct from the
+	// CUDA compatibility version in DriverMajor/Minor. Patch updates can change
+	// kernel performance and must invalidate future tuning observations.
+	NVIDIADriverVersion string `json:"nvidia_driver_version,omitempty"`
 
 	// GFXTarget is the AMD GPU gfx target string (e.g. "gfx1100") for ROCm
 	// device validation. Empty on non-AMD devices.

@@ -333,6 +333,9 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
 			Integrated:   isIntegratedLlamaServerDevice(library, deviceIndex, integratedByIndex),
 		}
 		if hasNativeDevice {
+			dev.PhysicalUUID = nativeDevice.PhysicalUUID
+			dev.Capabilities = nativeDevice.Capabilities
+			dev.NVIDIADriverVersion = nativeDevice.NVIDIADriverVersion
 			if nativeDevice.DeviceID != "" {
 				dev.PCIID = nativeDevice.DeviceID
 			}

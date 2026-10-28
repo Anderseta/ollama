@@ -577,14 +577,16 @@ type DebugInfo struct {
 type Metrics struct {
 	// GPUFirst contains optional native diagnostics. Shared counters can include
 	// concurrent requests; the payload reports its scope and lifetime peaks.
-	GPUFirst              json.RawMessage `json:"gpu_first,omitempty"`
-	TotalDuration         time.Duration   `json:"total_duration,omitempty"`
-	LoadDuration          time.Duration   `json:"load_duration,omitempty"`
-	PromptEvalCount       int             `json:"prompt_eval_count,omitempty"`
-	PromptEvalCachedCount *int            `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration   `json:"prompt_eval_duration,omitempty"`
-	EvalCount             int             `json:"eval_count,omitempty"`
-	EvalDuration          time.Duration   `json:"eval_duration,omitempty"`
+	GPUFirst                  json.RawMessage `json:"gpu_first,omitempty"`
+	SpeculativeDraftTokens    *int            `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int            `json:"speculative_accepted_tokens,omitempty"`
+	TotalDuration             time.Duration   `json:"total_duration,omitempty"`
+	LoadDuration              time.Duration   `json:"load_duration,omitempty"`
+	PromptEvalCount           int             `json:"prompt_eval_count,omitempty"`
+	PromptEvalCachedCount     *int            `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration        time.Duration   `json:"prompt_eval_duration,omitempty"`
+	EvalCount                 int             `json:"eval_count,omitempty"`
+	EvalDuration              time.Duration   `json:"eval_duration,omitempty"`
 }
 
 // Options specified in [GenerateRequest].  If you add a new option here, also

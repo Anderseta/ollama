@@ -171,6 +171,8 @@ func probeCUDADriverWindows() ([]nativeProbeDevice, error) {
 		return nil, err
 	}
 	cuDeviceGetPCIBusID, _ := findProc(cuda, "cuDeviceGetPCIBusId")
+	cuDeviceGetUUID, _ := procAny(cuda, "cuDeviceGetUuid_v2", "cuDeviceGetUuid")
+	cuMemGetAllocationGranularity, _ := findProc(cuda, "cuMemGetAllocationGranularity")
 
 	if ret, _, _ := cuInit.Call(0); ret != cuSuccessWindows {
 		return nil, fmt.Errorf("cuInit failed: %d", ret)
@@ -185,7 +187,8 @@ func probeCUDADriverWindows() ([]nativeProbeDevice, error) {
 	}
 
 	nvidiaDriverMajor := 0
-	if driver, err := probeNVIDIADriverMajorWindows(); err == nil {
+	nvidiaDriverVersion, _ := probeNVIDIADriverVersionWindows()
+	if driver, err := parseNVIDIADriverMajor(nvidiaDriverVersion); err == nil {
 		nvidiaDriverMajor = driver
 	}
 
@@ -204,6 +207,23 @@ func probeCUDADriverWindows() ([]nativeProbeDevice, error) {
 		major := cudaDeviceAttributeWindows(cuDeviceGetAttribute, cuDeviceAttributeComputeCapabilityMajorW, device)
 		minor := cudaDeviceAttributeWindows(cuDeviceGetAttribute, cuDeviceAttributeComputeCapabilityMinorW, device)
 		integrated := cudaDeviceAttributeWindows(cuDeviceGetAttribute, cuDeviceAttributeIntegratedW, device) == 1
+		capabilities := cudaProbeCapabilities(func(attr int) (int, bool) {
+			return cudaDeviceAttributeCheckedWindows(cuDeviceGetAttribute, attr, device)
+		})
+		if capabilities.VirtualMemoryManagement && cuMemGetAllocationGranularity != nil {
+			prop := cudaAllocationProp{Type: 1, LocationType: 1, LocationID: device}
+			var granularity uintptr
+			if ret, _, _ := cuMemGetAllocationGranularity.Call(uintptr(unsafe.Pointer(&granularity)), uintptr(unsafe.Pointer(&prop)), 0); ret == cuSuccessWindows {
+				capabilities.VirtualMemoryGranularity = uint64(granularity)
+			}
+		}
+		physicalUUID := ""
+		if cuDeviceGetUUID != nil {
+			var uuid [16]byte
+			if ret, _, _ := cuDeviceGetUUID.Call(uintptr(unsafe.Pointer(&uuid[0])), uintptr(device)); ret == cuSuccessWindows {
+				physicalUUID = cudaUUIDString(uuid)
+			}
+		}
 
 		name := make([]byte, 128)
 		cuDeviceGetName.Call(uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)), uintptr(device))
@@ -233,6 +253,9 @@ func probeCUDADriverWindows() ([]nativeProbeDevice, error) {
 			CUDADriverMajor:     driverMajor,
 			CUDADriverMinor:     driverMinor,
 			NVIDIADriverMajor:   nvidiaDriverMajor,
+			NVIDIADriverVersion: nvidiaDriverVersion,
+			PhysicalUUID:        physicalUUID,
+			Capabilities:        capabilities,
 		})
 	}
 
@@ -305,44 +328,49 @@ func probeHIPRuntimeWindows(libDirs []string) ([]nativeProbeDevice, error) {
 	return devices, nil
 }
 
-func probeNVIDIADriverMajorWindows() (int, error) {
+func probeNVIDIADriverVersionWindows() (string, error) {
 	nvml, err := loadDLLFromSystem32("nvml.dll")
 	if err != nil {
 		nvml, err = loadDLLFromDirs([]string{"nvml.dll"}, nvidiaNVMLDirsWindows())
 	}
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	initFn, err := findProc(nvml, "nvmlInit_v2")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	shutdownFn, err := findProc(nvml, "nvmlShutdown")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	driverFn, err := findProc(nvml, "nvmlSystemGetDriverVersion")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	if ret, _, _ := initFn.Call(); ret != 0 {
-		return 0, fmt.Errorf("nvmlInit_v2 failed: %d", ret)
+		return "", fmt.Errorf("nvmlInit_v2 failed: %d", ret)
 	}
 	defer shutdownFn.Call()
 
 	version := make([]byte, 80)
 	if ret, _, _ := driverFn.Call(uintptr(unsafe.Pointer(&version[0])), uintptr(len(version))); ret != 0 {
-		return 0, fmt.Errorf("nvmlSystemGetDriverVersion failed: %d", ret)
+		return "", fmt.Errorf("nvmlSystemGetDriverVersion failed: %d", ret)
 	}
-	return parseNVIDIADriverMajor(byteCString(version))
+	return strings.TrimSpace(byteCString(version)), nil
 }
 
 func cudaDeviceAttributeWindows(fn *windows.Proc, attr int, device int32) int {
+	value, _ := cudaDeviceAttributeCheckedWindows(fn, attr, device)
+	return value
+}
+
+func cudaDeviceAttributeCheckedWindows(fn *windows.Proc, attr int, device int32) (int, bool) {
 	var value int32
 	if ret, _, _ := fn.Call(uintptr(unsafe.Pointer(&value)), uintptr(attr), uintptr(device)); ret != cuSuccessWindows {
-		return 0
+		return 0, false
 	}
-	return int(value)
+	return int(value), true
 }
 
 func hipDeviceAttributeWindows(fn *windows.Proc, attr int, device int32) int {

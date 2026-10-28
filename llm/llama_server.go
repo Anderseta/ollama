@@ -188,9 +188,11 @@ type llamaServerRunner struct {
 
 	sem *semaphore.Weighted
 
-	launch                  llamaServerLaunchConfig
-	output                  *memoryParsingWriter
-	mmprojOffloadOOMRetried bool
+	launch                   llamaServerLaunchConfig
+	output                   *memoryParsingWriter
+	mmprojOffloadOOMRetried  bool
+	cudaModuleLoadingRetried bool
+	loadReady                bool
 }
 
 type llamaServerLaunchConfig struct {
@@ -495,7 +497,9 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		cmd.Stderr = out
 	}
 	cmd.SysProcAttr = LlamaServerSysProcAttr
-	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, launch.extraEnvsForStart())
+	childEnvs := cloneStringMap(launch.extraEnvsForStart())
+	setCUDATuningEnvironment(childEnvs, exe, launch.gpus, launch.gpuLibs)
+	SetupLlamaServerCommandEnv(cmd, exe, launch.gpuLibs, childEnvs)
 
 	slog.Info("starting llama-server", "cmd", cmd)
 	slog.Debug("subprocess", "", filteredEnv(cmd.Env))
@@ -1233,17 +1237,8 @@ func qwenVLServerArgs(modelArch string) []string {
 func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, _ bool) ([]ml.DeviceID, error) {
 	slog.Info("loading model via llama-server", "model", s.modelPath)
 
-	if err := s.WaitUntilRunning(ctx); err != nil {
-		retried, retryErr := s.retryWithMMProjCPUOffload(err)
-		if retryErr != nil {
-			return nil, retryErr
-		}
-		if !retried {
-			return nil, err
-		}
-		if err := s.WaitUntilRunning(ctx); err != nil {
-			return nil, fmt.Errorf("llama-server startup failed after projector CPU offload retry: %w", err)
-		}
+	if err := s.waitUntilRunningWithStartupRetries(ctx, s.WaitUntilRunning, s.startProcess); err != nil {
+		return nil, err
 	}
 	if err := s.removeSplitDirs(); err != nil {
 		slog.Debug("split GGUF alias cleanup deferred until runner shutdown", "error", err)
@@ -1327,8 +1322,27 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	for k := range s.systemFreeAtLoad {
 		delete(s.systemFreeAtLoad, k)
 	}
+	// stopProcess has reaped the failed child and its output goroutines before
+	// this reset. Neither a partial log line nor a previous managed-VRAM sample
+	// may become an observation of the replacement process.
+	if s.output != nil {
+		s.output.buffers = nil
+		s.output.tail = nil
+		s.output.discardingLine = false
+		s.output.kvCacheGroup = ""
+		s.output.hasContextBuffers = false
+		s.output.boundedExpertCache = 0
+	}
+	s.loadActivity.Store(0)
+	s.loadTracking.Store(false)
 	if s.status != nil {
 		s.status.SetLastError("")
+		s.status.activityMu.Lock()
+		s.status.activityTail = nil
+		s.status.activityDiscardingLine = false
+		s.status.activity = RuntimeActivity{}
+		s.status.activity.setPhase("starting", time.Now().UnixMilli())
+		s.status.activityMu.Unlock()
 	}
 }
 
@@ -1818,12 +1832,21 @@ func (e *llamaServerProgressEmitter) next(p *llamaServerPromptProgress) *api.Pro
 }
 
 type llamaServerTimings struct {
-	GPUFirst  json.RawMessage `json:"gpu_first,omitempty"`
-	CacheN    *int            `json:"cache_n"`
-	PromptN   int             `json:"prompt_n"`
-	PromptMS  float64         `json:"prompt_ms"`
-	PredictN  int             `json:"predicted_n"`
-	PredictMS float64         `json:"predicted_ms"`
+	DraftN         *int            `json:"draft_n"`
+	DraftNAccepted *int            `json:"draft_n_accepted"`
+	GPUFirst       json.RawMessage `json:"gpu_first,omitempty"`
+	CacheN         *int            `json:"cache_n"`
+	PromptN        int             `json:"prompt_n"`
+	PromptMS       float64         `json:"prompt_ms"`
+	PredictN       int             `json:"predicted_n"`
+	PredictMS      float64         `json:"predicted_ms"`
+}
+
+func (t llamaServerTimings) speculativeCounts() (*int, *int) {
+	if t.DraftN == nil || t.DraftNAccepted == nil || *t.DraftN < 0 || *t.DraftNAccepted < 0 || *t.DraftNAccepted > *t.DraftN {
+		return nil, nil
+	}
+	return activityValueCopy(t.DraftN), activityValueCopy(t.DraftNAccepted)
 }
 
 func (t llamaServerTimings) promptEvalCount() int {
@@ -1862,6 +1885,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		return err
 	}
 	defer s.sem.Release(1)
+	speculativeGeneration := s.status.beginSpeculativeGeneration()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
@@ -2072,6 +2096,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
 					GPUFirst:              lsResp.Timings.GPUFirst,
 				}
+				finalResp.SpeculativeDraftTokens, finalResp.SpeculativeAcceptedTokens = lsResp.Timings.speculativeCounts()
 				hasFinalResp = true
 			}
 		}
@@ -2099,6 +2124,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 			return fmt.Errorf("error closing llama-server response: %v", err)
 		}
 
+		s.status.observeSpeculativeGeneration(speculativeGeneration, finalResp.SpeculativeDraftTokens, finalResp.SpeculativeAcceptedTokens)
 		fn(finalResp)
 		return nil
 	}
@@ -2282,6 +2308,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return err
 	}
 	defer s.sem.Release(1)
+	speculativeGeneration := s.status.beginSpeculativeGeneration()
 
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
@@ -2415,6 +2442,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
 				resp.GPUFirst = lsResp.Timings.GPUFirst
+				resp.SpeculativeDraftTokens, resp.SpeculativeAcceptedTokens = lsResp.Timings.speculativeCounts()
 				completedCalls, err := accumulatedToolCalls(toolCalls, doneReason != DoneReasonLength)
 				if err != nil {
 					if doneReason != DoneReasonLength {
@@ -2458,6 +2486,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 			return fmt.Errorf("error closing llama-server chat response: %v", err)
 		}
 
+		s.status.observeSpeculativeGeneration(speculativeGeneration, finalResp.SpeculativeDraftTokens, finalResp.SpeculativeAcceptedTokens)
 		fn(finalResp)
 		return nil
 	}

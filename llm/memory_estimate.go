@@ -56,6 +56,10 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 	if context == 0 || layers == 0 || layers > 4096 {
 		return e
 	}
+	trunkLayers, mtpLayers, ok := estimateMemoryLayers(kv, layers, opts)
+	if !ok {
+		return e
+	}
 	initial, err := api.ResolveKVCacheInitialTokens(opts)
 	if err != nil {
 		return e
@@ -71,8 +75,12 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 	}
 	kindK, kindV := resolvedKVCacheTypes(opts)
 	var recurrent uint64
-	for layer := uint64(0); layer < layers; layer++ {
-		recr, ok := estimatedRecurrentLayer(kv, layer, layers)
+	for layer := uint64(0); layer < trunkLayers+mtpLayers; layer++ {
+		isMTP := layer >= trunkLayers
+		recr, ok := false, true
+		if !isMTP {
+			recr, ok = estimatedRecurrentLayer(kv, layer, layers)
+		}
 		if !ok {
 			return e
 		}
@@ -109,9 +117,23 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 			(!kv.Has("attention.value_length") && kv.EmbeddingLength()%heads != 0) {
 			return e
 		}
-		row := vramAdd(kvRowBytes(vramMul(kvHeads, keyDim), kindK), kvRowBytes(vramMul(kvHeads, valueDim), kindV))
+		layerK, layerV, committedContext := kindK, kindV, initialContext
+		if isMTP {
+			// A Qwen MTP head has its own full-attention cache. The draft's
+			// default is F16, and shared-other contexts do not use KV growth.
+			layerK = gpuNativeEnvironment(opts, "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K")
+			layerV = gpuNativeEnvironment(opts, "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V")
+			if layerK == "" {
+				layerK = "f16"
+			}
+			if layerV == "" {
+				layerV = "f16"
+			}
+			committedContext = context
+		}
+		row := vramAdd(kvRowBytes(vramMul(kvHeads, keyDim), strings.ToLower(layerK)), kvRowBytes(vramMul(kvHeads, valueDim), strings.ToLower(layerV)))
 		e.WorstCaseKV = vramAdd(e.WorstCaseKV, vramMul(row, context))
-		e.InitialKV = vramAdd(e.InitialKV, vramMul(row, initialContext))
+		e.InitialKV = vramAdd(e.InitialKV, vramMul(row, committedContext))
 	}
 	if recurrent > 0 {
 		var ok bool
@@ -130,6 +152,23 @@ func EstimateServerVRAM(modelPath string, f *gguf.Model, opts api.Options, paral
 	e.Auxiliary = max(uint64(256<<20), e.Weights/20)
 	e.Valid = vramAdd(e.Weights, e.KV, e.Recurrent, e.Auxiliary) != math.MaxUint64
 	return e
+}
+
+func estimateMemoryLayers(kv *gguf.Metadata, layers uint64, opts api.Options) (uint64, uint64, bool) {
+	switch kv.Architecture() {
+	case "qwen35", "qwen35moe", "qwen3next":
+		mtp := kv.Uint("nextn_predict_layers")
+		if mtp >= layers {
+			return 0, 0, false
+		}
+		trunk := layers - mtp
+		if opts.DraftNumPredict > 0 && (opts.SpeculativeType == "" || opts.SpeculativeType == "auto" || opts.SpeculativeType == "draft-mtp") {
+			return trunk, mtp, true
+		}
+		return trunk, 0, true
+	default:
+		return layers, 0, true
+	}
 }
 
 func resolvedKVCacheTypes(opts api.Options) (string, string) {
@@ -237,12 +276,22 @@ func estimateRecurrentBytes(kv *gguf.Metadata, layers, parallel uint64, opts api
 	rows := parallel
 	// Enabled target-model speculation can keep recurrent rollback rows. The
 	// native implementation decides the exact span; reserve the requested bound.
-	if opts.DraftNumPredict > 0 && opts.SpeculativeType != "none" &&
-		((opts.SpeculativeType != "" && opts.SpeculativeType != "auto") || hasMTPDraftMetadata(kv)) {
+	if opts.DraftNumPredict > 0 && needsRecurrentRollback(kv, opts.SpeculativeType) {
 		rows = vramMul(rows, vramAdd(1, uint64(opts.DraftNumPredict)))
 	}
 	bytes := vramMul(vramAdd(r, s), 4, rows, layers)
 	return bytes, bytes != math.MaxUint64
+}
+
+func needsRecurrentRollback(kv *gguf.Metadata, kind string) bool {
+	switch kind {
+	case "", "auto":
+		return hasMTPDraftMetadata(kv)
+	case "draft-mtp", "draft-eagle3", "draft-dflash", "draft-dspark":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasMTPDraftMetadata(kv *gguf.Metadata) bool { return kv.Uint("nextn_predict_layers") > 0 }

@@ -1,0 +1,749 @@
+diff --git a/common/state-transaction.h b/common/state-transaction.h
+new file mode 100644
+--- /dev/null
++++ b/common/state-transaction.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++// The serialized state and its drafter state are one transaction. A failed
++// capture must never replace a valid entry with a partially populated one.
++struct common_state_data {
++    std::vector<uint8_t> main;
++    std::vector<uint8_t> drft;
++    std::vector<uint8_t> spec;
++
++    size_t size() const { return main.size() + drft.size() + spec.size(); }
++};
++
++template <typename Main, typename Draft, typename Spec>
++bool common_state_capture(common_state_data & data, size_t main_size, size_t draft_size,
++                          Main capture_main, Draft capture_draft, Spec capture_spec) {
++    if (!main_size) { return false; }
++    try {
++        common_state_data pending;
++        pending.main.resize(main_size);
++        pending.drft.resize(draft_size);
++        if (capture_main(pending.main.data(), main_size) != main_size ||
++            (draft_size && capture_draft(pending.drft.data(), draft_size) != draft_size)) {
++            return false;
++        }
++        capture_spec(pending.spec);
++        data = std::move(pending);
++        return true;
++    } catch (...) {
++        return false;
++    }
++}
++
++template <typename Main, typename Draft, typename Spec, typename Clear>
++bool common_state_restore(const common_state_data & data, Main restore_main,
++                          Draft restore_draft, Spec restore_spec, Clear clear) {
++    try {
++        if (!data.main.empty() && restore_main(data.main.data(), data.main.size()) == data.main.size() &&
++            (data.drft.empty() || restore_draft(data.drft.data(), data.drft.size()) == data.drft.size())) {
++            restore_spec(data.spec);
++            return true;
++        }
++    } catch (...) {
++        // A backend can fail after committing only some of its destinations.
++    }
++    clear();
++    return false;
++}
+diff --git a/ggml/include/ggml-cuda-kv-growth.h b/ggml/include/ggml-cuda-kv-growth.h
+--- a/ggml/include/ggml-cuda-kv-growth.h
++++ b/ggml/include/ggml-cuda-kv-growth.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "ggml-backend.h"
++#include "ggml-kv-trim.h"
+ #include <stdint.h>
+ 
+ // Optional CUDA VMM storage. Logical buffer size/address stay fixed; only mapped
+@@ -14,3 +15,7 @@
+     // is already zero). False for conventional storage or nonzero lazy fill.
+     bool (*clear_existing)(ggml_backend_buffer_t, size_t, size_t);
+ };
++
++// Optional separate proc address preserves the version-1 growth API ABI.
++// Caller must fence all users of this buffer first, and discard all KV cells.
++using ggml_backend_cuda_kv_trim_t = bool (*)(ggml_backend_buffer_t, const ggml_kv_trim_range *, size_t);
+diff --git a/ggml/include/ggml-kv-trim.h b/ggml/include/ggml-kv-trim.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/include/ggml-kv-trim.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <cstddef>
++
++// Offsets within one virtually reserved buffer. All arithmetic is validated
++// before CUDA is allowed to unmap any physical mapping.
++struct ggml_kv_trim_range {
++    size_t offset;
++    size_t size;
++};
++
++inline bool ggml_kv_trim_ranges_valid(size_t capacity, const ggml_kv_trim_range * ranges, size_t count) {
++    if (count && !ranges) { return false; }
++    for (size_t i = 0; i < count; ++i) {
++        if (ranges[i].offset > capacity || ranges[i].size > capacity - ranges[i].offset) { return false; }
++    }
++    return true;
++}
++
++// CUDA cannot unmap part of a cuMemMap allocation. Keep the whole mapping
++// if even one byte intersects a protected initial-prefix/padding range.
++inline bool ggml_kv_trim_keep(size_t offset, size_t size, const ggml_kv_trim_range * ranges, size_t count) {
++    for (size_t i = 0; i < count; ++i) {
++        if (ranges[i].size && offset < ranges[i].offset + ranges[i].size && ranges[i].offset < offset + size) {
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1250,6 +1250,13 @@
+     return ctx->kv_vmm && ctx->kv_vmm->clear_existing(offset,size);
+ }
+ 
++static bool ggml_cuda_kv_trim_empty(ggml_backend_buffer_t buffer, const ggml_kv_trim_range * keep, size_t count) {
++    if (!buffer || !ggml_backend_buffer_is_cuda(buffer) || !ggml_kv_trim_ranges_valid(buffer->size, keep, count)) { return false; }
++    auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
++    // Explicit context-level consumer already fenced all uses of this buffer.
++    return ctx->kv_vmm && ctx->kv_vmm->trim(keep, count);
++}
++
+ static const ggml_backend_cuda_kv_growth_api ggml_cuda_kv_growth_api = {
+     1,ggml_cuda_kv_granularity,ggml_cuda_kv_reserve,ggml_cuda_kv_commit,ggml_cuda_kv_committed,ggml_cuda_kv_clear_existing
+ };
+@@ -7227,6 +7234,9 @@
+     if (strcmp(name, "ggml_backend_cuda_kv_growth_api") == 0) {
+         return const_cast<ggml_backend_cuda_kv_growth_api *>(&ggml_cuda_kv_growth_api);
+     }
++    if (strcmp(name, "ggml_backend_cuda_kv_trim_empty") == 0) {
++        return (void *) ggml_cuda_kv_trim_empty;
++    }
+     if (strcmp(name, "ggml_backend_cuda_set_memory_limit") == 0) {
+         return (void *)ggml_backend_cuda_set_memory_limit;
+     }
+diff --git a/ggml/src/ggml-cuda/kv-growth.cuh b/ggml/src/ggml-cuda/kv-growth.cuh
+--- a/ggml/src/ggml-cuda/kv-growth.cuh
++++ b/ggml/src/ggml-cuda/kv-growth.cuh
+@@ -98,6 +98,28 @@
+         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+         return true;
+     }
++    bool trim(const ggml_kv_trim_range * keep, size_t count) {
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (!ggml_kv_trim_ranges_valid(capacity, keep, count)) { return false; }
++        std::lock_guard<std::mutex> lock(mutex);
++        if (fill != 0) { return false; }
++        ggml_cuda_set_device(device);
++        for (size_t i = 0; i < mappings.size();) {
++            const auto m = mappings[i];
++            if (ggml_kv_trim_keep(m.offset, m.size, keep, count)) { ++i; continue; }
++            // A failed unmap retains its mapping/accounting. Earlier successful
++            // removals remain valid even if a later driver call fails.
++            if (cuMemUnmap(address + m.offset, m.size) != CUDA_SUCCESS) { return false; }
++            std::fill(pages.begin() + m.offset/granularity,
++                      pages.begin() + (m.offset + m.size)/granularity, uint8_t(0));
++            ggml_cuda_memory_release_vmm(ggml_cuda_get_physical_device(device), m.tracked ? m.size : 0, m.tracked ? 0 : 1);
++            mappings.erase(mappings.begin() + i);
++        }
++        return true;
++#else
++        GGML_UNUSED(keep); GGML_UNUSED(count); return false;
++#endif
++    }
+     size_t committed() {
+         std::lock_guard<std::mutex> lock(mutex);
+         size_t bytes=0; for (const auto & m : mappings) { bytes+=m.size; } return bytes;
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -804,6 +804,11 @@
+ 
+     // Clear the memory contents
+     // If data == true, the data buffers will also be cleared together with the metadata
++    // Opt-in WILDLLAMA_KV_CACHE_TRIM_EMPTY=1. Synchronizes the context and
++    // reclaims CUDA VMM mappings only when every sequence is empty. Returns
++    // physically released bytes; logical context and tensor addresses are unchanged.
++    LLAMA_API size_t llama_memory_trim_empty(struct llama_context * ctx);
++
+     LLAMA_API void llama_memory_clear(
+             llama_memory_t mem,
+                       bool data);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4769,6 +4769,19 @@
+ // memory
+ //
+ 
++size_t llama_memory_trim_empty(llama_context * ctx) {
++    const char * enabled = std::getenv("WILDLLAMA_KV_CACHE_TRIM_EMPTY");
++    if (!ctx || !enabled || std::strcmp(enabled, "1") != 0) { return 0; }
++    try {
++        ctx->synchronize();
++        auto * memory = ctx->get_memory();
++        return memory ? memory->trim_empty() : 0;
++    } catch (const std::exception & err) {
++        LLAMA_LOG_WARN("KV trim: reclamation skipped or incomplete: %s\n", err.what());
++        return 0;
++    }
++}
++
+ void llama_memory_clear(llama_memory_t mem, bool data) {
+     if (!mem) {
+         return;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -425,6 +425,42 @@
+     }
+ }
+ 
++size_t llama_kv_cache::trim_empty() {
++    if (!growth_initial_tokens || other) { return 0; }
++    for (const auto & cells : v_cells) { if (cells.get_used()) { return 0; } }
++    // Lower the commitment watermark before any mapping is released, including
++    // partial failure or allocation exceptions while staging another buffer.
++    growth_committed_tokens = growth_initial_tokens;
++    size_t released = 0;
++    for (auto & entry : ctxs_bufs) {
++        auto & ctx = entry.first;
++        auto & buf = entry.second;
++        const auto * api = llama_kv_growth_api(ggml_backend_buffer_get_type(buf.get()));
++        if (!api) { continue; }
++        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf.get()));
++        auto trim = reinterpret_cast<ggml_backend_cuda_kv_trim_t>(ggml_backend_reg_get_proc_address(
++                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_trim_empty"));
++        if (!trim) { continue; }
++        auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf.get()));
++        std::vector<ggml_kv_trim_range> keep;
++        for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
++            if (tensor->view_src) { continue; }
++            const size_t offset = static_cast<uint8_t *>(tensor->data) - base;
++            keep.push_back({offset, tensor->nb[1]*growth_initial_tokens});
++            const size_t actual = ggml_nbytes(tensor);
++            const size_t allocated = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(buf.get()), tensor);
++            if (allocated > actual) { keep.push_back({offset + actual, allocated - actual}); }
++        }
++        const size_t before = api->committed(buf.get());
++        if (!trim(buf.get(), keep.data(), keep.size())) {
++            LLAMA_LOG_WARN("KV trim: physical reclamation incomplete; retained mappings remain charged\n");
++        }
++        const size_t after = api->committed(buf.get());
++        if (before != SIZE_MAX && after < before) { released += before - after; }
++    }
++    return released;
++}
++
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -134,6 +134,7 @@
+     bool get_can_shift() const override;
+ 
+     void clear(bool data) override;
++    size_t trim_empty() override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -140,6 +140,12 @@
+     mem_recr->clear(data);
+ }
+ 
++size_t llama_memory_hybrid::trim_empty() {
++    if (mem_recr->used) { return 0; }
++    for (const auto & cell : mem_recr->cells) { if (!cell.is_empty()) { return 0; } }
++    return mem_attn->trim_empty();
++}
++
+ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // Try removing from the recurrent cache first since it may fail. If it does
+     // fail, the cache will not have been mutated.
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -59,6 +59,7 @@
+     bool get_can_shift() const override;
+ 
+     void clear(bool data) override;
++    size_t trim_empty() override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -108,6 +108,10 @@
+     // if data == true, the data buffers will also be cleared together with the metadata
+     virtual void clear(bool data) = 0;
+ 
++    // Optional physical reclamation. Caller must synchronize the context first.
++    // Unsupported layouts/backends retain their storage; logical capacity stays fixed.
++    virtual size_t trim_empty() { return 0; }
++
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -445,3 +445,10 @@
+     add_dependencies(test-scheduler-exceptions ggml-cpu)
+     target_compile_definitions(test-scheduler-exceptions PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+ endif()
++
++# Header-only CPU regressions: no model, native library or GPU is required.
++foreach(test_name IN ITEMS test-kv-trim-ranges test-prompt-state-transaction)
++    add_executable(${test_name} ${test_name}.cpp)
++    target_compile_features(${test_name} PRIVATE cxx_std_17)
++    llama_test(${test_name} LABEL "main behavior")
++endforeach()
+diff --git a/tests/test-cuda-kv-growth.cpp b/tests/test-cuda-kv-growth.cpp
+--- a/tests/test-cuda-kv-growth.cpp
++++ b/tests/test-cuda-kv-growth.cpp
+@@ -34,6 +34,9 @@
+                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_growth_api"));
+         require(api && api->version == 1 && api->granularity && api->reserve && api->commit && api->committed && api->clear_existing,
+                 "CUDA KV growth API unavailable");
++        auto trim = reinterpret_cast<ggml_backend_cuda_kv_trim_t>(
++                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_kv_trim_empty"));
++        require(trim != nullptr, "CUDA empty-cache trim API unavailable");
+         constexpr size_t mib = 1024*1024;
+         const size_t page = api->granularity(buft);
+         if (!page || page > 4*mib) {
+@@ -200,6 +203,25 @@
+         require(api->committed(buffer.get()) == 8*page && stats().managed_used_bytes == baseline + 8*page &&
+                 stats().managed_used_bytes <= 32*mib, "physical growth escaped quota accounting");
+         require(ggml_backend_buffer_get_base(buffer.get()) == address, "clear/growth changed the logical address");
++        // Every copy above is synchronous. Retain one mapped prefix and
++        // reclaim whole unused mappings without moving the reserved address.
++        const ggml_kv_trim_range keep[] = {{page + 13, 1}};
++        const ggml_kv_trim_range invalid[] = {{logical, 1}};
++        const auto before_trim = stats();
++        require(!trim(buffer.get(), invalid, 1) && api->committed(buffer.get()) == 8*page,
++                "invalid trim modified storage");
++        require(trim(buffer.get(), keep, 1), "whole-mapping trim failed");
++        const size_t retained = api->committed(buffer.get());
++        require(retained == page && stats().managed_used_bytes == baseline + retained &&
++                before_trim.managed_used_bytes - stats().managed_used_bytes == 7*page,
++                "trim did not release physical mappings/quota exactly");
++        require(trim(buffer.get(), keep, 1) && api->committed(buffer.get()) == retained,
++                "trim was not idempotent");
++        require(ggml_backend_buffer_get_base(buffer.get()) == address && ggml_backend_buffer_get_size(buffer.get()) == logical,
++                "trim changed logical address or capacity");
++        expect_fill(flat, 12*page + 33, 257, 0);
++        require(api->committed(buffer.get()) == 2*page && stats().managed_used_bytes == baseline + 2*page,
++                "regrowth after trim did not recommit zero-filled storage within quota");
+         buffer.reset();
+         require(stats().managed_used_bytes == baseline, "free did not unmap pages and return managed usage to baseline");
+         std::printf("PASS: CUDA KV VAS reservation, 16/32 MiB quotas, sparse growth, preserved bytes, views/2D, padding, future clears and cleanup (page=%zu)\n", page);
+diff --git a/tests/test-kv-growth.cpp b/tests/test-kv-growth.cpp
+--- a/tests/test-kv-growth.cpp
++++ b/tests/test-kv-growth.cpp
+@@ -309,6 +309,21 @@
+     batch_owner batch;
+     const auto actual = continuation(session.second.get(), batch, vocab, snapshot_tokens);
+     require_identical(expected, actual, "recovered quota-denied restore changed continuation logits bitwise");
++    // The explicit context-level trim fences its scheduler. Live KV and
++    // rollback states may never be reclaimed; fully cleared KV may shrink.
++    environment_guard trim_enabled("WILDLLAMA_KV_CACHE_TRIM_EMPTY", "1");
++    require(llama_memory_trim_empty(session.second.get()) == 0, "trim released live sequence memory");
++    llama_memory_clear(llama_get_memory(session.second.get()), true);
++    const auto trim_before = stats();
++    const size_t released = llama_memory_trim_empty(session.second.get());
++    require(released > 0 && trim_before.managed_used_bytes - stats().managed_used_bytes == released,
++            "empty-cache trim did not return exact physical quota");
++    require(llama_memory_trim_empty(session.second.get()) == 0 && llama_n_ctx(session.second.get()) == context,
++            "repeated trim changed physical usage or logical context");
++    require(llama_state_set_data(session.second.get(), snapshot.data(), snapshot.size()) == snapshot.size(),
++            "restore did not recommit KV after physical trim");
++    require_identical(expected, continuation(session.second.get(), batch, vocab, snapshot_tokens),
++            "trim/regrowth changed continuation logits bitwise");
+     std::printf("PASS KV quota_restore quota_mib=%llu context=%u snapshot_tokens=%u initial_tokens=256 continuation=bitwise denied_allocations=%llu\n",
+             (unsigned long long) quota_mib, context, snapshot_tokens, (unsigned long long) stats().denied_allocations);
+ }
+diff --git a/tests/test-kv-trim-ranges.cpp b/tests/test-kv-trim-ranges.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-kv-trim-ranges.cpp
+@@ -0,0 +1,44 @@
++#include "../ggml/include/ggml-kv-trim.h"
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        constexpr size_t page = 2*1024*1024, capacity = 64*page;
++        // A mapping can cover several CUDA pages. Neither a prefix boundary
++        // nor a tiny quantized padding tail may cause a partial unmap.
++        const ggml_kv_trim_range keep[] = {{13, page/2}, {20*page + 17, 129}};
++        require(ggml_kv_trim_ranges_valid(capacity, keep, 2), "valid keep ranges rejected");
++        require(ggml_kv_trim_keep(0, 3*page, keep, 2), "mapping crossing initial prefix was released");
++        require(ggml_kv_trim_keep(19*page, 3*page, keep, 2), "mapping crossing padding tail was released");
++        require(!ggml_kv_trim_keep(3*page, 16*page, keep, 2), "unused middle mapping retained");
++        require(!ggml_kv_trim_keep(22*page, page, keep, 2), "unused high mapping retained");
++        const ggml_kv_trim_range adjacent[] = {{page, page}};
++        require(!ggml_kv_trim_keep(0, page, adjacent, 1) && !ggml_kv_trim_keep(2*page, page, adjacent, 1), "adjacent ranges treated as overlapping");
++        const ggml_kv_trim_range empty[] = {{page + 1, 0}};
++        require(!ggml_kv_trim_keep(page, page, empty, 1), "zero-byte range retained mapping");
++        const ggml_kv_trim_range overflow[] = {{std::numeric_limits<size_t>::max() - 1, 9}};
++        require(!ggml_kv_trim_ranges_valid(capacity, overflow, 1), "overflowing range accepted");
++        require(!ggml_kv_trim_ranges_valid(capacity, nullptr, 1), "null nonempty keep list accepted");
++        require(ggml_kv_trim_ranges_valid(capacity, nullptr, 0), "empty keep list rejected");
++        std::vector<ggml_kv_trim_range> mappings = {{0, 3*page}, {3*page, 16*page}, {19*page, 3*page}, {22*page, page}};
++        auto trim = [&] {
++            size_t released = 0;
++            for (auto it = mappings.begin(); it != mappings.end();) {
++                if (ggml_kv_trim_keep(it->offset, it->size, keep, 2)) { ++it; }
++                else { released += it->size; it = mappings.erase(it); }
++            }
++            return released;
++        };
++        require(trim() == 17*page && mappings.size() == 2, "whole-mapping reclamation plan incorrect");
++        require(trim() == 0 && mappings.size() == 2, "trim was not idempotent");
++        std::puts("PASS: whole mappings, prefix/padding boundaries, overflow validation and idempotence");
++        return 0;
++    } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
++}
+diff --git a/tests/test-prompt-state-transaction.cpp b/tests/test-prompt-state-transaction.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-prompt-state-transaction.cpp
+@@ -0,0 +1,43 @@
++#include "../common/state-transaction.h"
++#include <algorithm>
++#include <cstdio>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        common_state_data entry{{1,2,3,4}, {5,6}, {7}};
++        const auto saved = entry;
++        auto main = [](uint8_t * dst, size_t size) { std::fill(dst, dst + size, 11); return size; };
++        auto draft_fail = [](uint8_t * dst, size_t size) { std::fill(dst, dst + size, 12); return size - 1; };
++        auto spec = [](std::vector<uint8_t> & dst) { dst = {13,14}; };
++        require(!common_state_capture(entry, 4, 2, main, draft_fail, spec), "short draft capture accepted");
++        require(entry.main == saved.main && entry.drft == saved.drft && entry.spec == saved.spec, "failed capture replaced valid entry");
++        require(!common_state_capture(entry, 4, 0, main, draft_fail, [](auto &) { throw std::runtime_error("spec failure"); }), "spec capture failure accepted");
++        require(entry.main == saved.main && entry.drft == saved.drft && entry.spec == saved.spec, "throwing capture damaged valid entry");
++        auto draft = [](uint8_t * dst, size_t size) { std::fill(dst, dst + size, 12); return size; };
++        require(common_state_capture(entry, 4, 2, main, draft, spec), "valid capture failed");
++        require(entry.main == std::vector<uint8_t>(4,11) && entry.drft == std::vector<uint8_t>(2,12) && entry.spec == std::vector<uint8_t>({13,14}), "capture did not commit all three states");
++        common_state_data live;
++        size_t clears = 0, spec_restores = 0;
++        auto restore_main = [&](const uint8_t * src, size_t n) { live.main.assign(src, src+n); return n; };
++        auto restore_draft = [&](const uint8_t * src, size_t n) { live.drft.assign(src, src+n); return n; };
++        auto restore_spec = [&](const auto & data) { live.spec = data; ++spec_restores; };
++        auto clear = [&] { live = {}; ++clears; };
++        require(!common_state_restore(entry, restore_main, [&](const uint8_t * src, size_t n) { live.drft.assign(src, src+n); return n-1; }, restore_spec, clear), "partial restore accepted");
++        require(live.size() == 0 && clears == 1 && spec_restores == 0, "draft failure left target state live or restored spec early");
++        require(entry.size() == 8, "restore failure consumed valid cache");
++        require(!common_state_restore(entry, restore_main, restore_draft, [](const auto &) { throw std::runtime_error("spec restore failure"); }, clear), "spec restore exception accepted");
++        require(live.size() == 0 && clears == 2, "spec failure did not clear both contexts");
++        for (int i = 0; i < 3; ++i) {
++            require(common_state_restore(entry, restore_main, restore_draft, restore_spec, clear), "valid retry/replay failed");
++            require(live.main == entry.main && live.drft == entry.drft && live.spec == entry.spec, "replay changed state bytes");
++        }
++        require(clears == 2 && spec_restores == 3, "successful replay incorrectly cleared state");
++        std::puts("PASS: capture atomicity, target/draft/spec failure cleanup, preserved entry, retries and byte-identical replay");
++        return 0;
++    } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -346,30 +346,25 @@
+         if (prompt.tokens.size() == 0) {
+             return false;
+         }
+-
+-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+-
+-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+-
+-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+-
+-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+-        if (cur == nullptr) {
++        const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
++        if (!size_tgt || (ctx_dft && !size_dft)) {
+             return false;
+         }
+-
+-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        if (ctx_dft) {
+-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+-        }
+-
+-        return true;
++        if (!prompt_cache.can_save(prompt, size_tgt + size_dft)) { return false; }
++        server_prompt_data pending;
++        if (!common_state_capture(pending, size_tgt, size_dft,
++                [&](uint8_t * dst, size_t size) { return llama_state_seq_get_data_ext(ctx_tgt, dst, size, id, LLAMA_STATE_SEQ_FLAGS_NONE); },
++                [&](uint8_t * dst, size_t size) { return llama_state_seq_get_data_ext(ctx_dft, dst, size, id, LLAMA_STATE_SEQ_FLAGS_NONE); },
++                [&](std::vector<uint8_t> & state) { common_speculative_get_state(spec, id, state); })) {
++            SLT_WRN(*this, "%s", "failed to capture prompt state; existing cache retained\n");
++            return false;
++        }
++        return prompt_cache.alloc(prompt, std::move(pending)) != nullptr;
+     }
+ 
+     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec);
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+         }
+@@ -383,6 +378,10 @@
+         mem.seq_rm(id, -1, -1);
+ 
+         prompt.clear();
++        // No trim is performed inside seq_rm: speculative rollback and restore
++        // use it too. This explicit dropped-prompt path is synchronized/opt-in.
++        llama_memory_trim_empty(ctx_tgt);
++        if (ctx_dft) { llama_memory_trim_empty(ctx_dft); }
+     }
+ 
+     std::vector<common_adapter_lora_info> lora;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1744,29 +1744,31 @@
+     return res;
+ }
+ 
+-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+-    // first check if the current state is contained fully in the cache
+-    for (auto it = states.begin(); it != states.end(); ++it) {
+-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+-
+-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+-            return nullptr;
+-        }
+-    }
+-
+-    // calculate checkpoints size to see if it will fit with the prompt
+-    size_t checkpoints_size = 0;
++bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size) const {
++    for (const auto & state : states) {
++        if (state.prompt.tokens.get_common_prefix(prompt.tokens) == (int) prompt.tokens.size()) {
++            return false;
++        }
++    }
++    if (limit_size > 0 && state_size > limit_size) { return false; }
+     for (const auto & ckpt : prompt.checkpoints) {
+-        checkpoints_size += ckpt.size();
+-    }
+-
+-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+-
+-    // skip over-limit entries to avoid disturbing the cache
+-    if (limit_size > 0 && state_size_new > limit_size) {
+-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
++        if (ckpt.size() > SIZE_MAX - state_size) { return false; }
++        state_size += ckpt.size();
++        if (limit_size > 0 && state_size > limit_size) { return false; }
++    }
++    return true;
++}
++
++server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, server_prompt_data data) {
++    if (data.main.empty() || !can_save(prompt, data.size())) { return nullptr; }
++    size_t state_size_new = data.size();
++    for (const auto & ckpt : prompt.checkpoints) { state_size_new += ckpt.size(); }
++
++    std::list<server_prompt_cache_state> pending;
++    try {
++        pending.push_back({ prompt.clone(), std::move(data) });
++    } catch (const std::bad_alloc & e) {
++        SRV_WRN("failed to stage prompt cache entry; existing cache retained: %s\n", e.what());
+         return nullptr;
+     }
+ 
+@@ -1784,7 +1786,7 @@
+     }
+ 
+     if (limit_size > 0) {
+-        // make room before allocating the new vectors to avoid breaching the limit
++        // Publish only after capture succeeds. Evict now so resident entries stay within the configured limit.
+         while (!states.empty() && size() + state_size_new > limit_size) {
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+@@ -1793,36 +1795,9 @@
+         }
+     }
+ 
+-    std::vector<uint8_t> state_data_tgt;
+-    std::vector<uint8_t> state_data_dft;
+-
+-    // check if we can allocate enough memory for the new state
+-    try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
+-    } catch (const std::bad_alloc & e) {
+-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+-
+-        limit_size = std::max<size_t>(1, 0.4*size());
+-
+-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+-
+-        update();
+-
+-        return nullptr;
+-    }
+-
+-    states.push_back({
+-        /*.prompt =*/ {
+-            /*.tokens      =*/ prompt.tokens.clone(),
+-            /*.checkpoints =*/ prompt.checkpoints,
+-        },
+-        /*.data   =*/ {
+-            /*.main =*/ std::move(state_data_tgt),
+-            /*.drft =*/ std::move(state_data_dft),
+-        },
+-    });
+-
++    // Splice is noexcept: only a complete entry becomes visible, after all
++    // allocations and the target/draft/spec capture have succeeded.
++    states.splice(states.end(), pending);
+     return &states.back();
+ }
+ 
+@@ -1892,40 +1867,24 @@
+     return it_best;
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
+     auto it_best = find_best(prompt, tokens_new);
+     if (it_best != states.end()) {
+         const size_t restore_bytes = it_best->data.size();
+         const int64_t restore_start = ggml_time_us();
+ 
+-        {
+-            auto & data = it_best->data.main;
+-
+-            const size_t size = data.size();
+-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+-            if (n != size) {
+-                SRV_ERR("failed to restore state with size %zu\n", size);
+-
+-                return false;
+-            }
+-
+-        }
+-
+-        {
+-            auto & data = it_best->data.drft;
+-
+-            if (!data.empty()) {
+-                GGML_ASSERT(ctx_dft);
+-
+-                const size_t size = data.size();
+-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+-                if (n != size) {
+-                    SRV_WRN("failed to restore state with size %zu\n", size);
+-
+-                    return false;
+-                }
+-
+-            }
++        const bool restored = common_state_restore(it_best->data,
++                [&](const uint8_t * src, size_t size) { return llama_state_seq_set_data_ext(ctx_tgt, src, size, id_slot, 0); },
++                [&](const uint8_t * src, size_t size) { return ctx_dft ? llama_state_seq_set_data_ext(ctx_dft, src, size, id_slot, 0) : 0; },
++                [&](const std::vector<uint8_t> & state) { common_speculative_set_state(spec, id_slot, state); },
++                [&] {
++                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
++                    if (ctx_dft) { llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1); }
++                    common_speculative_set_state(spec, id_slot, {});
++                });
++        if (!restored) {
++            SRV_WRN("%s", "failed to restore complete prompt state; target and draft cleared, cache retained\n");
++            return false;
+         }
+ 
+         prompt = std::move(it_best->prompt);
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -2,6 +2,7 @@
+ 
+ #include "common.h"
+ #include "llama.h"
++#include "state-transaction.h"
+ 
+ #include <string>
+ #include <unordered_set>
+@@ -12,6 +13,8 @@
+ #include "server-common.h"
+ #include "mtmd-helper.h"
+ 
++
++struct common_speculative;
+ 
+ enum server_task_type {
+     SERVER_TASK_TYPE_COMPLETION,
+@@ -671,14 +674,7 @@
+     }
+ };
+ 
+-struct server_prompt_data {
+-    std::vector<uint8_t> main;
+-    std::vector<uint8_t> drft;
+-
+-    size_t size() const {
+-        return main.size() + drft.size();
+-    }
+-};
++using server_prompt_data = common_state_data;
+ 
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+@@ -719,9 +715,11 @@
+     void observe_prompt(uint64_t tokens, double duration_us);
+     std::list<server_prompt_cache_state>::iterator find_best(const server_prompt & prompt, const server_tokens & tokens);
+ 
+-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+-
+-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
++    bool can_save(const server_prompt & prompt, size_t state_size) const;
++
++    server_prompt_cache_state * alloc(const server_prompt & prompt, server_prompt_data data);
++
++    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec);
+ 
+     void update();
+ };

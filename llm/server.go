@@ -249,18 +249,20 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	PromptProgress        *api.PromptProgress `json:"prompt_progress,omitempty"`
-	GPUFirst              json.RawMessage     `json:"gpu_first,omitempty"`
-	Message               api.Message         `json:"message"`
-	DoneReason            DoneReason          `json:"done_reason"`
-	ToolCallsTruncated    bool                `json:"tool_calls_truncated,omitempty"`
-	Done                  bool                `json:"done"`
-	PromptEvalCount       int                 `json:"prompt_eval_count"`
-	PromptEvalCachedCount *int                `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration       `json:"prompt_eval_duration"`
-	EvalCount             int                 `json:"eval_count"`
-	EvalDuration          time.Duration       `json:"eval_duration"`
-	Logprobs              []Logprob           `json:"logprobs,omitempty"`
+	SpeculativeDraftTokens    *int                `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int                `json:"speculative_accepted_tokens,omitempty"`
+	PromptProgress            *api.PromptProgress `json:"prompt_progress,omitempty"`
+	GPUFirst                  json.RawMessage     `json:"gpu_first,omitempty"`
+	Message                   api.Message         `json:"message"`
+	DoneReason                DoneReason          `json:"done_reason"`
+	ToolCallsTruncated        bool                `json:"tool_calls_truncated,omitempty"`
+	Done                      bool                `json:"done"`
+	PromptEvalCount           int                 `json:"prompt_eval_count"`
+	PromptEvalCachedCount     *int                `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration        time.Duration       `json:"prompt_eval_duration"`
+	EvalCount                 int                 `json:"eval_count"`
+	EvalDuration              time.Duration       `json:"eval_duration"`
+	Logprobs                  []Logprob           `json:"logprobs,omitempty"`
 }
 
 // DoneReason represents the reason why a completion response is done
@@ -296,16 +298,18 @@ type Logprob struct {
 }
 
 type CompletionResponse struct {
-	PromptProgress        *api.PromptProgress `json:"prompt_progress,omitempty"`
-	GPUFirst              json.RawMessage     `json:"gpu_first,omitempty"`
-	Content               string              `json:"content"`
-	DoneReason            DoneReason          `json:"done_reason"`
-	Done                  bool                `json:"done"`
-	PromptEvalCount       int                 `json:"prompt_eval_count"`
-	PromptEvalCachedCount *int                `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration       `json:"prompt_eval_duration"`
-	EvalCount             int                 `json:"eval_count"`
-	EvalDuration          time.Duration       `json:"eval_duration"`
+	SpeculativeDraftTokens    *int                `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int                `json:"speculative_accepted_tokens,omitempty"`
+	PromptProgress            *api.PromptProgress `json:"prompt_progress,omitempty"`
+	GPUFirst                  json.RawMessage     `json:"gpu_first,omitempty"`
+	Content                   string              `json:"content"`
+	DoneReason                DoneReason          `json:"done_reason"`
+	Done                      bool                `json:"done"`
+	PromptEvalCount           int                 `json:"prompt_eval_count"`
+	PromptEvalCachedCount     *int                `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration        time.Duration       `json:"prompt_eval_duration"`
+	EvalCount                 int                 `json:"eval_count"`
+	EvalDuration              time.Duration       `json:"eval_duration"`
 
 	// Logprobs contains log probability information if requested
 	Logprobs []Logprob `json:"logprobs,omitempty"`

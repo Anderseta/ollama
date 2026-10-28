@@ -10,19 +10,23 @@ import (
 // RuntimeActivity is an observed runner snapshot, shared by its active slots.
 // It intentionally contains no prompts, responses, file paths or raw log lines.
 type RuntimeActivity struct {
-	Phase           string            `json:"phase"`
-	PhaseStartedAt  int64             `json:"phase_started_at"`
-	UpdatedAt       int64             `json:"updated_at"`
-	Detailed        bool              `json:"detailed"`
-	Stage           string            `json:"stage,omitempty"`
-	Progress        *float64          `json:"progress,omitempty"`
-	PromptProcessed *uint64           `json:"prompt_processed,omitempty"`
-	PromptTotal     *uint64           `json:"prompt_total,omitempty"`
-	GeneratedTokens *uint64           `json:"generated_tokens,omitempty"`
-	TokensPerSecond *float64          `json:"tokens_per_second,omitempty"`
-	Operation       *RuntimeOperation `json:"operation,omitempty"`
-	Memory          *RuntimeMemory    `json:"memory,omitempty"`
-	History         []RuntimePhase    `json:"history"`
+	SpeculativeDraftTokens    *int  `json:"speculative_draft_tokens,omitempty"`
+	SpeculativeAcceptedTokens *int  `json:"speculative_accepted_tokens,omitempty"`
+	SpeculativeObservedAt     int64 `json:"speculative_observed_at,omitempty"`
+	speculativeGeneration     uint64
+	Phase                     string            `json:"phase"`
+	PhaseStartedAt            int64             `json:"phase_started_at"`
+	UpdatedAt                 int64             `json:"updated_at"`
+	Detailed                  bool              `json:"detailed"`
+	Stage                     string            `json:"stage,omitempty"`
+	Progress                  *float64          `json:"progress,omitempty"`
+	PromptProcessed           *uint64           `json:"prompt_processed,omitempty"`
+	PromptTotal               *uint64           `json:"prompt_total,omitempty"`
+	GeneratedTokens           *uint64           `json:"generated_tokens,omitempty"`
+	TokensPerSecond           *float64          `json:"tokens_per_second,omitempty"`
+	Operation                 *RuntimeOperation `json:"operation,omitempty"`
+	Memory                    *RuntimeMemory    `json:"memory,omitempty"`
+	History                   []RuntimePhase    `json:"history"`
 }
 
 type RuntimePhase struct {
@@ -77,6 +81,7 @@ func (a *RuntimeActivity) setPhase(phase string, now int64) {
 		a.Stage = ""
 		if phase == "prefill" || phase == "loading" {
 			a.PromptProcessed, a.PromptTotal, a.GeneratedTokens = nil, nil, nil
+			a.SpeculativeDraftTokens, a.SpeculativeAcceptedTokens, a.SpeculativeObservedAt = nil, nil, 0
 		}
 		a.History = append(a.History, RuntimePhase{Phase: phase, At: now})
 		if len(a.History) > 24 {
@@ -87,6 +92,32 @@ func (a *RuntimeActivity) setPhase(phase string, now int64) {
 		a.Operation = nil
 	}
 	a.UpdatedAt = now
+}
+
+func (w *StatusWriter) beginSpeculativeGeneration() uint64 {
+	if w == nil {
+		return 0
+	}
+	w.activityMu.Lock()
+	defer w.activityMu.Unlock()
+	a := &w.activity
+	a.speculativeGeneration++
+	a.SpeculativeDraftTokens, a.SpeculativeAcceptedTokens, a.SpeculativeObservedAt = nil, nil, 0
+	return a.speculativeGeneration
+}
+
+func (w *StatusWriter) observeSpeculativeGeneration(generation uint64, draft, accepted *int) {
+	if w == nil || draft == nil || accepted == nil {
+		return
+	}
+	w.activityMu.Lock()
+	defer w.activityMu.Unlock()
+	a := &w.activity
+	if a.speculativeGeneration != generation {
+		return
+	}
+	a.SpeculativeDraftTokens, a.SpeculativeAcceptedTokens = activityValueCopy(draft), activityValueCopy(accepted)
+	a.SpeculativeObservedAt = time.Now().UnixMilli()
 }
 
 func (w *StatusWriter) observeActivity(b []byte) {
@@ -220,6 +251,8 @@ func (w *StatusWriter) ActivitySnapshot() RuntimeActivity {
 	value.PromptTotal = activityValueCopy(value.PromptTotal)
 	value.GeneratedTokens = activityValueCopy(value.GeneratedTokens)
 	value.TokensPerSecond = activityValueCopy(value.TokensPerSecond)
+	value.SpeculativeDraftTokens = activityValueCopy(value.SpeculativeDraftTokens)
+	value.SpeculativeAcceptedTokens = activityValueCopy(value.SpeculativeAcceptedTokens)
 	value.History = append([]RuntimePhase{}, value.History...)
 	if value.Memory != nil {
 		memory := *value.Memory
