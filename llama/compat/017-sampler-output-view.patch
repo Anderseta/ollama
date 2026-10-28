@@ -1,0 +1,525 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1254,6 +1254,24 @@
+     LLAMA_API llama_token * llama_get_sampled_candidates_ith      (struct llama_context * ctx, int32_t i);
+     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
+ 
++    // Borrow one consistent sampler output row after a single synchronization.
++    // This is additive: the individual getters retain their existing behavior.
++    // Pointers remain valid until the next context mutation/decode, as with the
++    // individual getters. candidates preserves their full-vocabulary fallback.
++    // raw_logits is populated only when both sampled_probs/logits are absent.
++    struct llama_sampler_output {
++        const float * sampled_probs;
++        const float * sampled_logits;
++        const llama_token * candidates;
++        const float * raw_logits;
++        uint32_t sampled_probs_count;
++        uint32_t sampled_logits_count;
++        uint32_t candidates_count;
++        llama_token sampled_token;
++    };
++
++    LLAMA_API struct llama_sampler_output llama_get_sampler_output_ith(struct llama_context * ctx, int32_t i);
++
+     //
+     // Vocab
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4724,6 +4724,33 @@
+     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+ }
+ 
++llama_sampler_output llama_get_sampler_output_ith(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++    return llama_get_sampler_output_ith_synchronized(ctx, i);
++}
++
++llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i) {
++    llama_sampler_output output {};
++    // Preserve the individual getter order used by common_sampler::set_logits.
++    // Internal getters borrow views/reorder outputs; they do not synchronize,
++    // sample, advance RNG, or modify sampler/grammar/controller state.
++    output.sampled_probs = ctx->get_sampled_probs_ith(i);
++    output.sampled_logits = ctx->get_sampled_logits_ith(i);
++    output.candidates = ctx->get_sampled_candidates_ith(i);
++    if (output.sampled_probs) {
++        output.sampled_probs_count = static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
++    }
++    if (output.sampled_logits) {
++        output.sampled_logits_count = static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
++    }
++    if (!output.sampled_probs && !output.sampled_logits) {
++        output.raw_logits = ctx->get_logits_ith(i);
++    }
++    output.candidates_count = static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
++    output.sampled_token = ctx->get_sampled_token_ith(i);
++    return output;
++}
++
+ struct ggml_cgraph * llama_graph_reserve(
+         struct llama_context * ctx,
+         uint32_t n_tokens,
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -9,6 +9,12 @@
+ #include <cstdint>
+ #include <map>
+ #include <vector>
++
++// Internal output view for a caller that has ALREADY called llama_synchronize
++// and does not mutate/submit work to this context before consuming the view.
++// It performs no synchronization. General callers must use the safe public
++// llama_get_sampler_output_ith instead. Borrowed pointer lifetime is unchanged.
++LLAMA_API llama_sampler_output llama_get_sampler_output_ith_synchronized(llama_context * ctx, int32_t i);
+ 
+ // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,4 +1,5 @@
+ #include "sampling.h"
++#include "../src/llama-ext.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -131,10 +132,10 @@
+         llama_sampler_reset(chain);
+     }
+ 
+-    void set_logits(struct llama_context * ctx, int idx) {
+-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
++    void set_logits(struct llama_context * ctx, const llama_sampler_output & output) {
++        const float *       sampled_probs  = output.sampled_probs;
++        const float *       sampled_logits = output.sampled_logits;
++        const llama_token * sampled_ids    = output.candidates;
+ 
+         const llama_model * model = llama_get_model(ctx);
+         const llama_vocab * vocab = llama_model_get_vocab(model);
+@@ -142,19 +143,19 @@
+         const int n_vocab = llama_vocab_n_tokens(vocab);
+ 
+         if (sampled_probs) {
+-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
++            const uint32_t sampled_probs_count = output.sampled_probs_count;
+             cur.resize(sampled_probs_count);
+             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
+                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+             }
+         } else if (sampled_logits) {
+-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
++            const uint32_t sampled_logits_count = output.sampled_logits_count;
+             cur.resize(sampled_logits_count);
+             for (uint32_t i = 0; i < sampled_logits_count; i++) {
+                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+             }
+         } else {
+-            const auto * logits = llama_get_logits_ith(ctx, idx);
++            const auto * logits = output.raw_logits;
+             GGML_ASSERT(logits != nullptr);
+             cur.resize(n_vocab);
+             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+@@ -613,6 +614,10 @@
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
++    // Borrow after the existing fence/timer boundary: output reordering remains
++    // included in sampler CPU time while GPU waits remain excluded.
++    const auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++
+     llama_token id = LLAMA_TOKEN_NULL;
+ 
+     auto & grmr  = gsmpl->grmr;
+@@ -620,12 +625,12 @@
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
++    gsmpl->set_logits(ctx, output);
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+     {
+-        id = llama_get_sampled_token_ith(ctx, idx);
++        id = output.sampled_token;
+ 
+         if (id != LLAMA_TOKEN_NULL) {
+             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
+@@ -674,7 +679,9 @@
+ 
+     // resampling:
+     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+-    gsmpl->set_logits(ctx, idx);
++    // Grammar rejection reuses the same immutable decoded outputs. It does not
++    // submit another graph, so rebuilding candidates needs no additional fence.
++    gsmpl->set_logits(ctx, output);
+ 
+     llama_sampler_apply(rbudget,  &cur_p);
+ 
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-sampler-output-view.cpp
+@@ -0,0 +1,344 @@
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "../ggml/src/ggml-backend-impl.h"
++#include "../src/llama-ext.h"
++#include "sampling.h"
++#include "reasoning-budget.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++// Count the actual scheduler/backend synchronize boundary, not elapsed CPU
++// guesses. Only this fixture's explicitly loaded CPU backend is wrapped.
++static std::atomic<uint64_t> synchronizations{0};
++static std::map<ggml_backend_t, void (*)(ggml_backend_t)> original_sync;
++static ggml_backend_t (*original_init)(ggml_backend_dev_t, const char *);
++static void counted_sync(ggml_backend_t backend) {
++    ++synchronizations;
++    auto fn = original_sync.at(backend);
++    if (fn) { fn(backend); }
++}
++static ggml_backend_t counted_init(ggml_backend_dev_t device, const char * params) {
++    auto backend = original_init(device, params);
++    if (backend) {
++        original_sync[backend] = backend->iface.synchronize;
++        backend->iface.synchronize = counted_sync;
++    }
++    return backend;
++}
++
++constexpr int width = 32, n_vocab = 259;
++static llama_model_ptr fixture_model(bool hybrid = false) {
++    const std::string architecture = hybrid ? "qwen35" : "llama";
++    gguf_context_ptr meta(gguf_init_empty());
++    gguf_set_val_str(meta.get(), "general.architecture", architecture.c_str());
++    gguf_set_val_str(meta.get(), "general.name", "sampler-output-view-cpu-fixture");
++    for (const auto & p : std::vector<std::pair<const char *, uint32_t>>{
++            {"context_length", 128}, {"embedding_length", width}, {"block_count", hybrid ? 3u : 2u},
++            {"feed_forward_length", 64}, {"attention.head_count", 2},
++            {"attention.head_count_kv", 1}, {"rope.dimension_count", 16}}) {
++        gguf_set_val_u32(meta.get(), (architecture + "." + p.first).c_str(), p.second);
++    }
++    gguf_set_val_f32(meta.get(), (architecture + ".attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
++    if (hybrid) {
++        for (const auto & p : std::vector<std::pair<const char *, uint32_t>>{
++                {"full_attention_interval", 2}, {"ssm.conv_kernel", 4}, {"ssm.inner_size", 128},
++                {"ssm.state_size", 128}, {"ssm.time_step_rank", 1}, {"ssm.group_count", 1}}) {
++            gguf_set_val_u32(meta.get(), (architecture + "." + p.first).c_str(), p.second);
++        }
++        const uint32_t sections[] = {4, 4, 0, 0};
++        gguf_set_arr_data(meta.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
++    }
++    gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> names = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) {
++        char value[16]; std::snprintf(value, sizeof(value), "<0x%02X>", i);
++        names.emplace_back(value);
++    }
++    std::vector<const char *> tokens;
++    for (const auto & name : names) { tokens.push_back(name.c_str()); }
++    std::vector<float> scores(n_vocab, 0);
++    std::vector<int32_t> types(n_vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", tokens.data(), tokens.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.eos_token_id", 2);
++    auto init = [](ggml_tensor * tensor, void *) {
++        require(tensor->type == GGML_TYPE_F32, "fixture is not F32");
++        std::vector<float> values(ggml_nelements(tensor));
++        uint32_t state = 2166136261u;
++        for (const char * p = tensor->name; *p; ++p) { state = (state ^ uint8_t(*p)) * 16777619u; }
++        for (auto & value : values) {
++            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++            value = (float(state & 65535) / 65535.f - .5f) * .12f;
++        }
++        if (std::strstr(tensor->name, "norm")) { std::fill(values.begin(), values.end(), 1.f); }
++        if (std::strstr(tensor->name, "ssm_a") || std::strstr(tensor->name, "ssm_dt.bias")) {
++            std::fill(values.begin(), values.end(), -1.f);
++        }
++        ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
++    };
++    auto params = llama_model_default_params();
++    ggml_backend_dev_t devices[] = {nullptr};
++    params.devices = devices; params.n_gpu_layers = 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
++    params.use_extra_bufts = false; params.no_host = true;
++    llama_model_ptr model(llama_model_init_from_user(meta.get(), init, nullptr, params));
++    require(bool(model) && llama_model_size(model.get()) < 1024 * 1024, "tiny CPU model unavailable/oversized");
++    return model;
++}
++
++static llama_context_ptr fixture_context(llama_model * model, uint32_t sequences = 1) {
++    auto params = llama_context_default_params();
++    params.n_ctx = 128; params.n_batch = params.n_ubatch = 8; params.n_seq_max = sequences;
++    params.n_rs_seq = 2;
++    params.n_outputs_max_per_seq = 3;
++    params.n_threads = params.n_threads_batch = 1;
++    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    llama_context_ptr context(llama_init_from_model(model, params));
++    require(bool(context), "CPU context unavailable");
++    return context;
++}
++
++// Exact legacy call sequence used by common_sampler_sample before this patch.
++static llama_sampler_output legacy_output(llama_context * context, int index) {
++    llama_synchronize(context);
++    llama_sampler_output result{};
++    result.sampled_probs = llama_get_sampled_probs_ith(context, index);
++    result.sampled_logits = llama_get_sampled_logits_ith(context, index);
++    result.candidates = llama_get_sampled_candidates_ith(context, index);
++    if (result.sampled_probs) { result.sampled_probs_count = llama_get_sampled_probs_count_ith(context, index); }
++    else if (result.sampled_logits) { result.sampled_logits_count = llama_get_sampled_logits_count_ith(context, index); }
++    else { result.raw_logits = llama_get_logits_ith(context, index); }
++    result.sampled_token = llama_get_sampled_token_ith(context, index);
++    return result;
++}
++
++static void equal_view(llama_context * context, int index) {
++    synchronizations = 0;
++    auto old = legacy_output(context, index);
++    require(synchronizations.load() == 6, "legacy path did not perform six backend synchronizations");
++    // These counts were not used by the legacy common sampler in every branch,
++    // but the new complete view must agree with their individual API getters.
++    old.sampled_probs_count = old.sampled_probs ? llama_get_sampled_probs_count_ith(context, index) : 0;
++    old.sampled_logits_count = old.sampled_logits ? llama_get_sampled_logits_count_ith(context, index) : 0;
++    old.candidates_count = llama_get_sampled_candidates_count_ith(context, index);
++    synchronizations = 0;
++    const auto next = llama_get_sampler_output_ith(context, index);
++    require(synchronizations.load() == 1, "output view did not synchronize exactly once");
++    synchronizations = 0;
++    const auto synchronized = llama_get_sampler_output_ith_synchronized(context, index);
++    require(synchronizations.load() == 0, "already-synchronized view inserted a fence");
++    for (const auto * view : {&next, &synchronized}) {
++        require(old.sampled_probs == view->sampled_probs && old.sampled_logits == view->sampled_logits &&
++                old.candidates == view->candidates && old.raw_logits == view->raw_logits &&
++                old.sampled_probs_count == view->sampled_probs_count && old.sampled_logits_count == view->sampled_logits_count &&
++                old.candidates_count == view->candidates_count && old.sampled_token == view->sampled_token,
++                "view differs from legacy output getters");
++    }
++}
++
++static void permutation_views(llama_model * model) {
++    auto left = fixture_context(model, 2), right = fixture_context(model, 2);
++    common_batch a(left.get()), b(right.get());
++    // Real recurrent batching groups sequences internally, while public rows
++    // must retain this interleaved user order. Row 1 intentionally has no output.
++    for (auto * batch : {&a, &b}) {
++        batch->add(3 + 'x', 0, 1, true);
++        batch->add(3 + 'y', 0, 0, false);
++        batch->add(3 + 'z', 1, 1, true);
++        batch->add(3 + 'w', 1, 0, true);
++    }
++    require(llama_process(left.get(), LLAMA_PROCESS_TYPE_DECODE, a.get()) == 0 &&
++            llama_process(right.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "two-sequence sparse decode failed");
++    // Legacy is first to materialize left, the safe view first materializes
++    // right: one path cannot mask the other's initial output reordering.
++    for (int index : {0, 2, 3, -1, -2, -3}) {
++        synchronizations = 0;
++        const auto expected = legacy_output(left.get(), index);
++        require(synchronizations.load() == 6, "sparse legacy synchronization count changed");
++        synchronizations = 0;
++        const auto actual = llama_get_sampler_output_ith(right.get(), index);
++        require(synchronizations.load() == 1, "sparse view synchronization count changed");
++        require(expected.raw_logits && actual.raw_logits && !actual.sampled_probs && !actual.sampled_logits &&
++                actual.sampled_token == LLAMA_TOKEN_NULL && expected.sampled_token == actual.sampled_token,
++                "sparse raw-output availability changed");
++        require(std::memcmp(expected.raw_logits, actual.raw_logits, n_vocab * sizeof(float)) == 0 &&
++                std::memcmp(expected.candidates, actual.candidates, n_vocab * sizeof(llama_token)) == 0,
++                "sparse/multi-sequence output permutation changed");
++    }
++}
++
++static std::vector<llama_token_data> candidates(const llama_sampler_output & output) {
++    const size_t count = output.sampled_probs ? output.sampled_probs_count :
++                         output.sampled_logits ? output.sampled_logits_count : n_vocab;
++    std::vector<llama_token_data> result(count);
++    for (size_t i = 0; i < count; ++i) {
++        result[i] = output.sampled_probs ? llama_token_data{output.candidates[i], output.sampled_logits[i], output.sampled_probs[i]} :
++                    output.sampled_logits ? llama_token_data{output.candidates[i], output.sampled_logits[i], 0.f} :
++                                           llama_token_data{llama_token(i), output.raw_logits[i], 0.f};
++    }
++    return result;
++}
++
++struct reference_sampler {
++    common_sampler_ptr chain;
++    llama_sampler_ptr grammar;
++    llama_sampler_ptr budget;
++    std::vector<llama_token_data> cur;
++    llama_token_data_array current{};
++
++    reference_sampler(llama_model * model, common_params_sampling params) {
++        chain.reset(common_sampler_init(model, params));
++        const auto * vocab = llama_model_get_vocab(model);
++        if (!params.grammar.empty()) {
++            grammar.reset(llama_sampler_init_grammar(vocab, params.grammar.grammar.c_str(), "root"));
++            require(bool(grammar), "reference grammar unavailable");
++        }
++        if (!params.reasoning_budget_start.empty()) {
++            budget.reset(common_reasoning_budget_init(vocab, {params.reasoning_budget_start}, params.reasoning_budget_end,
++                params.reasoning_budget_forced, params.reasoning_budget_tokens));
++        }
++    }
++
++    void accept(llama_token token) {
++        common_sampler_accept(chain.get(), token, true);
++        if (grammar) { llama_sampler_accept(grammar.get(), token); }
++        if (budget) { llama_sampler_accept(budget.get(), token); }
++    }
++
++    llama_token sample(llama_context * context, int index, bool grammar_first) {
++        auto output = legacy_output(context, index);
++        auto reset = [&] { cur = candidates(output); current = {cur.data(), cur.size(), -1, false}; };
++        reset();
++        if (output.sampled_token != LLAMA_TOKEN_NULL) {
++            for (size_t i = 0; i < cur.size(); ++i) {
++                if (cur[i].id == output.sampled_token) { current.selected = i; break; }
++            }
++            return output.sampled_token;
++        }
++        llama_sampler_apply(budget.get(), &current);
++        if (grammar_first) { llama_sampler_apply(grammar.get(), &current); }
++        llama_sampler_apply(common_sampler_get(chain.get()), &current);
++        llama_token token = current.data[current.selected].id;
++        if (!grammar || grammar_first) { return token; }
++        llama_token_data one{token, 1.f, 0.f};
++        llama_token_data_array one_array{&one, 1, -1, false};
++        llama_sampler_apply(grammar.get(), &one_array);
++        if (one.logit != -INFINITY) { return token; }
++        reset();
++        llama_sampler_apply(budget.get(), &current);
++        llama_sampler_apply(grammar.get(), &current);
++        llama_sampler_apply(common_sampler_get(chain.get()), &current);
++        return current.data[current.selected].id;
++    }
++};
++
++static void same_candidates(const llama_token_data_array & a, const llama_token_data_array & b) {
++    require(a.size == b.size && a.selected == b.selected && a.sorted == b.sorted, "candidate metadata changed");
++    for (size_t i = 0; i < a.size; ++i) {
++        require(a.data[i].id == b.data[i].id &&
++                std::memcmp(&a.data[i].logit, &b.data[i].logit, sizeof(float)) == 0 &&
++                std::memcmp(&a.data[i].p, &b.data[i].p, sizeof(float)) == 0,
++                "candidate values/order changed");
++    }
++}
++
++static void run(llama_model * model, const char * name, common_params_sampling params, bool grammar_first = false) {
++    std::fprintf(stderr, "sampler-output-view: %s\n", name);
++    auto left = fixture_context(model), right = fixture_context(model);
++    reference_sampler reference(model, params);
++    auto next_params = params;
++    common_sampler_ptr next(common_sampler_init(model, next_params));
++    require(bool(reference.chain) && bool(next), "sampler initialization failed");
++    auto * left_backend = common_sampler_get_backend(reference.chain.get());
++    auto * right_backend = common_sampler_get_backend(next.get());
++    require(llama_set_sampler(left.get(), 0, left_backend) && llama_set_sampler(right.get(), 0, right_backend),
++            "CPU backend sampler registration failed");
++    if (params.grammar.empty() && params.reasoning_budget_start.empty() && params.backend_sampling) {
++        require(left_backend && right_backend, "fixture failed to enable requested backend sampling");
++    }
++    if (!params.reasoning_budget_start.empty()) {
++        const llama_token start = params.reasoning_budget_start.front();
++        reference.accept(start); common_sampler_accept(next.get(), start, true);
++    }
++    for (int batch_index = 0; batch_index < 3; ++batch_index) {
++        common_batch a(left.get()), b(right.get());
++        for (int i = 0; i < 3; ++i) {
++            const auto position = batch_index * 3 + i;
++            a.add(3 + 'x' + i, position, 0, true); b.add(3 + 'x' + i, position, 0, true);
++        }
++        require(llama_process(left.get(), LLAMA_PROCESS_TYPE_DECODE, a.get()) == 0 &&
++                llama_process(right.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "CPU decode failed");
++        for (int index : {0, 1, 2, -1, -2, -3}) { equal_view(right.get(), index); }
++        const auto shape = llama_get_sampler_output_ith(right.get(), 0);
++        if (left_backend) {
++            require(shape.sampled_token != LLAMA_TOKEN_NULL && shape.sampled_logits, "backend selected token/logits absent");
++        } else {
++            require(shape.sampled_token == LLAMA_TOKEN_NULL && !shape.sampled_probs && !shape.sampled_logits && shape.raw_logits,
++                    "CPU raw-logit fallback changed");
++        }
++        for (int i = 0; i < 3; ++i) {
++            const int index = i == 2 ? -1 : i;
++            const auto expected = reference.sample(left.get(), index, grammar_first);
++            synchronizations = 0;
++            const auto actual = common_sampler_sample(next.get(), right.get(), index, grammar_first);
++            require(synchronizations.load() == 1, "common sampler performed redundant context fences");
++            require(expected == actual, "sampled token/RNG/controller result changed");
++            same_candidates(reference.current, *common_sampler_get_candidates(next.get(), false));
++            reference.accept(expected); common_sampler_accept(next.get(), actual, true);
++        }
++    }
++}
++
++int main() {
++    try {
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        require(device && ggml_backend_dev_count() == 1, "fixture must register CPU only");
++        original_init = device->iface.init_backend;
++        device->iface.init_backend = counted_init;
++        struct restore { ggml_backend_dev_t device; ~restore() { device->iface.init_backend = original_init; } } restore{device};
++        llama_backend_init();
++        auto model = fixture_model();
++        auto hybrid = fixture_model(true);
++        permutation_views(hybrid.get());
++        common_params_sampling params;
++        params.seed = 424242; params.temp = .7f; params.top_k = 20; params.top_p = .9f;
++        params.penalty_repeat = 1.f; params.penalty_freq = params.penalty_present = 0.f;
++        params.no_perf = true;
++        run(model.get(), "CPU seeded", params);
++        params.temp = 0;
++        run(model.get(), "CPU greedy", params);
++        params.temp = .7f;
++        params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [A-Z]+\n");
++        run(model.get(), "grammar rejection seeded", params);
++        run(model.get(), "grammar-first seeded", params, true);
++        params.grammar = {};
++        params.reasoning_budget_tokens = 2;
++        params.reasoning_budget_start = {3 + '['}; params.reasoning_budget_end = {{3 + ']'}};
++        params.reasoning_budget_forced = {3 + ']'};
++        params.logit_bias = {{3 + 'A', 100.f}};
++        run(model.get(), "reasoning forced end", params);
++        params.reasoning_budget_start.clear(); params.reasoning_budget_end.clear(); params.reasoning_budget_forced.clear();
++        params.reasoning_budget_tokens = -1; params.logit_bias.clear();
++        params.backend_sampling = true;
++        run(model.get(), "backend seeded", params);
++        params.temp = 0;
++        run(model.get(), "backend greedy", params);
++        std::puts("PASS: exact legacy output views, positive/negative rows, CPU/backend tokens, greedy/seed/grammar/reasoning, candidates and six-to-one backend fences");
++        return 0;
++    } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -459,3 +459,7 @@
+ add_executable(test-mtp-carry-state test-mtp-carry-state.cpp)
+ target_compile_features(test-mtp-carry-state PRIVATE cxx_std_17)
+ llama_test(test-mtp-carry-state LABEL "main behavior")
++
++llama_build_and_test(test-sampler-output-view.cpp LABEL "main behavior" LINK llama-common)
++add_dependencies(test-sampler-output-view ggml-cpu)
++target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")

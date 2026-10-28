@@ -51,7 +51,8 @@ if(_patch_count GREATER 1)
         set(_probe_supported TRUE)
         foreach(_entry IN LISTS _patch_entries)
             string(REGEX REPLACE "^[^|]*\\|" "" _patch "${_entry}")
-            execute_process(COMMAND ${GIT_EXECUTABLE} apply --numstat "${_patch}"
+            execute_process(COMMAND ${CMAKE_COMMAND} -E env ${_git_apply_env}
+                ${GIT_EXECUTABLE} apply --numstat "${_patch}"
                 RESULT_VARIABLE _stat_result OUTPUT_VARIABLE _stat)
             if(NOT _stat_result EQUAL 0)
                 set(_probe_supported FALSE)

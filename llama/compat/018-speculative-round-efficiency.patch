@@ -1,0 +1,298 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1691,6 +1691,14 @@
+                 (start_zero[seq_id] || (first_pos > 0 && state[seq_id].can_resume(first_pos)));
+         }
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
++        // The constructor configures unmasked nextn output: all raw target
++        // rows are dense. Synchronize/reorder once, then keep this target-owned
++        // host view while the separate draft context performs catch-up.
++        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++        if (!h_tgt || uint64_t(n_tokens) > llama_n_batch(ctx_tgt)) {
++            SPC_ERR("invalid target nextn rows for MTP catch-up: %d\n", n_tokens);
++            return false;
++        }
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+         if (!is_mem_shared) {
+@@ -1702,8 +1710,6 @@
+             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+             //                                                       ^--- this is a problem
+             // TODO:this is generally true, but would be nice to assert it
+-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-
+             for (int k = 0; k < n_tokens; ++k) {
+                 const auto & t = batch_in.tokens[k];
+ 
+@@ -1769,7 +1775,7 @@
+             }
+             for (int32_t i = 0; i < n_rows; ++i) {
+                 const int32_t index = i_batch_beg[seq_id] + i;
+-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, index);
++                const float * h = h_tgt + (size_t) index*n_embd;
+                 std::memcpy(saved.verify.data() + (size_t) i*n_embd, h, row_bytes);
+                 saved.positions[i] = batch_in.tokens[index].pos[0];
+             }
+@@ -3015,6 +3021,34 @@
+     }
+ }
+ 
++bool common_speculative_type_needs_prompt_tokens(common_speculative_type type) {
++    switch (type) {
++        case COMMON_SPECULATIVE_TYPE_NONE:
++        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
++        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
++        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
++        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
++        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
++            return false;
++        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
++        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
++        case COMMON_SPECULATIVE_TYPE_COUNT:
++        default:
++            return true;
++    }
++}
++
++bool common_speculative_needs_prompt_tokens(const common_speculative * spec) {
++    if (!spec) { return false; }
++    for (const auto & impl : spec->impls) {
++        if (common_speculative_type_needs_prompt_tokens(impl->type)) { return true; }
++    }
++    return false;
++}
++
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+     bool result = true;
+ 
+@@ -3099,7 +3133,7 @@
+ 
+                 if (!result.empty()) {
+                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
+-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
++                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt ? dp.prompt->size() : 0,
+                             impl.get()->n_call_draft, result.size());
+ 
+                     // remember which implementation was used
+diff --git a/common/speculative.h b/common/speculative.h
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -4,6 +4,24 @@
+ #include "common.h"
+ 
+ struct common_speculative;
++
++// Neural drafters consume their existing native state, not a full token-history
++// copy. N-gram and unknown/future implementations conservatively need history.
++bool common_speculative_type_needs_prompt_tokens(common_speculative_type type);
++bool common_speculative_needs_prompt_tokens(const common_speculative * spec);
++
++// Materialize at most once, only when an installed implementation may use it.
++// Storage remains owned by the slot while the draft call runs asynchronously.
++template <typename Materialize>
++const llama_tokens * common_speculative_prepare_prompt(const common_speculative * spec,
++                                                      llama_tokens & storage, Materialize materialize) {
++    if (!common_speculative_needs_prompt_tokens(spec)) {
++        storage.clear();
++        return nullptr;
++    }
++    storage = materialize();
++    return &storage;
++}
+ 
+ // comma separated list the provided types
+ std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
+@@ -71,8 +89,9 @@
+     llama_pos   pos0;
+     llama_token id_last;
+ 
+-    // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+-    const llama_tokens * prompt;
++    // Optional for neural implementations; n-gram implementations require the
++    // fully materialized history, including when configured as a fallback.
++    const llama_tokens * prompt = nullptr;
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
+diff --git a/tests/test-speculative-depth.cpp b/tests/test-speculative-depth.cpp
+--- a/tests/test-speculative-depth.cpp
++++ b/tests/test-speculative-depth.cpp
+@@ -1,6 +1,7 @@
+ #include "common.h"
+ #include "speculative.h"
+ #include "ggml-cpp.h"
++#include "../src/llama-ext.h"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -96,6 +97,7 @@
+ struct outcome {
+     std::vector<llama_tokens> tokens;
+     int computed_rows = 0;
++    int prompt_materializations = 0;
+ };
+ 
+ struct forward_counter {
+@@ -115,7 +117,8 @@
+ };
+ 
+ outcome run(llama_model * target, llama_model * draft, common_speculative_type type,
+-            const std::vector<int> & limits, bool inactive_last = false) {
++            const std::vector<int> & limits, bool inactive_last = false,
++            bool force_history = false, bool ngram_fallback = false) {
+     const uint32_t sequences = uint32_t(limits.size());
+     std::fprintf(stderr, "speculative-depth: %s, sequences=%u, first limit=%d, replay=%d\n",
+                  common_speculative_type_to_str(type).c_str(), sequences, limits[0], inactive_last);
+@@ -139,6 +142,7 @@
+ 
+     common_params_speculative config;
+     config.types = {type};
++    if (ngram_fallback) { config.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE); }
+     config.draft.ctx_tgt = ctx_target.get();
+     config.draft.ctx_dft = ctx_draft.get();
+     config.draft.n_max = 48;
+@@ -157,7 +161,16 @@
+     require(llama_process(ctx_target.get(), LLAMA_PROCESS_TYPE_DECODE, prefill.get()) == 0,
+             "target fixture prefill failed");
+     std::fprintf(stderr, "speculative-depth: draft prefill\n");
++    const float * target_hidden = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ? llama_get_embeddings_nextn(ctx_target.get()) : nullptr;
++    std::vector<float> target_hidden_copy;
++    if (target_hidden) { target_hidden_copy.assign(target_hidden, target_hidden + prefill.size()*dim); }
+     require(common_speculative_process(speculative.get(), prefill), "draft fixture prefill failed");
++    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
++        const float * after_hidden = llama_get_embeddings_nextn(ctx_target.get());
++        require(target_hidden && after_hidden == target_hidden &&
++                std::equal(target_hidden_copy.begin(), target_hidden_copy.end(), after_hidden),
++                "draft catch-up replaced or mutated the target-owned dense nextn view");
++    }
+     for (uint32_t seq = 0; seq < sequences; ++seq) { common_speculative_begin(speculative.get(), seq, prompt); }
+     const float * logits = llama_get_logits_ith(ctx_target.get(), -1);
+     const std::vector<float> target_logits(logits, logits + vocab);
+@@ -165,13 +178,20 @@
+     outcome result;
+     result.tokens.resize(sequences);
+     std::vector<std::vector<std::vector<llama_token_data>>> candidates(sequences);
++    std::vector<llama_tokens> materialized(sequences);
+     for (uint32_t seq = 0; seq < sequences; ++seq) {
+         auto & dp = common_speculative_get_draft_params(speculative.get(), seq);
+         dp.drafting = !(inactive_last && seq == sequences-1);
+         dp.n_max = limits[seq];
+         dp.pos0 = llama_pos(prompt.size());
+         dp.id_last = preferred;
+-        dp.prompt = &prompt;
++        auto materialize = [&] { ++result.prompt_materializations; return prompt; };
++        if (force_history) {
++            materialized[seq] = materialize();
++            dp.prompt = &materialized[seq];
++        } else {
++            dp.prompt = common_speculative_prepare_prompt(speculative.get(), materialized[seq], materialize);
++        }
+         dp.result = &result.tokens[seq];
+         dp.result_q = &candidates[seq];
+         dp.temp = 0;
+@@ -183,6 +203,8 @@
+             candidates[seq] = {{{19, 0, 1}}};
+         }
+     }
++    require(result.prompt_materializations == (force_history || ngram_fallback ? int(sequences) : 0),
++            "neural draft materialized history or mixed ngram omitted it");
+     // Public perf counters clamp each zero count to one for printing divisions,
+     // so their difference undercounts the first generated row. Count actual
+     // executed output rows with the scheduler callback instead. Synchronize both
+@@ -213,6 +235,45 @@
+     return result;
+ }
+ 
++void check_prompt_materialization() {
++    for (auto type : {COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
++                     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
++                     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}) {
++        require(!common_speculative_type_needs_prompt_tokens(type), "known neural drafter unexpectedly needs full history");
++    }
++    for (auto type : {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
++                     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
++                     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, COMMON_SPECULATIVE_TYPE_COUNT,
++                     static_cast<common_speculative_type>(15)}) {
++        require(common_speculative_type_needs_prompt_tokens(type), "ngram/future type lost conservative history requirement");
++    }
++    llama_tokens scratch = {99};
++    int absent_materializations = 0;
++    require(common_speculative_prepare_prompt(nullptr, scratch, [&] { ++absent_materializations; return llama_tokens{1}; }) == nullptr &&
++            absent_materializations == 0 && scratch.empty(), "absent spec materialized or retained stale history");
++    llama_tokens prompt;
++    for (int i = 0; i < 64; ++i) { prompt.push_back(1 + i%4); }
++    auto draft = [&](bool lazy) {
++        common_params_speculative config;
++        config.types = {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
++        config.ngram_simple.size_n = 2; config.ngram_simple.size_m = 4;
++        common_speculative_ptr spec(common_speculative_init(config, 1));
++        require(bool(spec) && common_speculative_needs_prompt_tokens(spec.get()), "ngram prompt capability missing");
++        common_speculative_begin(spec.get(), 0, prompt);
++        llama_tokens storage, output;
++        int calls = 0;
++        auto & dp = common_speculative_get_draft_params(spec.get(), 0);
++        dp.drafting = true; dp.n_max = 4; dp.pos0 = llama_pos(prompt.size()); dp.id_last = 1; dp.result = &output;
++        dp.prompt = lazy ? common_speculative_prepare_prompt(spec.get(), storage, [&] { ++calls; return prompt; }) : &prompt;
++        common_speculative_draft(spec.get());
++        require(calls == (lazy ? 1 : 0), "ngram materialization count differs from one");
++        return output;
++    };
++    const auto lazy = draft(true), control = draft(false);
++    require(!lazy.empty() && lazy == control, "lazy ngram history changed actual lookup proposals");
++    std::puts("PASS prompt materialization: absent 0, ngram 1, identical real lookup proposals, conservative mixed/future policy");
++}
++
+ void check_implementation(llama_model * target, llama_model * draft, common_speculative_type type) {
+     const auto full = run(target, draft, type, {-1});
+     const auto limited = run(target, draft, type, {1});
+@@ -220,6 +281,16 @@
+     const auto zero = run(target, draft, type, {0});
+     const auto replay = run(target, draft, type, {0}, true);
+     const auto mixed = run(target, draft, type, {1, 4, 0, -1});
++    const auto history_control = run(target, draft, type, {-1}, false, true);
++    require(full.tokens == history_control.tokens && full.computed_rows == history_control.computed_rows,
++            "omitting unused neural history changed proposals or executed rows");
++    require(full.prompt_materializations == 0 && history_control.prompt_materializations == 1,
++            "neural history materialization instrumentation failed");
++    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
++        const auto mixed_lookup = run(target, draft, type, {-1}, false, false, true);
++        require(mixed_lookup.prompt_materializations == 1 && mixed_lookup.tokens == full.tokens,
++                "mixed ngram/MTP fallback omitted history or changed retained proposals");
++    }
+     require(full.tokens[0].size() == 48 && full.computed_rows == 48, "global draft maximum changed");
+     require(oversized.tokens[0].size() == 48 && oversized.computed_rows == 48,
+             "per-sequence request exceeded the implementation maximum");
+@@ -245,6 +316,7 @@
+ #else
+         ggml_backend_load_all();
+ #endif
++        check_prompt_materialization();
+         auto target = fixture("qwen35");
+         auto eagle = fixture("eagle3");
+         check_implementation(target.get(), target.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3824,7 +3824,8 @@
+                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                         }
+ 
+-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
++                        const llama_tokens * draft_prompt = common_speculative_prepare_prompt(spec.get(), slot.spec_prompt,
++                                [&] { return slot.prompt.tokens.get_text_tokens(); });
+ 
+                         const bool spec_reject = slot.use_spec_rejection();
+ 
+@@ -3833,7 +3834,7 @@
+                             /* .n_max    = */ n_draft_max,
+                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
+                             /* .id_last  = */ slot.sampled,
+-                            /* .prompt   = */ &slot.spec_prompt,
++                            /* .prompt   = */ draft_prompt,
+                             /* .result   = */ &slot.spec_draft,
+                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                             /* .temp     = */ slot.task->params.sampling.temp,

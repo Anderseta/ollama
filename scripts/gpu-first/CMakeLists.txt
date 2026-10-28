@@ -186,3 +186,9 @@ add_test(NAME mtp-state COMMAND test-mtp-state)
 add_executable(test-mtp-carry-state "${WILDLLAMA_NATIVE}/tests/test-mtp-carry-state.cpp")
 target_compile_features(test-mtp-carry-state PRIVATE cxx_std_17)
 add_test(NAME mtp-carry-state COMMAND test-mtp-carry-state)
+
+# The output-view fixture uses an explicit CPU backend and a sub-MiB model.
+validation_target(test-sampler-output-view llama-common)
+add_dependencies(test-sampler-output-view ggml-cpu)
+target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME sampler-output-view COMMAND test-sampler-output-view)

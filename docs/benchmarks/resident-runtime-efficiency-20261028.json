@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-28",
+  "artifact": "resident_runtime_host_efficiency",
+  "status": "passed",
+  "base_commit": "aeb85b154d1950bda98e73cfa5795eed708f9f7e",
+  "scope": "Small Windows CPU fixtures and local HTTP fakes/fixtures. No new large-model or GPU throughput measurement.",
+  "native_base": "llama.cpp b11845 plus WildLlama patches 001-018",
+  "changes": {
+    "sampling": {
+      "legacy_backend_synchronizations_per_sample": 6,
+      "new_backend_synchronizations_per_sample": 1,
+      "safe_public_view_synchronizations": 1,
+      "already_synchronized_internal_view_synchronizations": 0,
+      "sampler_timer_boundary_preserved": true
+    },
+    "neural_drafting": {
+      "full_history_copies_per_round": 0,
+      "bytes_avoided_at_131072_text_tokens": 524288,
+      "ngram_mixed_and_unknown_types_keep_history": true,
+      "begin_unchanged": true
+    },
+    "mtp_hidden_rows": {
+      "target_hidden_buffer_reads_per_batch": 1,
+      "per_row_target_synchronizations_removed": true,
+      "target_owned_buffer_and_row_content_checked": true
+    },
+    "patch_reapplication": {
+      "nested_unversioned_source_uses_git_ceiling_for_numstat": true,
+      "outer_index_preserved": true
+    }
+  },
+  "validation": {
+    "native_ctest": {
+      "passed": 8,
+      "failed": 0,
+      "tests": [
+        "cuda-tuning-policy",
+        "speculative-depth",
+        "state-transfer",
+        "test-kv-trim-ranges",
+        "test-prompt-state-transaction",
+        "mtp-state",
+        "mtp-carry-state",
+        "sampler-output-view"
+      ]
+    },
+    "server_components": {
+      "tests": 44,
+      "assertions": 184,
+      "failed": 0
+    },
+    "sampling_view_cases": [
+      "CPU greedy",
+      "CPU seeded",
+      "grammar rejection",
+      "grammar first",
+      "reasoning budget",
+      "backend greedy",
+      "backend seeded",
+      "positive and negative output indices",
+      "sparse outputs and interleaved two-sequence permutation"
+    ],
+    "http_before_after": {
+      "status": "passed",
+      "fixture_bytes": 28628288,
+      "cases_per_payload": 8,
+      "cpu_only": true,
+      "content_tokens_probabilities_equal": true,
+      "outputs_sha256": "156cb87235ab35e1fd290a9a50a24b7eb236ec5e3874a1aace873a1376cafb47",
+      "large_model_loaded": false,
+      "throughput_measured": false
+    },
+    "patch_replay": {
+      "patches": [
+        "001-llama-cpp-hooks.patch",
+        "002-moe-ram-limit.patch",
+        "003-runtime-performance.patch",
+        "004-gpu-first-moe.patch",
+        "005-live-runtime-activity.patch",
+        "006-moe-residency-pipeline.patch",
+        "007-dense-runtime.patch",
+        "008-runtime-efficiency.patch",
+        "009-bounded-copy-pipeline.patch",
+        "010-scheduler-exception-contract.patch",
+        "011-moe-read-and-execution-batching.patch",
+        "012-expert-major-and-packed-rows.patch",
+        "013-resident-gpu-tuning.patch",
+        "014-kv-reclamation-and-prompt-state.patch",
+        "015-mtp-checkpoint-state.patch",
+        "016-tuning-reuse.patch",
+        "017-sampler-output-view.patch",
+        "018-speculative-round-efficiency.patch"
+      ],
+      "files": 125,
+      "comparison": "exact UTF-8 text with CRLF/LF normalized",
+      "line_ending_only_differences": [
+        "src/llama-model-ram.cpp",
+        "src/llama-moe-cache.cpp",
+        "src/llama-state-transfer.h",
+        "tests/test-state-transfer.cpp"
+      ],
+      "fresh_apply_passed": true,
+      "second_apply_passed": true
+    },
+    "patch_regression": [
+      "clean source",
+      "every partial prefix",
+      "repeated apply",
+      "nested archive in outer worktree",
+      "index preservation",
+      "conflict preservation"
+    ],
+    "native_source_integrity": "same recorded inputs before and after successful build",
+    "cuda_backend_unchanged_sha256": "c7051ea8930f7c35cda19bfd7ba7d9a5a7d0e6dc889d229bdde96b39efa2b6af"
+  },
+  "payload_sha256": {
+    "llama-server.exe": "6b4940e78b0f95b80f52e72dc5f6fc8c7423b63977eed4bda262d27490bbb5d3",
+    "llama-server-impl.dll": "4b188311a4d7280530110901747ac937be98b8e97d85725af8c86be1793da643",
+    "llama.dll": "c16f91d03f1fb528ef5c0a278ebb4e39aa46785206516fa9824ee4a82dacd4a7",
+    "llama-common.dll": "f70ab305e4c803478d88ca17a2f975d08a25d163d0787fbb4aee18ac8554e303",
+    "mtmd.dll": "96a449a46c53858fd73ebe54657e6e05a1f2c942552ccbce38caaee56bcffea6",
+    "cuda_v12/ggml-cuda.dll": "c7051ea8930f7c35cda19bfd7ba7d9a5a7d0e6dc889d229bdde96b39efa2b6af"
+  },
+  "wildgoose": {
+    "source_revision": "fc3e864b96c540d084602b636ccde5428a1ebafe",
+    "ui_tests_passed": 349,
+    "ui_tests_preexisting_skipped": 1,
+    "python_tests_passed": 315,
+    "canonical_build_and_validation_passed": true,
+    "rust_backend_reused": true,
+    "changes": [
+      "coalesce in-flight runtime and metadata requests",
+      "do not publish ACP notifications without state changes",
+      "preserve usage, context, progress clearing and final stream flush",
+      "stop activity timers after last subscriber"
+    ]
+  },
+  "unchanged_controls": [
+    "model weights",
+    "quantization",
+    "logical context",
+    "sampling parameters",
+    "saved profiles"
+  ],
+  "limitations": [
+    "No new Qwen tokens/s claim. Previous full-model results remain separate.",
+    "No Linux execution in this round.",
+    "Shared-KV and multiple-head MTP architectures were reviewed statically, not loaded."
+  ]
+}

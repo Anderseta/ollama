@@ -1,13 +1,14 @@
 """Regression test for ordered, overlapping native patches (no downloads)."""
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 
 
-def run(argv, cwd, check=True):
-    return subprocess.run(argv, cwd=cwd, check=check, capture_output=True, text=True)
+def run(argv, cwd, check=True, env=None):
+    return subprocess.run(argv, cwd=cwd, env=env, check=check, capture_output=True, text=True)
 
 
 def main():
@@ -51,12 +52,29 @@ def main():
             run(applier, source)
             assert target.read_text(encoding="utf8") == versions[-1], "reconfigure changed content"
             assert not list(source.glob(".ollama-patch-check-*")), "probe directory leaked"
+        # A retained archive can live inside a different worktree without its
+        # own .git directory. Every Git subprocess must honor the same ceiling,
+        # including --numstat; otherwise it silently skips the archive's paths.
+        archive = source / "retained archive"
+        archive.mkdir()
+        (archive / "value.txt").write_text(versions[0], encoding="utf8")
+        archive_env = dict(os.environ)
+        for key in ("GIT_CEILING_DIRECTORIES", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            archive_env.pop(key, None)
+        outer = run(["git", "rev-parse", "--show-toplevel"], archive, env=archive_env)
+        assert Path(outer.stdout.strip()).resolve() == source.resolve(), "fixture must discover outer worktree"
+        before_index = (source / ".git/index").read_bytes()
+        for _ in range(2):
+            run(applier, archive, env=archive_env)
+            assert (archive / "value.txt").read_text(encoding="utf8") == versions[-1]
+            assert (source / ".git/index").read_bytes() == before_index, "outer index modified"
+            assert not list(archive.glob(".ollama-patch-check-*")), "archive probe leaked"
         target.write_text("unrelated conflicting content\n", encoding="utf8")
         result = run(applier, source, check=False)
         assert result.returncode != 0, "conflicting edits were accepted"
         assert target.read_text(encoding="utf8") == "unrelated conflicting content\n", "conflict damaged source"
         assert not list(source.glob(".ollama-patch-check-*")), "failed probe directory leaked"
-    print("PASS: clean, all partial prefixes, repeated apply, index preservation, conflict preservation")
+    print("PASS: clean, all partial prefixes, repeated apply, nested archive, index preservation, conflict preservation")
 
 
 if __name__ == "__main__":

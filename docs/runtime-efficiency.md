@@ -438,3 +438,64 @@ These are Go-only changes: a staged `go build -o <staging>/ollama.exe .` can reu
 the installed native payload. Set `GOCACHE`, `GOMODCACHE`, `GOPATH` and `GOTMPDIR`
 to the installation's persistent cache/temp directories before testing or
 building; no native payload rebuild or model download is required.
+
+## Lower host overhead for resident models
+
+When weights already fit in VRAM, repeatedly synchronizing the device and
+preparing unused CPU data can become a larger part of each token's latency.
+The following changes remove host work while retaining the existing sampler,
+grammar checks, random-number consumption, weights and requested context.
+
+### Read sampling outputs after one synchronization
+
+The common sampling path previously synchronized the context explicitly and
+then synchronized it again through each public output getter. Each of these
+calls visits the backend scheduler; on CUDA it can call
+`cudaStreamSynchronize` even after the first call has completed the work.
+
+Patch `017` adds an output view populated after a single synchronization. It
+uses the same internal getters and preserves the existing sampled-token,
+candidate, probability and raw-logit behavior. Existing public getters remain
+available. The common sampler consumes the view instead of repeatedly crossing
+the synchronization boundary. CPU sampling, backend sampling and grammar
+rejection still use their existing sampling chains.
+
+### Avoid unused prompt copies during neural drafting
+
+Patch `018` makes speculative implementations declare whether their draft
+round consumes a token-history vector. MTP and other neural draft methods do
+not need that vector, so the server no longer scans and copies the complete
+history before each round. At 131,072 text tokens, this avoids a 512 KiB token
+copy per round. Normal prompt preparation and the per-request speculative
+`begin` operation remain unchanged.
+
+N-gram methods still receive the history they require. Mixed configurations
+retain it if any configured implementation needs it, and unknown future types
+use the conservative path. This changes neither the draft budget nor target
+verification. It also leaves prompt-cache, recurrent-state and rollback
+semantics unchanged.
+
+MTP also reuses the already synchronized, dense target hidden-state buffer
+while recording verification rows. It no longer synchronizes the target
+again for every row. The constructor already enables unmasked target rows,
+and the draft catch-up path uses this same dense indexing. Row contents and
+per-sequence carryover stay unchanged.
+
+These are runtime changes and require rebuilding the matching native payload.
+They are not a new model profile or a reason to reduce context. Component
+validation uses small synthetic CPU fixtures; it does not establish a new
+large-model tokens/s result. The previously recorded Qwen MTP throughput
+measurements remain separate from these changes.
+
+The [validation record](benchmarks/resident-runtime-efficiency-20261028.json)
+contains the eight CPU CTest results, 44 server component cases, and eight
+before/after HTTP sampling comparisons with a 27.3 MiB artificial model. The
+comparisons retain identical content, tokens and probabilities. Tests also
+cover sparse multi-sequence outputs, grammar rejection, reasoning budgets,
+N-gram fallbacks and MTP state continuity. The CUDA backend binary is unchanged.
+
+The patch applier now also isolates `git apply --numstat` from enclosing
+worktrees. Without that isolation, a retained source archive nested inside
+another repository could silently report no patch paths and fail to recognize
+an already applied patch stack. The regression fixture checks repeated
+application and preservation of the enclosing Git index.
