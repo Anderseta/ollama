@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -85,7 +86,7 @@ func TestHuggingFacePullRegistersBothShardsWithoutMergingAndReusesBlobs(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		filename := []string{"model-IQ3_S-00001-of-00002.gguf", "model-IQ3_S-00002-of-00002.gguf"}[index]
+		filename := []string{"subfolder/model-IQ3_S-00001-of-00002.gguf", "subfolder/model-IQ3_S-00002-of-00002.gguf"}[index]
 		file := huggingFaceTestFile(filename)
 		file.Size = int64(len(content))
 		file.LFS.Size = file.Size
@@ -110,12 +111,20 @@ func TestHuggingFacePullRegistersBothShardsWithoutMergingAndReusesBlobs(t *testi
 		http.ServeContent(w, r, "model.gguf", time.Unix(1, 0), bytes.NewReader(content))
 	}))
 	defer cdn.Close()
+	var pinnedRequests atomic.Int32
+	revision := strings.Repeat("b", 40)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/models/") {
 			if r.URL.Query().Get("blobs") != "true" {
 				t.Error("SHA-256 metadata not requested")
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"siblings": files})
+			if strings.Contains(r.URL.Path, "/revision/") {
+				if !strings.HasSuffix(r.URL.Path, "/revision/"+revision) {
+					t.Error("wrong pinned revision requested")
+				}
+				pinnedRequests.Add(1)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": revision, "siblings": files})
 			return
 		}
 		if strings.Contains(r.URL.Path, "/manifests/") {
@@ -139,10 +148,86 @@ func TestHuggingFacePullRegistersBothShardsWithoutMergingAndReusesBlobs(t *testi
 	}
 	t.Cleanup(func() { testMakeRequestDialContext = nil })
 	name := model.ParseName("http://huggingface.co/owner/" + strings.Repeat("a", 96) + ":IQ3_S")
-	for range 2 {
-		if err := PullModel(t.Context(), name.String(), "llamacpp", &registryOptions{Insecure: true}, func(api.ProgressResponse) {}); err != nil {
+	cancelled, cancel := context.WithCancel(t.Context())
+	none := "none"
+	err := PullModel(cancelled, name.String(), "llamacpp", &registryOptions{Insecure: true, HuggingFace: huggingFaceSelection{File: files[0].Filename, Projector: &none}}, func(response api.ProgressResponse) {
+		if response.FileIndex == 2 && strings.HasPrefix(response.Status, "downloading Hugging Face file") {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("download did not stop between shards: %v", err)
+	}
+	firstBlob, _ := manifest.BlobsPath("sha256:" + files[0].LFS.SHA256)
+	secondBlob, _ := manifest.BlobsPath("sha256:" + files[1].LFS.SHA256)
+	secondData := data["sha256:"+files[1].LFS.SHA256]
+	half := len(secondData) / 2
+	if err := os.WriteFile(secondBlob+"-partial", secondData[:half], 0644); err != nil {
+		t.Fatal(err)
+	}
+	part, err := json.Marshal(jsonBlobDownloadPart{N: 0, Size: int64(len(secondData)), Completed: int64(half)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondBlob+"-partial-0", part, 0644); err != nil {
+		t.Fatal(err)
+	}
+	orphan, _ := manifest.BlobsPath("sha256:" + strings.Repeat("f", 64))
+	if err := os.WriteFile(orphan, []byte("unused"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for _, path := range []string{firstBlob, secondBlob + "-partial", secondBlob + "-partial-0", orphan} {
+		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := PruneLayers(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{firstBlob, secondBlob + "-partial", secondBlob + "-partial-0"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("startup prune discarded resumable download: %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("normal orphan was not pruned: %v", err)
+	}
+	for attempt := range 2 {
+		options := &registryOptions{Insecure: true}
+		if attempt == 1 {
+			none := "none"
+			options.HuggingFace = huggingFaceSelection{File: files[0].Filename, Projector: &none, Revision: revision}
+		}
+		var last int64
+		seenSecond := false
+		progress := func(response api.ProgressResponse) {
+			if response.OverallTotal == 0 {
+				return
+			}
+			if response.OverallTotal != files[0].Size+files[1].Size {
+				t.Errorf("wrong overall total: %+v", response)
+			}
+			if response.OverallCompleted < last || response.OverallCompleted > response.OverallTotal {
+				t.Errorf("aggregate progress regressed: %+v, previous %d", response, last)
+			}
+			last = response.OverallCompleted
+			if response.FileIndex == 2 && response.FileCount == 2 {
+				seenSecond = true
+			}
+		}
+		if err := PullModel(t.Context(), name.String(), "llamacpp", options, progress); err != nil {
+			t.Fatal(err)
+		}
+		if !seenSecond || last != files[0].Size+files[1].Size {
+			t.Fatal("incomplete aggregate progress")
+		}
+		if pins, err := manifest.DownloadPinnedBlobs(); err != nil || len(pins) != 0 {
+			t.Fatalf("completed model retained download checkpoint: %+v %v", pins, err)
+		}
+	}
+	if pinnedRequests.Load() != 1 {
+		t.Fatal("exact selection did not pin the catalog revision")
 	}
 	if bodies.Load() != 2 {
 		t.Fatalf("blob GETs=%d, want 2 with cache reuse", bodies.Load())

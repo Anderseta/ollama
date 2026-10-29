@@ -1580,6 +1580,15 @@ func (s *Server) PullHandler(c *gin.Context) {
 	}
 
 	name := modelRef.Name
+	selection := huggingFaceSelection{File: req.HuggingFaceFile, Projector: req.HuggingFaceProjector, Revision: req.HuggingFaceRevision}
+	if err := selection.validate(); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if selection.explicit() && !isHuggingFaceName(name) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Hugging Face selection requires a huggingface.co model"})
+		return
+	}
 
 	name, err = getExistingName(name)
 	if err != nil {
@@ -1603,7 +1612,8 @@ func (s *Server) PullHandler(c *gin.Context) {
 		}
 
 		regOpts := &registryOptions{
-			Insecure: req.Insecure,
+			Insecure:    req.Insecure,
+			HuggingFace: selection,
 		}
 
 		ctx, cancel := context.WithCancel(streamCtx)
@@ -2456,9 +2466,11 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
 	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
 	r.GET("/api/version", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget"}})
+		c.JSON(http.StatusOK, gin.H{"version": version.Version, "capabilities": []string{"runner_env", "num_ubatch", "embedding_batch", "gpu_exclusive", "gpu_vram_limit_mib", "gpu_diagnostics", "live_activity", "moe_runtime", "kv_cache_initial_tokens", "reasoning_budget", "huggingface_catalog"}})
 	})
 	r.GET("/api/activity", s.RuntimeActivityHandler)
+	r.GET("/api/huggingface/search", s.HuggingFaceSearchHandler)
+	r.GET("/api/huggingface/files", s.HuggingFaceFilesHandler)
 	r.GET("/api/status", s.StatusHandler)
 	// Codex uses this existing Ollama listener for both native and Ollama
 	// models. The proxy selects the upstream per request.

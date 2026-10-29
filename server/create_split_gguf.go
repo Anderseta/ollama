@@ -15,7 +15,7 @@ const (
 	splitGGUFMinOllamaVersion = "0.35.0"
 )
 
-var splitGGUFNameRe = regexp.MustCompile(`^(.*)-(\d{5})-of-(\d{5})\.gguf$`)
+var splitGGUFNameRe = regexp.MustCompile(`(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$`)
 
 type splitGGUFSlot struct {
 	layer    *modelLayer

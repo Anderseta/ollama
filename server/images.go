@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -55,10 +54,11 @@ var (
 )
 
 type registryOptions struct {
-	Insecure bool
-	Username string
-	Password string
-	Token    string
+	Insecure    bool
+	Username    string
+	Password    string
+	Token       string
+	HuggingFace huggingFaceSelection
 
 	CheckRedirect func(req *http.Request, via []*http.Request) error
 }
@@ -960,6 +960,11 @@ func narrowManifestListToLocal(data []byte) ([]byte, string, error) {
 }
 
 func PruneLayers() error {
+	pinned, err := manifest.DownloadPinnedBlobs()
+	if err != nil {
+		slog.Warn("skipping prune because pending model downloads could not be read", "error", err)
+		return nil
+	}
 	var candidates []string
 	p, err := manifest.BlobsPath("")
 	if err != nil {
@@ -976,6 +981,14 @@ func PruneLayers() error {
 		if blob.IsDir() {
 			continue
 		}
+		name := blob.Name()
+		if len(name) >= 71 && strings.HasPrefix(name, "sha256-") {
+			digest := "sha256:" + name[7:71]
+			suffix := name[71:]
+			if _, ok := pinned[digest]; ok && (suffix == "" || suffix == "-partial" || strings.HasPrefix(suffix, "-partial-")) {
+				continue
+			}
+		}
 
 		info, err := blob.Info()
 		if err != nil {
@@ -986,7 +999,7 @@ func PruneLayers() error {
 			continue
 		}
 
-		name := blob.Name()
+		name = blob.Name()
 		name = strings.ReplaceAll(name, "-", ":")
 
 		_, err = manifest.BlobsPath(name)
@@ -1075,7 +1088,6 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		fn(api.ProgressResponse{Status: "success"})
 		return nil
 	}
-
 	for _, layer := range layers {
 		if err := uploadBlob(ctx, n, layer, regOpts, fn); err != nil {
 			slog.Info(fmt.Sprintf("error uploading blob: %v", err))
@@ -1166,6 +1178,12 @@ func pushLayersForManifestList(parent manifest.Manifest) ([]manifest.Layer, erro
 
 func PullModel(ctx context.Context, name string, runner string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	n := model.ParseName(name)
+	if regOpts.HuggingFace.explicit() {
+		if !isHuggingFaceName(n) {
+			return errors.New("Hugging Face file selection requires a huggingface.co model")
+		}
+		return pullHuggingFaceGGUF(ctx, n, runner, regOpts, fn)
+	}
 
 	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
@@ -1245,6 +1263,13 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 		return nil
 	}
 
+	digests := make([]string, 0, len(layers))
+	for _, layer := range layers {
+		digests = append(digests, layer.Digest)
+	}
+	if err := manifest.PinDownload(n, digests); err != nil {
+		return err
+	}
 	skipVerify := make(map[string]bool)
 	for _, layer := range layers {
 		cacheHit, err := downloadBlob(ctx, downloadOpts{
@@ -1274,7 +1299,7 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 		if skipVerify[layer.Digest] {
 			continue
 		}
-		if err := verifyBlob(layer.Digest); err != nil {
+		if err := verifyBlobContext(ctx, layer.Digest); err != nil {
 			if errors.Is(err, errDigestMismatch) {
 				fp, err := manifest.BlobsPath(layer.Digest)
 				if err != nil {
@@ -1296,12 +1321,18 @@ func PullModel(ctx context.Context, name string, runner string, regOpts *registr
 
 	fn(api.ProgressResponse{Status: "writing manifest"})
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := manifest.WriteManifestData(n, manifestData); err != nil {
 		slog.Info(fmt.Sprintf("couldn't write manifest for %s", n.DisplayShortest()))
 		return err
 	}
 
 	writePullDowngradeAnchor(n, mf, manifestData, selectedChildDigest)
+	if err := manifest.ReleaseDownloadPin(n); err != nil {
+		slog.Warn("could not release completed model download", "model", n.String(), "error", err)
+	}
 
 	slog.Debug("manifest written", "name", n.DisplayShortest(), "sha256", fmt.Sprintf("%x", sha256.Sum256(manifestData)), "size", len(manifestData))
 
@@ -1353,7 +1384,7 @@ func checkModelRequires(ctx context.Context, n model.Name, mf *manifest.Manifest
 		return nil
 	}
 
-	if err := verifyBlob(mf.Config.Digest); err != nil {
+	if err := verifyBlobContext(ctx, mf.Config.Digest); err != nil {
 		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errDigestMismatch) {
 			return err
 		}
@@ -1361,7 +1392,7 @@ func checkModelRequires(ctx context.Context, n model.Name, mf *manifest.Manifest
 			slog.Debug("skipping requires check: config fetch failed", "model", n.DisplayShortest(), "error", err)
 			return nil
 		}
-		if err := verifyBlob(mf.Config.Digest); err != nil {
+		if err := verifyBlobContext(ctx, mf.Config.Digest); err != nil {
 			slog.Debug("skipping requires check: config verify failed", "model", n.DisplayShortest(), "error", err)
 			return nil
 		}
@@ -1427,7 +1458,7 @@ func pullSelectedManifest(ctx context.Context, n model.Name, parent *manifest.Ma
 		return nil, "", err
 	}
 
-	if err := verifyBlob(childDigest); err != nil {
+	if err := verifyBlobContext(ctx, childDigest); err != nil {
 		return nil, "", err
 	}
 	blobPath, err := manifest.BlobsPath(childDigest)
@@ -1560,6 +1591,9 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 	// Write manifest
 	fn(api.ProgressResponse{Status: "writing manifest"})
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := manifest.WriteManifestData(n, manifestData); err != nil {
 		return err
 	}
@@ -1654,14 +1688,8 @@ func pullModelManifest(ctx context.Context, n model.Name, regOpts *registryOptio
 }
 
 // GetSHA256Digest returns the SHA256 hash of a given buffer and returns it, and the size of buffer
-func GetSHA256Digest(r io.Reader) (string, int64) {
-	h := sha256.New()
-	n, err := io.Copy(h, r)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n
+func GetSHA256Digest(r io.Reader) (string, int64, error) {
+	return hashModelBlob(context.Background(), r)
 }
 
 var errUnauthorized = errors.New("unauthorized: access denied")
@@ -1845,6 +1873,13 @@ func parseRegistryChallenge(authStr string) registryChallenge {
 var errDigestMismatch = errors.New("digest mismatch, file must be downloaded again")
 
 func verifyBlob(digest string) error {
+	return verifyBlobContext(context.Background(), digest)
+}
+
+func verifyBlobContext(ctx context.Context, digest string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fp, err := manifest.BlobsPath(digest)
 	if err != nil {
 		return err
@@ -1856,10 +1891,12 @@ func verifyBlob(digest string) error {
 	}
 	defer f.Close()
 
-	fileDigest, _ := GetSHA256Digest(f)
+	fileDigest, _, err := hashModelBlob(ctx, f)
+	if err != nil {
+		return err
+	}
 	if digest != fileDigest {
 		return fmt.Errorf("%w: want %s, got %s", errDigestMismatch, digest, fileDigest)
 	}
-
-	return nil
+	return clearBlobVerificationPending(digest)
 }

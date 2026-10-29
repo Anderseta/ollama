@@ -887,12 +887,15 @@ type CopyRequest struct {
 
 // PullRequest is the request passed to [Client.Pull].
 type PullRequest struct {
-	Model    string `json:"model"`
-	Runner   string `json:"runner,omitempty"`
-	Insecure bool   `json:"insecure,omitempty"` // Deprecated: ignored
-	Username string `json:"username"`           // Deprecated: ignored
-	Password string `json:"password"`           // Deprecated: ignored
-	Stream   *bool  `json:"stream,omitempty"`
+	Model                string  `json:"model"`
+	Runner               string  `json:"runner,omitempty"`
+	HuggingFaceFile      string  `json:"hf_file,omitempty"`
+	HuggingFaceProjector *string `json:"hf_projector,omitempty"`
+	HuggingFaceRevision  string  `json:"hf_revision,omitempty"`
+	Insecure             bool    `json:"insecure,omitempty"` // Deprecated: ignored
+	Username             string  `json:"username"`           // Deprecated: ignored
+	Password             string  `json:"password"`           // Deprecated: ignored
+	Stream               *bool   `json:"stream,omitempty"`
 
 	// Deprecated: set the model name with Model instead
 	Name string `json:"name"`
@@ -901,10 +904,15 @@ type PullRequest struct {
 // ProgressResponse is the response passed to progress functions like
 // [PullProgressFunc] and [PushProgressFunc].
 type ProgressResponse struct {
-	Status    string `json:"status"`
-	Digest    string `json:"digest,omitempty"`
-	Total     int64  `json:"total,omitempty"`
-	Completed int64  `json:"completed,omitempty"`
+	Status           string `json:"status"`
+	Digest           string `json:"digest,omitempty"`
+	Total            int64  `json:"total,omitempty"`
+	Completed        int64  `json:"completed,omitempty"`
+	OverallTotal     int64  `json:"overall_total,omitempty"`
+	OverallCompleted int64  `json:"overall_completed,omitempty"`
+	File             string `json:"file,omitempty"`
+	FileIndex        int    `json:"file_index,omitempty"`
+	FileCount        int    `json:"file_count,omitempty"`
 }
 
 // PushRequest is the request passed to [Client.Push].

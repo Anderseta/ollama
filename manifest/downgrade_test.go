@@ -93,7 +93,7 @@ func danglingEntry(t *testing.T, name model.Name) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join("..", "..", "blobs", "sha256-"+strings.Repeat("0", 64)), v2Path); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlink unavailable: %v", err)
 	}
 }
 

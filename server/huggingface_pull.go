@@ -2,11 +2,10 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"log/slog"
+	"math"
 	"os"
 	"path"
 	"regexp"
@@ -28,10 +27,51 @@ type huggingFaceFile struct {
 	} `json:"lfs"`
 }
 
-func selectHuggingFaceGGUF(files []huggingFaceFile, tag string) ([]huggingFaceFile, error) {
-	groups := make(map[string][]huggingFaceFile)
-	var projectors []huggingFaceFile
+func normalizeHuggingFaceFile(file huggingFaceFile) huggingFaceFile {
+	if file.Size == 0 && file.LFS.Size > 0 {
+		file.Size = file.LFS.Size
+	}
+	return file
+}
+
+func validateHuggingFaceFile(file huggingFaceFile) error {
+	if file.Size <= 0 || file.Size != file.LFS.Size || manifest.ValidateDigest("sha256:"+file.LFS.SHA256) != nil {
+		return fmt.Errorf("missing or inconsistent SHA-256/size for %q", file.Filename)
+	}
+	return nil
+}
+
+func huggingFaceFileGroup(filename string) string {
+	if prefix, _, _, split := splitGGUFName(filename); split {
+		return path.Join(path.Dir(filename), prefix)
+	}
+	return filename
+}
+
+func validateHuggingFaceProjector(files []huggingFaceFile) error {
 	for _, file := range files {
+		if err := validateHuggingFaceFile(file); err != nil {
+			return err
+		}
+		if _, _, count, split := splitGGUFName(file.Filename); split && count > 1 {
+			return errors.New("split vision projectors are not supported; choose a single-file mmproj GGUF")
+		}
+	}
+	return nil
+}
+
+func selectHuggingFaceGGUF(files []huggingFaceFile, tag string, choices ...huggingFaceSelection) ([]huggingFaceFile, error) {
+	var choice huggingFaceSelection
+	if len(choices) > 0 {
+		choice = choices[0]
+	}
+	if err := choice.validate(); err != nil {
+		return nil, err
+	}
+	groups := make(map[string][]huggingFaceFile)
+	projectorGroups := map[string][]huggingFaceFile{}
+	for _, file := range files {
+		file = normalizeHuggingFaceFile(file)
 		if !strings.HasSuffix(strings.ToLower(file.Filename), ".gguf") {
 			continue
 		}
@@ -39,23 +79,26 @@ func selectHuggingFaceGGUF(files []huggingFaceFile, tag string) ([]huggingFaceFi
 			return nil, fmt.Errorf("invalid Hugging Face GGUF path: %q", file.Filename)
 		}
 		if strings.HasPrefix(strings.ToLower(path.Base(file.Filename)), "mmproj") {
-			projectors = append(projectors, file)
+			key := huggingFaceFileGroup(file.Filename)
+			projectorGroups[key] = append(projectorGroups[key], file)
 			continue
 		}
-		key := file.Filename
-		if prefix, _, _, split := splitGGUFName(file.Filename); split {
-			key = path.Join(path.Dir(file.Filename), prefix)
-		}
+		key := huggingFaceFileGroup(file.Filename)
 		groups[key] = append(groups[key], file)
 	}
 	var selected []huggingFaceFile
-	quant := regexp.MustCompile(`(?i)(?:^|[-_.])` + regexp.QuoteMeta(tag) + `(?:[-_.]|$)`)
+	var quant *regexp.Regexp
+	if choice.File == "" {
+		quant = regexp.MustCompile(`(?i)(?:^|[-_.])` + regexp.QuoteMeta(tag) + `(?:[-_.]|$)`)
+	}
 	for key, group := range groups {
-		match := quant.MatchString(key)
+		match := quant != nil && quant.MatchString(key)
 		for _, file := range group {
 			match = match || strings.EqualFold(file.Filename, tag)
 		}
-		if strings.EqualFold(tag, "latest") {
+		if choice.File != "" {
+			match = slices.ContainsFunc(group, func(file huggingFaceFile) bool { return file.Filename == choice.File })
+		} else if strings.EqualFold(tag, "latest") {
 			match = len(groups) == 1 || strings.Contains(strings.ToUpper(key), "Q4_K_M")
 		}
 		if !match {
@@ -77,55 +120,86 @@ func selectHuggingFaceGGUF(files []huggingFaceFile, tag string) ([]huggingFaceFi
 			}
 		}
 	}
-	if len(projectors) > 1 {
+	var projectors []huggingFaceFile
+	if choice.Projector != nil {
+		projector := *choice.Projector
+		if projector == "none" || projector == "" {
+			projectors = nil
+		} else {
+			for _, group := range projectorGroups {
+				if slices.ContainsFunc(group, func(file huggingFaceFile) bool { return file.Filename == projector }) {
+					projectors = group
+					break
+				}
+			}
+			if len(projectors) == 0 {
+				return nil, fmt.Errorf("Hugging Face vision projector not found: %q", projector)
+			}
+		}
+	} else if len(projectorGroups) > 1 {
 		return nil, errors.New("multiple Hugging Face vision projectors; import the selected files explicitly")
+	} else {
+		for _, group := range projectorGroups {
+			projectors = group
+		}
+	}
+	if err := validateHuggingFaceProjector(projectors); err != nil {
+		return nil, err
 	}
 	selected = append(selected, projectors...)
 	if len(selected) > maxCreateFiles {
 		return nil, errors.New("too many Hugging Face GGUF files")
 	}
 	for _, file := range selected {
-		if file.Size <= 0 || file.Size != file.LFS.Size || manifest.ValidateDigest("sha256:"+file.LFS.SHA256) != nil {
-			return nil, fmt.Errorf("missing or inconsistent SHA-256/size for %q", file.Filename)
+		if err := validateHuggingFaceFile(file); err != nil {
+			return nil, err
 		}
 	}
 	return selected, nil
 }
 
 func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, options *registryOptions, fn func(api.ProgressResponse)) error {
+	if name.ProtocolScheme == "http" && !options.Insecure {
+		return errInsecureProtocol
+	}
 	if runner != "" && runner != "llamacpp" {
 		return fmt.Errorf("Hugging Face GGUF requires the llamacpp runner, not %q", runner)
 	}
 	fn(api.ProgressResponse{Status: "resolving Hugging Face GGUF shards"})
-	requestURL := name.BaseURL().JoinPath("api/models", name.Namespace, name.Model)
-	requestURL.RawQuery = "blobs=true"
-	response, err := makeRequestWithRetry(ctx, http.MethodGet, requestURL, nil, nil, options)
-	if err != nil {
-		return fmt.Errorf("read Hugging Face file list: %w", err)
-	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, (8<<20)+1))
+	repository, err := readHuggingFaceRepository(ctx, name, options)
 	if err != nil {
 		return err
 	}
-	if len(data) > 8<<20 {
-		return errors.New("Hugging Face file list is too large")
-	}
-	var repository struct {
-		Files []huggingFaceFile `json:"siblings"`
-	}
-	if err := json.Unmarshal(data, &repository); err != nil {
-		return err
-	}
-	files, err := selectHuggingFaceGGUF(repository.Files, name.Tag)
+	files, err := selectHuggingFaceGGUF(repository.Files, name.Tag, options.HuggingFace)
 	if err != nil {
 		return err
 	}
 	oldDigests, _ := manifest.ReferencedBlobDigestsForName(name)
 	local := make(map[string]string, len(files))
+	var total, completed int64
 	for _, file := range files {
+		if file.Size > math.MaxInt64-total {
+			return errors.New("Hugging Face model size exceeds supported range")
+		}
+		total += file.Size
+	}
+	digests := make([]string, 0, len(files))
+	for _, file := range files {
+		digests = append(digests, "sha256:"+file.LFS.SHA256)
+	}
+	if err := manifest.PinDownload(name, digests); err != nil {
+		return err
+	}
+	for index, file := range files {
+		report := func(progress api.ProgressResponse) {
+			progress.OverallTotal = total
+			progress.OverallCompleted = completed + max(0, min(progress.Completed, file.Size))
+			progress.File, progress.FileIndex, progress.FileCount = file.Filename, index+1, len(files)
+			fn(progress)
+		}
+		report(api.ProgressResponse{Status: fmt.Sprintf("downloading Hugging Face file %d/%d: %s", index+1, len(files), file.Filename)})
 		digest := "sha256:" + file.LFS.SHA256
-		cached, err := downloadBlob(ctx, downloadOpts{n: name, digest: digest, regOpts: options, fn: fn})
+		cached, err := downloadBlob(ctx, downloadOpts{n: name, digest: digest, regOpts: options, fn: report})
 		if err != nil {
 			return err
 		}
@@ -141,8 +215,8 @@ func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, op
 			return fmt.Errorf("unexpected size for Hugging Face GGUF %q", file.Filename)
 		}
 		if !cached {
-			fn(api.ProgressResponse{Status: "verifying sha256 digest", Digest: digest})
-			if err := verifyBlob(digest); err != nil {
+			report(api.ProgressResponse{Status: "verifying sha256 digest", Digest: digest, Total: file.Size, Completed: file.Size})
+			if err := verifyBlobContext(ctx, digest); err != nil {
 				if errors.Is(err, errDigestMismatch) {
 					_ = os.Remove(blob)
 					removeGGUFMetadata(digest)
@@ -151,13 +225,22 @@ func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, op
 			}
 		}
 		local[file.Filename] = digest
+		completed += file.Size
 	}
-	layers, err := convertModelFromFiles(ctx, local, fn)
+	finishedDownload := func(progress api.ProgressResponse) {
+		progress.OverallTotal, progress.OverallCompleted = total, completed
+		fn(progress)
+	}
+	finishedDownload(api.ProgressResponse{Status: "importing downloaded Hugging Face model"})
+	layers, err := convertModelFromFiles(ctx, local, finishedDownload)
 	if err != nil {
 		return err
 	}
-	if err := createModel(ctx, api.CreateRequest{Model: name.String(), Files: local}, name, layers, new(model.ConfigV2), fn); err != nil {
+	if err := createModel(ctx, api.CreateRequest{Model: name.String(), Files: local}, name, layers, new(model.ConfigV2), finishedDownload); err != nil {
 		return err
+	}
+	if err := manifest.ReleaseDownloadPin(name); err != nil {
+		slog.Warn("could not release completed Hugging Face download", "model", name.String(), "error", err)
 	}
 	if !envconfig.NoPrune() && len(oldDigests) > 0 {
 		removed, err := manifest.RemoveUnreferencedBlobs(oldDigests...)
@@ -166,6 +249,6 @@ func pullHuggingFaceGGUF(ctx context.Context, name model.Name, runner string, op
 			return err
 		}
 	}
-	fn(api.ProgressResponse{Status: "success"})
+	finishedDownload(api.ProgressResponse{Status: "success"})
 	return nil
 }

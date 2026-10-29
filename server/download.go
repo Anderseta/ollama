@@ -508,6 +508,9 @@ type downloadOpts struct {
 
 // downloadBlob downloads a blob from the registry and stores it in the blobs directory
 func downloadBlob(ctx context.Context, opts downloadOpts) (cacheHit bool, _ error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if opts.digest == "" {
 		return false, fmt.Errorf("%s: %s", opts.n.DisplayNamespaceModel(), "digest is empty")
 	}
@@ -523,6 +526,10 @@ func downloadBlob(ctx context.Context, opts downloadOpts) (cacheHit bool, _ erro
 	case err != nil:
 		return false, err
 	default:
+		pending, err := blobVerificationPending(opts.digest)
+		if err != nil {
+			return false, err
+		}
 		opts.fn(api.ProgressResponse{
 			Status:    fmt.Sprintf("pulling %s", opts.digest[7:19]),
 			Digest:    opts.digest,
@@ -530,12 +537,16 @@ func downloadBlob(ctx context.Context, opts downloadOpts) (cacheHit bool, _ erro
 			Completed: fi.Size(),
 		})
 
-		return true, nil
+		return !pending, nil
 	}
 
 	data, ok := blobDownloadManager.LoadOrStore(opts.digest, &blobDownload{Name: fp, Digest: opts.digest})
 	download := data.(*blobDownload)
 	if !ok {
+		if err := markBlobVerificationPending(opts.digest); err != nil {
+			blobDownloadManager.Delete(opts.digest)
+			return false, err
+		}
 		requestURL := opts.n.BaseURL()
 		requestURL = requestURL.JoinPath("v2", opts.n.DisplayNamespaceModel(), "blobs", opts.digest)
 		if err := download.Prepare(ctx, requestURL, opts.regOpts); err != nil {

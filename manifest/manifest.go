@@ -271,6 +271,9 @@ func RemoveNamed(n model.Name) ([]string, error) {
 	if err := removeNamedManifestPaths(n); err != nil {
 		return nil, err
 	}
+	if err := ReleaseDownloadPin(n); err != nil {
+		return nil, err
+	}
 
 	return RemoveUnreferencedBlobs(candidates...)
 }
@@ -439,7 +442,10 @@ func retainedBlobDigestsLocked() (map[string]struct{}, error) {
 		return nil, err
 	}
 
-	retained := make(map[string]struct{})
+	retained, err := downloadPinnedBlobsLocked()
+	if err != nil {
+		return nil, err
+	}
 	for n, ref := range refs {
 		data, _, digest, err := readVerifiedManifestLocked(ref.path, ref.root)
 		if err != nil {

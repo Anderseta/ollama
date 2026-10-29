@@ -197,6 +197,9 @@ func writeGGUFMetadata(path, blob string, md ggufMetadata) {
 // last reference is gone.
 func removeGGUFMetadata(digests ...string) {
 	for _, digest := range digests {
+		if err := clearBlobVerificationPending(digest); err != nil {
+			slog.Debug("could not remove blob verification marker", "digest", digest, "error", err)
+		}
 		path, err := ggufMetadataPath(digest)
 		if err != nil {
 			continue
