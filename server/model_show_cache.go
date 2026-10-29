@@ -570,6 +570,13 @@ func cloneMessages(in []api.Message) []api.Message {
 			}
 		}
 		out[i].ToolCalls = slices.Clone(msg.ToolCalls)
+		for j := range out[i].ToolCalls {
+			var args api.ToolCallFunctionArguments
+			for key, value := range msg.ToolCalls[j].Function.Arguments.All() {
+				args.Set(key, cloneAny(value))
+			}
+			out[i].ToolCalls[j].Function.Arguments = args
+		}
 	}
 	return out
 }

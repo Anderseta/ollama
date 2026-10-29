@@ -29,10 +29,11 @@ const (
 )
 
 type Qwen3CoderParser struct {
-	state     qwenParserState
-	acc       strings.Builder
-	tools     []api.Tool
-	callIndex int
+	state                qwenParserState
+	acc                  strings.Builder
+	tools                []api.Tool
+	callIndex            int
+	toolCloseSearchStart int
 }
 
 func (p *Qwen3CoderParser) HasToolSupport() bool {
@@ -55,6 +56,9 @@ func (p *Qwen3CoderParser) PreservedTokens() []string {
 }
 
 func (p *Qwen3CoderParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
+	p.acc.Reset()
+	p.state = qwenParserState_LookingForToolStart
+	p.toolCloseSearchStart = 0
 	p.tools = tools
 	p.callIndex = 0
 	return tools // Qwen doesn't modify tools
@@ -75,6 +79,7 @@ func (p *Qwen3CoderParser) Add(s string, done bool) (content string, thinking st
 		}
 		p.acc.Reset()
 		p.state = qwenParserState_LookingForToolStart
+		p.toolCloseSearchStart = 0
 	}
 
 	var toolCalls []api.ToolCall
@@ -164,6 +169,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			p.acc.Reset()
 			p.acc.WriteString(after)
 			p.state = qwenParserState_CollectingToolContent
+			p.toolCloseSearchStart = 0
 			return events, true
 		} else if overlap := overlap(p.acc.String(), toolOpenTag); overlap > 0 {
 			// we found a partial tool open tag, so we can emit the unambiguous part,
@@ -195,24 +201,25 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			return events, false
 		}
 	case qwenParserState_CollectingToolContent:
-		if strings.Contains(p.acc.String(), toolCloseTag) {
-			split := strings.SplitN(p.acc.String(), toolCloseTag, 2)
-			before := split[0]
+		acc := p.acc.String()
+		if index := strings.Index(acc[p.toolCloseSearchStart:], toolCloseTag); index >= 0 {
+			index += p.toolCloseSearchStart
+			before := acc[:index]
 			if len(before) == 0 {
 				slog.Warn("qwen tool call closing tag found but no content before it")
 			}
 			// remove any whitespace between the tool call and any content after it
-			after := strings.TrimLeftFunc(split[1], unicode.IsSpace)
+			after := strings.TrimLeftFunc(acc[index+len(toolCloseTag):], unicode.IsSpace)
 			p.acc.Reset()
 			p.acc.WriteString(after)
 			events = append(events, qwenEventRawToolCall{raw: before})
 			p.state = qwenParserState_LookingForToolStart
+			p.toolCloseSearchStart = 0
 			return events, true
 		} else {
-			// note that we don't need to check the overlap here because we only plan
-			// on parsing the tool call once we see the full closing tag. We don't
-			// stream back the unparsed tool content, so there's no need to be eager
-			// here
+			// Tool content is append-only until the closing tag. Revisit just the
+			// possible split-tag suffix instead of rescanning the entire call.
+			p.toolCloseSearchStart = max(0, len(acc)-len(toolCloseTag)+1)
 			return events, false
 		}
 	default:

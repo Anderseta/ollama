@@ -1,0 +1,366 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -517,7 +517,7 @@
+ }
+ 
+ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+-    return new common_sampler {
++    auto * result = new common_sampler {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+@@ -527,6 +527,8 @@
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
+     };
++    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
++    return result;
+ }
+ 
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+@@ -545,7 +547,7 @@
+     dst->prev       = src->prev;
+     dst->cur        = src->cur;
+     dst->cur_p      = src->cur_p;
+-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
++    dst->cur_p.data = src->cur_p.data ? dst->cur.data() + (src->cur_p.data - src->cur.data()) : nullptr;
+     dst->rng        = src->rng;
+     dst->t_total_us = src->t_total_us;
+ }
+@@ -608,9 +610,7 @@
+     return gsmpl && gsmpl->params.backend_sampling && !gsmpl->grmr && !gsmpl->rbudget ? gsmpl->chain : nullptr;
+ }
+ 
+-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+-    llama_synchronize(ctx);
+-
++static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
+@@ -698,6 +698,11 @@
+     return id;
+ }
+ 
++llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
++    llama_synchronize(ctx);
++    return common_sampler_sample_synchronized(gsmpl, ctx, idx, grammar_first);
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+@@ -706,9 +711,13 @@
+ 
+     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+ 
++    // All rows belong to the same completed decode. Sampling and acceptance
++    // update only host sampler state; no context work is submitted between rows.
++    llama_synchronize(ctx);
++
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+@@ -722,7 +731,7 @@
+     }
+ 
+     if (i == draft.size()) {
+-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+@@ -757,11 +766,14 @@
+     std::vector<llama_token_data> residual;
+ 
+     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
++    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++
++    llama_synchronize(ctx);
+ 
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+         // leaves the target distribution in the candidate array
+-        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id_tgt = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
+ 
+         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+         const auto & q     = draft_q[i];
+@@ -806,6 +818,9 @@
+         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+             common_sampler_accept(gsmpl, draft[i], true);
+             result.push_back(draft[i]);
++            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
++                break;
++            }
+             continue;
+         }
+ 
+@@ -840,7 +855,7 @@
+     }
+ 
+     if (i == draft.size()) {
+-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -11,6 +11,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
++#include <random>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -219,8 +220,8 @@
+         if (budget) { llama_sampler_accept(budget.get(), token); }
+     }
+ 
+-    llama_token sample(llama_context * context, int index, bool grammar_first) {
+-        auto output = legacy_output(context, index);
++    llama_token sample(llama_context * context, int index, bool grammar_first, bool legacy_getters = true) {
++        auto output = legacy_getters ? legacy_output(context, index) : llama_get_sampler_output_ith(context, index);
+         auto reset = [&] { cur = candidates(output); current = {cur.data(), cur.size(), -1, false}; };
+         reset();
+         if (output.sampled_token != LLAMA_TOKEN_NULL) {
+@@ -300,6 +301,193 @@
+             same_candidates(reference.current, *common_sampler_get_candidates(next.get(), false));
+             reference.accept(expected); common_sampler_accept(next.get(), actual, true);
+         }
++    }
++}
++
++static void sampler_candidate_ownership(llama_model * model, common_params_sampling params) {
++    auto context = fixture_context(model);
++    common_sampler_ptr source(common_sampler_init(model, params));
++    common_sampler_ptr empty(common_sampler_clone(source.get()));
++    require(!common_sampler_get_candidates(empty.get(), false)->data, "empty clone has candidate storage");
++    common_batch batch(context.get()); batch.add(3 + 'x', 0, 0, true);
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "clone fixture decode failed");
++    common_sampler_sample(source.get(), context.get(), 0);
++    auto * candidates = common_sampler_get_candidates(source.get(), false);
++    require(candidates->size > 2, "clone fixture needs several candidates");
++    // XTC can retain an interior candidate window instead of the vector base.
++    candidates->data += 1; candidates->size -= 1; candidates->selected = 0;
++    std::vector<llama_token_data> expected(candidates->data, candidates->data + candidates->size);
++    common_sampler_ptr cloned(common_sampler_clone(source.get()));
++    common_sampler_ptr copied(common_sampler_init(model, params));
++    common_sampler_copy(source.get(), copied.get());
++    for (auto * sampler : {cloned.get(), copied.get()}) {
++        const auto * actual = common_sampler_get_candidates(sampler, false);
++        require(actual->data != candidates->data, "copied candidates still alias source");
++        same_candidates(*candidates, *actual);
++    }
++    candidates->data[0].id = LLAMA_TOKEN_NULL;
++    source.reset();
++    for (auto * sampler : {cloned.get(), copied.get()}) {
++        const auto * actual = common_sampler_get_candidates(sampler, false);
++        require(actual->size == expected.size(), "candidate window size changed");
++        require(std::memcmp(actual->data, expected.data(), expected.size() * sizeof(llama_token_data)) == 0,
++                "cloned/copied candidate window changed after source mutation/destruction");
++    }
++}
++
++static void sort_reference_candidates(reference_sampler & sampler) {
++    auto & cur = sampler.current;
++    if (cur.sorted) { return; }
++    const llama_token selected = cur.data[cur.selected].id;
++    std::sort(cur.data, cur.data + cur.size, [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
++    for (size_t i = 0; i < cur.size; ++i) { if (cur.data[i].id == selected) { cur.selected = i; break; } }
++    cur.sorted = true;
++}
++
++static std::vector<llama_token> reference_batch(reference_sampler & sampler, llama_context * context,
++        const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
++    std::vector<llama_token> result;
++    const auto * vocab = llama_model_get_vocab(llama_get_model(context));
++    size_t i = 0;
++    for (; i < draft.size(); ++i) {
++        const auto token = sampler.sample(context, idxs[i], grammar_first, false);
++        sampler.accept(token); result.push_back(token);
++        if (token != draft[i] || (llama_vocab_is_eog(vocab, token) && i + 1 < draft.size())) { break; }
++    }
++    if (i == draft.size()) { const auto token = sampler.sample(context, idxs[i], grammar_first, false); sampler.accept(token); result.push_back(token); }
++    return result;
++}
++
++static std::vector<llama_token> reference_batch_rejection(reference_sampler & sampler, std::mt19937 & rng,
++        llama_context * context, const std::vector<int> & idxs, const llama_tokens & draft,
++        const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
++    std::vector<llama_token> result;
++    std::uniform_real_distribution<float> uni(0.f, 1.f);
++    auto probability = [](const std::vector<llama_token_data> & values, llama_token id) {
++        for (const auto & entry : values) { if (entry.id == id) { return entry.p; } }
++        return 0.f;
++    };
++    size_t i = 0;
++    for (; i < draft.size(); ++i) {
++        const auto fallback = sampler.sample(context, idxs[i], grammar_first, false);
++        sort_reference_candidates(sampler);
++        auto & cur = sampler.current;
++        std::vector<llama_token_data> masked;
++        const bool apply_mask = !grammar_first && bool(sampler.grammar);
++        if (apply_mask) {
++            masked.assign(cur.data, cur.data + cur.size);
++            llama_token_data_array arr{masked.data(), masked.size(), -1, false};
++            llama_sampler_apply(sampler.grammar.get(), &arr);
++        }
++        auto p_raw = [&](size_t k) { return apply_mask && masked[k].logit == -INFINITY ? 0.f : cur.data[k].p; };
++        float p_sum = 0.f;
++        if (apply_mask) { for (size_t k = 0; k < cur.size; ++k) { p_sum += p_raw(k); } }
++        const float p_norm = apply_mask && p_sum > 0.f ? 1.f / p_sum : 1.f;
++        auto p_of = [&](size_t k) { return p_raw(k) * p_norm; };
++        const float q_x = probability(draft_q[i], draft[i]);
++        float p_x = 0.f;
++        for (size_t k = 0; k < cur.size; ++k) { if (cur.data[k].id == draft[i]) { p_x = p_of(k); break; } }
++        if (q_x > 0.f && (p_x >= q_x || uni(rng) < p_x / q_x)) {
++            sampler.accept(draft[i]); result.push_back(draft[i]); continue;
++        }
++        std::vector<llama_token_data> residual;
++        float sum = 0.f;
++        for (size_t k = 0; k < cur.size; ++k) {
++            const float r = p_of(k) - probability(draft_q[i], cur.data[k].id);
++            if (r > 0.f) { residual.push_back({cur.data[k].id, 0.f, r}); sum += r; }
++        }
++        llama_token token = fallback;
++        if (sum > 0.f) {
++            float u = uni(rng) * sum; token = residual.back().id;
++            for (const auto & entry : residual) { u -= entry.p; if (u <= 0.f) { token = entry.id; break; } }
++        }
++        sampler.accept(token); result.push_back(token); break;
++    }
++    if (i == draft.size()) { const auto token = sampler.sample(context, idxs[i], grammar_first, false); sampler.accept(token); result.push_back(token); }
++    return result;
++}
++
++static void run_batch(llama_model * model, const char * name, common_params_sampling params, bool grammar_first = false) {
++    std::fprintf(stderr, "sampler-batch-view: %s\n", name);
++    for (bool rejection : {false, true}) {
++        for (int mismatch : {-1, 0, 1}) {
++            auto left = fixture_context(model), right = fixture_context(model);
++            reference_sampler reference(model, params);
++            auto next_params = params;
++            common_sampler_ptr next(common_sampler_init(model, next_params));
++            require(llama_set_sampler(left.get(), 0, common_sampler_get_backend(reference.chain.get())) &&
++                    llama_set_sampler(right.get(), 0, common_sampler_get_backend(next.get())), "batch backend registration failed");
++            if (!params.reasoning_budget_start.empty()) {
++                reference.accept(params.reasoning_budget_start.front());
++                common_sampler_accept(next.get(), params.reasoning_budget_start.front(), true);
++            }
++            common_batch a(left.get()), b(right.get());
++            for (auto * batch : {&a, &b}) {
++                batch->add(3 + 'x', 0, 0, true); batch->add(3 + 'y', 1, 0, false);
++                batch->add(3 + 'z', 2, 0, true); batch->add(3 + 'w', 3, 0, true);
++            }
++            require(llama_process(left.get(), LLAMA_PROCESS_TYPE_DECODE, a.get()) == 0 &&
++                    llama_process(right.get(), LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "batch sparse decode failed");
++            const std::vector<int> idxs{0, 2, -1};
++            common_sampler_ptr preview(common_sampler_clone(next.get()));
++            llama_tokens draft;
++            std::vector<std::vector<llama_token_data>> draft_q;
++            for (int i = 0; i < 2; ++i) {
++                const auto token = common_sampler_sample(preview.get(), right.get(), idxs[i], grammar_first);
++                const auto * candidates = common_sampler_get_candidates(preview.get(), true);
++                draft.push_back(token); draft_q.emplace_back(candidates->data, candidates->data + candidates->size);
++                common_sampler_accept(preview.get(), token, true);
++            }
++            if (mismatch >= 0) { draft[mismatch] = 0; draft_q[mismatch] = {{0, 0.f, 1.f}}; }
++            std::mt19937 rng(common_sampler_get_seed(reference.chain.get()) ^ 0x9e3779b9u);
++            synchronizations = 0;
++            const auto expected = rejection ? reference_batch_rejection(reference, rng, left.get(), idxs, draft, draft_q, grammar_first) :
++                                              reference_batch(reference, left.get(), idxs, draft, grammar_first);
++            const auto old_fences = synchronizations.load();
++            synchronizations = 0;
++            const auto actual = rejection ? common_sampler_sample_and_accept_n_rejection(next.get(), right.get(), idxs, draft, draft_q, grammar_first) :
++                                            common_sampler_sample_and_accept_n(next.get(), right.get(), idxs, draft, grammar_first);
++            require(synchronizations.load() == 1, "batch sampling did not use exactly one context fence");
++            require(old_fences == expected.size(), "reference did not fence once per output token");
++            require(expected == actual, "batch sampling changed accepted tokens");
++            same_candidates(reference.current, *common_sampler_get_candidates(next.get(), false));
++            require(common_sampler_last(next.get()) == expected.back(), "batch acceptance history changed");
++            // The next sample also checks continued sampler/grammar/reasoning RNG state.
++            require(reference.sample(left.get(), -1, grammar_first) == common_sampler_sample(next.get(), right.get(), -1, grammar_first),
++                    "batch sampling changed subsequent sampler state");
++        }
++    }
++}
++
++static void batch_eog(llama_model * model, common_params_sampling params) {
++    auto context = fixture_context(model);
++    const auto eog = llama_vocab_eos(llama_model_get_vocab(model));
++    params.logit_bias = {{eog, 100.f}};
++    common_batch batch(context.get());
++    for (int i = 0; i < 3; ++i) { batch.add(3 + 'x', i, 0, true); }
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "EOG fixture decode failed");
++    const std::vector<int> idxs{0, 1, 2};
++    const llama_tokens draft{eog, 3 + 'A'};
++    const std::vector<std::vector<llama_token_data>> q{{{eog, 0.f, 1.f}}, {{3 + 'A', 0.f, 1.f}}};
++    reference_sampler old(model, params);
++    std::mt19937 rng(common_sampler_get_seed(old.chain.get()) ^ 0x9e3779b9u);
++    require(reference_batch_rejection(old, rng, context.get(), idxs, draft, q, false).size() > 1,
++            "legacy rejection did not demonstrate acceptance after EOG");
++    for (bool rejection : {false, true}) {
++        common_sampler_ptr sampler(common_sampler_init(model, params));
++        synchronizations = 0;
++        const auto actual = rejection ? common_sampler_sample_and_accept_n_rejection(sampler.get(), context.get(), idxs, draft, q) :
++                                        common_sampler_sample_and_accept_n(sampler.get(), context.get(), idxs, draft);
++        require(synchronizations.load() == 1 && actual == llama_tokens{eog}, "batch accepted tokens after early EOG");
++        require(common_sampler_last(sampler.get()) == eog, "post-EOG token contaminated sampler history");
++        // A trailing EOG can be the target token of an existing replay. Preserve
++        // the matching verifier's established behavior for that case.
++        common_sampler_reset(sampler.get());
++        const std::vector<int> trailing_idxs{0, 1};
++        const llama_tokens trailing_draft{eog};
++        const auto trailing = rejection ? common_sampler_sample_and_accept_n_rejection(sampler.get(), context.get(), trailing_idxs, trailing_draft, {q[0]}) :
++                                          common_sampler_sample_and_accept_n(sampler.get(), context.get(), trailing_idxs, trailing_draft);
++        require(trailing == llama_tokens({eog, eog}), "trailing replay EOG behavior changed");
+     }
+ }
+ 
+@@ -319,6 +507,28 @@
+         params.seed = 424242; params.temp = .7f; params.top_k = 20; params.top_p = .9f;
+         params.penalty_repeat = 1.f; params.penalty_freq = params.penalty_present = 0.f;
+         params.no_perf = true;
++        sampler_candidate_ownership(model.get(), params);
++        batch_eog(model.get(), params);
++        auto batch_params = params;
++        batch_params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
++        run_batch(model.get(), "CPU seeded matching/rejection", batch_params);
++        batch_params.temp = 0;
++        run_batch(model.get(), "CPU greedy matching/rejection", batch_params);
++        batch_params.temp = .7f;
++        batch_params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [A-Z]+\n");
++        run_batch(model.get(), "grammar rejection", batch_params);
++        run_batch(model.get(), "grammar first", batch_params, true);
++        batch_params.grammar = {};
++        batch_params.reasoning_budget_tokens = 2;
++        batch_params.reasoning_budget_start = {3 + '['}; batch_params.reasoning_budget_end = {{3 + ']'}};
++        batch_params.reasoning_budget_forced = {3 + ']'};
++        run_batch(model.get(), "reasoning forced end", batch_params);
++        batch_params.reasoning_budget_start.clear(); batch_params.reasoning_budget_end.clear(); batch_params.reasoning_budget_forced.clear();
++        batch_params.reasoning_budget_tokens = -1;
++        batch_params.backend_sampling = true;
++        run_batch(model.get(), "backend seeded matching/rejection", batch_params);
++        batch_params.temp = 0;
++        run_batch(model.get(), "backend greedy matching/rejection", batch_params);
+         run(model.get(), "CPU seeded", params);
+         params.temp = 0;
+         run(model.get(), "CPU greedy", params);
+@@ -338,7 +548,7 @@
+         run(model.get(), "backend seeded", params);
+         params.temp = 0;
+         run(model.get(), "backend greedy", params);
+-        std::puts("PASS: exact legacy output views, positive/negative rows, CPU/backend tokens, greedy/seed/grammar/reasoning, candidates and six-to-one backend fences");
++        std::puts("PASS: exact CPU/backend tokens and candidates, sparse rows, grammar/reasoning/RNG, single-row output views, one fence per batch, early EOG and owned candidate windows");
+         return 0;
+     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
+ }

@@ -102,6 +102,12 @@ type qwen35EventThinkingContent struct {
 func (qwen35EventThinkingContent) isQwen35Event() {}
 
 func (p *Qwen35Parser) Add(s string, done bool) (content string, thinking string, calls []api.ToolCall, err error) {
+	// After thinking ends, the tool parser owns the remaining stream, including
+	// an empty terminal chunk that must drain its buffered content.
+	if p.state == qwen35ParserStateCollectingContent && p.buffer.Len() == 0 {
+		return p.toolParser.Add(s, done)
+	}
+
 	p.buffer.WriteString(s)
 	events := p.parseEvents()
 

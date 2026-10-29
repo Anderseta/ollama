@@ -1,0 +1,402 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-29",
+  "artifact": "speculative_batch_sampling_streaming_tool_parsing_and_state_isolation",
+  "status": "passed",
+  "base_commit": "53ccbee0383d33d8106535bba0499ee2e9d9f3ff",
+  "native_base": "llama.cpp b11845 plus WildLlama patches 001-021",
+  "scope": "Windows CPU and small synthetic CUDA fixtures. No large model loaded or new model tokens/s measurement.",
+  "changes": {
+    "verification_batch": {
+      "context_fences_before": "one per sampled row",
+      "context_fences_after": "one per batch",
+      "host_setup_can_still_overlap_decode": true,
+      "standalone_sample_still_fenced": true
+    },
+    "sampler_state": {
+      "clone_and_copy_own_candidate_storage": true,
+      "interior_candidate_windows_preserved": true,
+      "accepted_early_eog_stops_unreachable_draft_acceptance": true,
+      "existing_trailing_eog_replay_preserved": true
+    },
+    "qwen_stream_parser": {
+      "closing_tag_search": "incremental with split-tag suffix overlap",
+      "qwen35_content_delegates_directly_after_thinking": true,
+      "empty_terminal_chunk_drains_pending_tool_text": true,
+      "incomplete_calls_not_executed": true,
+      "init_discards_previous_incomplete_stream": true
+    },
+    "vram_recovery": {
+      "unsigned_underflow_guard": true,
+      "runner_devices_only": true,
+      "missing_readings_inconclusive": true,
+      "baseline_discovery_uses_timeout": true
+    },
+    "model_show_cache": {
+      "deep_tool_arguments_and_nested_json_isolation": true,
+      "insertion_order_preserved": true
+    }
+  },
+  "validation": {
+    "go_complete_packages": [
+      "server",
+      "llm",
+      "model/parsers",
+      "model/renderers"
+    ],
+    "go_focused_scheduler_and_cache_race": "passed",
+    "go_release_build_and_cli_help": "passed",
+    "native_cpu": {
+      "passed": 21,
+      "failed": 0,
+      "tests": [
+        "cuda-tuning-policy",
+        "moe-admission",
+        "moe-budget",
+        "moe-partition",
+        "moe-readiness",
+        "moe-read-plan",
+        "moe-copy-plan",
+        "moe-work-batch",
+        "moe-ram-admission",
+        "moe-packed-rows",
+        "moe-expert-plan",
+        "speculative-depth",
+        "state-transfer",
+        "scheduler-exceptions",
+        "prepare-async",
+        "test-kv-trim-ranges",
+        "test-prompt-state-transaction",
+        "mtp-state",
+        "mtp-carry-state",
+        "sampler-output-view",
+        "cuda-graph-reuse-policy"
+      ]
+    },
+    "native_sampler_batch_cases": 42,
+    "native_sampler_equivalence": "Exact tokens, candidate metadata/probabilities and subsequent RNG/controller state for CPU/backend seeded/greedy, sparse signed rows, grammar modes and reasoning budgets.",
+    "native_server_components": {
+      "passed": 44,
+      "assertions": 184,
+      "failed": 0
+    },
+    "native_cuda": {
+      "passed": 4,
+      "failed": 0,
+      "tests": [
+        "cuda-dense",
+        "dense-embedding",
+        "cuda-graph-reuse",
+        "cuda-graph-reuse-disabled"
+      ]
+    },
+    "cuda_custom_host_provider_failure_recovery": "passed",
+    "cpu_http_before_after": {
+      "status": "passed",
+      "fixture_bytes": 28628288,
+      "cases_per_payload": 8,
+      "cpu_only": true,
+      "content_tokens_probabilities_equal": true,
+      "outputs_sha256": "156cb87235ab35e1fd290a9a50a24b7eb236ec5e3874a1aace873a1376cafb47",
+      "large_model_loaded": false,
+      "throughput_measured": false
+    },
+    "patch_replay": {
+      "patches": [
+        "001-llama-cpp-hooks.patch",
+        "002-moe-ram-limit.patch",
+        "003-runtime-performance.patch",
+        "004-gpu-first-moe.patch",
+        "005-live-runtime-activity.patch",
+        "006-moe-residency-pipeline.patch",
+        "007-dense-runtime.patch",
+        "008-runtime-efficiency.patch",
+        "009-bounded-copy-pipeline.patch",
+        "010-scheduler-exception-contract.patch",
+        "011-moe-read-and-execution-batching.patch",
+        "012-expert-major-and-packed-rows.patch",
+        "013-resident-gpu-tuning.patch",
+        "014-kv-reclamation-and-prompt-state.patch",
+        "015-mtp-checkpoint-state.patch",
+        "016-tuning-reuse.patch",
+        "017-sampler-output-view.patch",
+        "018-speculative-round-efficiency.patch",
+        "019-cuda-graph-reuse.patch",
+        "020-checkpoint-restore-transaction.patch",
+        "021-sampler-batch-fences-and-owned-candidates.patch"
+      ],
+      "files": 126,
+      "comparison": "exact UTF-8 text with CRLF/LF normalized",
+      "line_ending_only_differences": [
+        "src/llama-model-ram.cpp",
+        "src/llama-moe-cache.cpp",
+        "src/llama-state-transfer.h",
+        "tests/test-state-transfer.cpp"
+      ],
+      "fresh_apply_passed": true,
+      "second_apply_passed": true
+    },
+    "build_source_integrity": "Native sources, compatibility patches and fixture sources stable across final build."
+  },
+  "parser_microbenchmark": {
+    "cpu": "AMD Ryzen 5 2600",
+    "gomaxprocs": 2,
+    "chunk_bytes": 32,
+    "sample_duration": "750ms",
+    "execution_order": [
+      "before",
+      "after",
+      "after",
+      "before"
+    ],
+    "samples_per_variant": 2,
+    "comparison": "Prebuilt test executables, same benchmark; baseline source overlay from base_commit.",
+    "not_model_tokens_per_second": true,
+    "results": {
+      "qwen3-coder/256KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 4275757,
+              "allocations_per_op": 177,
+              "ns_per_op": 49274083
+            },
+            {
+              "bytes_per_op": 4271682,
+              "allocations_per_op": 170,
+              "ns_per_op": 37942375
+            }
+          ],
+          "median_ns_per_op": 43608229.0,
+          "median_bytes_per_op": 4273719.5,
+          "median_allocations_per_op": 173.5
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 4277460,
+              "allocations_per_op": 175,
+              "ns_per_op": 8322470
+            },
+            {
+              "bytes_per_op": 4277343,
+              "allocations_per_op": 176,
+              "ns_per_op": 9613289
+            }
+          ],
+          "median_ns_per_op": 8967879.5,
+          "median_bytes_per_op": 4277401.5,
+          "median_allocations_per_op": 175.5
+        },
+        "parsing_speed_ratio": 4.863
+      },
+      "qwen3-coder/64KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 1068018,
+              "allocations_per_op": 141,
+              "ns_per_op": 4103763
+            },
+            {
+              "bytes_per_op": 1066782,
+              "allocations_per_op": 139,
+              "ns_per_op": 3847014
+            }
+          ],
+          "median_ns_per_op": 3975388.5,
+          "median_bytes_per_op": 1067400.0,
+          "median_allocations_per_op": 140.0
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 1066644,
+              "allocations_per_op": 139,
+              "ns_per_op": 2122889
+            },
+            {
+              "bytes_per_op": 1066773,
+              "allocations_per_op": 139,
+              "ns_per_op": 2467414
+            }
+          ],
+          "median_ns_per_op": 2295151.5,
+          "median_bytes_per_op": 1066708.5,
+          "median_allocations_per_op": 139.0
+        },
+        "parsing_speed_ratio": 1.732
+      },
+      "qwen3-coder/8KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 133654,
+              "allocations_per_op": 115,
+              "ns_per_op": 332626
+            },
+            {
+              "bytes_per_op": 133704,
+              "allocations_per_op": 115,
+              "ns_per_op": 305522
+            }
+          ],
+          "median_ns_per_op": 319074.0,
+          "median_bytes_per_op": 133679.0,
+          "median_allocations_per_op": 115.0
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 133595,
+              "allocations_per_op": 114,
+              "ns_per_op": 282202
+            },
+            {
+              "bytes_per_op": 133612,
+              "allocations_per_op": 114,
+              "ns_per_op": 327346
+            }
+          ],
+          "median_ns_per_op": 304774.0,
+          "median_bytes_per_op": 133603.5,
+          "median_allocations_per_op": 114.0
+        },
+        "parsing_speed_ratio": 1.047
+      },
+      "qwen3.5/256KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 5132627,
+              "allocations_per_op": 41155,
+              "ns_per_op": 50926339
+            },
+            {
+              "bytes_per_op": 5132306,
+              "allocations_per_op": 41154,
+              "ns_per_op": 40794575
+            }
+          ],
+          "median_ns_per_op": 45860457.0,
+          "median_bytes_per_op": 5132466.5,
+          "median_allocations_per_op": 41154.5
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 4276191,
+              "allocations_per_op": 174,
+              "ns_per_op": 8459273
+            },
+            {
+              "bytes_per_op": 4276298,
+              "allocations_per_op": 174,
+              "ns_per_op": 10155860
+            }
+          ],
+          "median_ns_per_op": 9307566.5,
+          "median_bytes_per_op": 4276244.5,
+          "median_allocations_per_op": 174.0
+        },
+        "parsing_speed_ratio": 4.927
+      },
+      "qwen3.5/64KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 1283828,
+              "allocations_per_op": 10398,
+              "ns_per_op": 5193469
+            },
+            {
+              "bytes_per_op": 1286270,
+              "allocations_per_op": 10400,
+              "ns_per_op": 4380319
+            }
+          ],
+          "median_ns_per_op": 4786894.0,
+          "median_bytes_per_op": 1285049.0,
+          "median_allocations_per_op": 10399.0
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 1067414,
+              "allocations_per_op": 139,
+              "ns_per_op": 2181440
+            },
+            {
+              "bytes_per_op": 1066872,
+              "allocations_per_op": 139,
+              "ns_per_op": 2225171
+            }
+          ],
+          "median_ns_per_op": 2203305.5,
+          "median_bytes_per_op": 1067143.0,
+          "median_allocations_per_op": 139.0
+        },
+        "parsing_speed_ratio": 2.173
+      },
+      "qwen3.5/8KiB": {
+        "before": {
+          "samples": [
+            {
+              "bytes_per_op": 161133,
+              "allocations_per_op": 1412,
+              "ns_per_op": 415100
+            },
+            {
+              "bytes_per_op": 161025,
+              "allocations_per_op": 1412,
+              "ns_per_op": 381910
+            }
+          ],
+          "median_ns_per_op": 398505.0,
+          "median_bytes_per_op": 161079.0,
+          "median_allocations_per_op": 1412.0
+        },
+        "after": {
+          "samples": [
+            {
+              "bytes_per_op": 133473,
+              "allocations_per_op": 114,
+              "ns_per_op": 290852
+            },
+            {
+              "bytes_per_op": 133513,
+              "allocations_per_op": 114,
+              "ns_per_op": 304449
+            }
+          ],
+          "median_ns_per_op": 297650.5,
+          "median_bytes_per_op": 133493.0,
+          "median_allocations_per_op": 114.0
+        },
+        "parsing_speed_ratio": 1.339
+      }
+    },
+    "limits": "Synthetic tool arguments; timing varies with background load. Bytes/op measure transient parser allocations, not model RAM."
+  },
+  "build": {
+    "go": "1.26.10",
+    "native_cuda_toolkit": "12.8",
+    "cuda_architecture": "120",
+    "go_package_parallelism": 1,
+    "native_parallelism": 1,
+    "outputs_and_caches": "G:",
+    "new_tools_installed": false
+  },
+  "payload_sha256": {
+    "ollama.exe": "0c82e884b71cf3b31d8853a0eceaf8c08d98a918a879b6be96d3536716f2637a",
+    "lib/ollama/llama-common.dll": "cd201d1ae4691ef60e0047199f5cb905b95ac356a9d98a8b13185a30176ebc28",
+    "lib/ollama/llama-server-impl.dll": "93c036a8417af65eafe8e8373ee92b87339f3a3c03ee7b7f599828376ed8d43d",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "7acf6c738f00549b08b9786d1e298b2d3a040cec2e932c52c3e13636aa6ab7be"
+  },
+  "limits": [
+    "Windows execution only; Linux/HIP/MUSA not runtime-tested this round.",
+    "Existing MoE read/upload paths were audited without speculative changes.",
+    "Weights, quantization, requested context and saved profiles are unchanged.",
+    "Exact small-fixture comparisons do not establish quality or throughput for every model."
+  ]
+}

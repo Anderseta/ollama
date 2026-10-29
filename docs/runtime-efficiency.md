@@ -556,3 +556,70 @@ Eight before/after HTTP cases with a 27.3 MiB artificial CPU model retain
 identical text, generated token IDs and probabilities. No model weights,
 quantization, requested context or saved profiles changed. These tests
 establish component behavior; they do not claim a new Qwen tokens/s result.
+
+## Speculative verification, streaming tools and state isolation
+
+### Synchronize once for a verification batch
+
+Patch `021` extends the synchronized sampling view to speculative verification.
+All rows in a verification batch come from the same decode; sampling and token
+acceptance update host state without submitting more context work. Matching
+and probabilistic rejection verification now synchronize once for that batch,
+instead of once per sampled row. Standalone sampling still synchronizes before
+reading outputs. Sampling timers continue to exclude the initial device wait.
+
+Candidate order, probabilities, grammar rejection, reasoning budgets and RNG
+consumption remain unchanged on ordinary successful paths. Candidate buffers
+in cloned/copied samplers now belong to the destination, preserving an interior
+window such as one selected by XTC. A clone no longer references its source's
+storage; copying no longer silently resets that window to the vector base.
+
+Probabilistic verification also stops at an accepted end-of-generation token
+when more draft tokens follow, matching the existing matching verifier. Those
+unreachable tokens no longer contaminate sampler history. The existing trailing
+end-token replay behavior is preserved and tested separately from equivalence
+comparisons of ordinary paths.
+
+### Avoid quadratic scanning of streamed Qwen tool calls
+
+The Qwen3-Coder tool parser, also used by Qwen3.5, previously searched the full
+accumulated call for its closing tag after every received chunk. Large arguments
+therefore caused quadratic scanning. It now resumes at the unexamined suffix,
+retaining the overlap needed for a closing tag split across chunks. Complete
+arguments are still buffered and parsed with the same XML and value conversion.
+
+Once reasoning ends, Qwen3.5 delegates directly to the tool parser instead of
+rebuilding intermediate content events for each chunk. An empty terminal chunk
+also drains pending text, trailing whitespace and incomplete call text through
+the existing fallback; incomplete calls are not executed. Reinitializing the
+Qwen3-Coder parser clears an unfinished previous stream.
+
+These changes reduce host parsing work and transient allocations. The benchmark
+uses artificial tool arguments and measures parsing, not model token throughput.
+It does not change generation settings, weights, quantization or context.
+
+In the local before/after/after/before microbenchmark, parsing 256 KiB arguments
+in 32-byte chunks took a median 43.61 → 8.97 ms for Qwen3-Coder and
+45.86 → 9.31 ms for Qwen3.5 (about 4.9× faster). Qwen3.5's transient allocation
+count fell from approximately 41,155 to 174 per call. These are component
+measurements with artificial arguments, not end-to-end generation claims.
+
+### Keep memory recovery and cached responses isolated
+
+GPU memory recovery now checks the runner's own devices. A decrease in free
+memory cannot wrap an unsigned subtraction and falsely report recovery, and a
+release on an unrelated GPU cannot satisfy the check. Missing device readings
+remain inconclusive. Baseline discovery shares the bounded recovery deadline.
+
+Cached `/api/show` responses now deep-copy ordered tool arguments and nested
+JSON values, preserving insertion order. Mutating one returned response cannot
+change another response or the stored model metadata.
+
+The [validation record](benchmarks/runtime-refinements-20261029.json) includes
+the four complete Go package suites, focused race tests, 21 native CPU tests,
+44 server cases and four small CUDA tests. Forty-two verification cases retain
+exact tokens, candidate fields and subsequent sampler state while checking one
+real context synchronization per batch. Separate regression cases cover candidate
+ownership, early end tokens and empty terminal chunks. Eight before/after HTTP
+cases with the 27.3 MiB artificial CPU model retain identical content, tokens and
+probabilities. No large model was loaded in this round.

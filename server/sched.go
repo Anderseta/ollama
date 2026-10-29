@@ -1782,20 +1782,16 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
 		return finished
 	}
 	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), s.waitForRecovery)
+	devices := slices.Clone(runner.gpus)
 
 	// Establish a baseline before we unload
-	gpusBefore := s.getGpuFn(context.Background(), runners)
-	var totalMemoryBefore, freeMemoryBefore uint64
-	for _, gpu := range gpusBefore {
-		totalMemoryBefore += gpu.TotalMemory
-		freeMemoryBefore += gpu.FreeMemory
-	}
-	totalMemoryNow := totalMemoryBefore
+	gpusBefore := s.getGpuFn(ctx, runners)
+	freeMemoryBefore, baselineComplete := gpuFreeMemoryForDevices(gpusBefore, devices)
 	freeMemoryNow := freeMemoryBefore
 
 	go func() {
 		// typical convergence is 0.5-1.5s - If it takes too long to discover and converge, let the scheduler estimate VRAM usage
-		ctx, cancel := context.WithTimeout(context.Background(), s.waitForRecovery)
 		defer cancel()
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
@@ -1804,19 +1800,16 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
 			case <-ticker.C:
 				// Query GPUs, look for free to go back up
 				gpusNow := s.getGpuFn(ctx, runners)
-				totalMemoryNow = 0
-				freeMemoryNow = 0
-				for _, gpu := range gpusNow {
-					totalMemoryNow += gpu.TotalMemory
-					freeMemoryNow += gpu.FreeMemory
-				}
-				if freeMemoryNow > freeMemoryBefore {
+				var complete bool
+				freeMemoryNow, complete = gpuFreeMemoryForDevices(gpusNow, devices)
+				increased := baselineComplete && complete && freeMemoryNow > freeMemoryBefore
+				if increased {
 					logutil.Trace("gpu VRAM convergence", "percent", int(float32(freeMemoryNow-freeMemoryBefore)/float32(runner.vramSize)*100))
 				} else {
 					logutil.Trace("gpu VRAM convergence", "percent", 0)
 				}
 				// If we're within ~75% of the estimated memory usage recovered, bail out
-				if float32(freeMemoryNow-freeMemoryBefore) > float32(runner.vramSize)*0.75 {
+				if increased && float32(freeMemoryNow-freeMemoryBefore) > float32(runner.vramSize)*0.75 {
 					slog.Debug(fmt.Sprintf("gpu VRAM free memory converged after %0.2f seconds", time.Since(start).Seconds()), "free_before", format.HumanBytes2(freeMemoryBefore), "free_now", format.HumanBytes2(freeMemoryNow), "runner", runner)
 					finished <- struct{}{}
 					return
@@ -1829,6 +1822,26 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
 		}
 	}()
 	return finished
+}
+
+// An unrelated GPU gaining free memory is not evidence that this runner's
+// allocations were released. Missing discovery data must not establish recovery.
+func gpuFreeMemoryForDevices(gpus []ml.DeviceInfo, devices []ml.DeviceID) (uint64, bool) {
+	var free uint64
+	for _, device := range devices {
+		found := false
+		for _, gpu := range gpus {
+			if gpu.DeviceID == device {
+				free = saturatingMemorySum(free, gpu.FreeMemory)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, false
+		}
+	}
+	return free, len(devices) > 0
 }
 
 // LogValue may run from goroutines that already hold refMu (see the scheduler
