@@ -805,8 +805,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				res.Response = content
 			}
 
-			if _, err := sb.WriteString(cr.Content); err != nil {
-				sendResponse(streamCtx, ch, gin.H{"error": err.Error()})
+			// Raw generation never returns a token context. Keep its output only
+			// in the response stream (or the non-streaming collector below).
+			if !req.Raw {
+				sb.WriteString(cr.Content)
 			}
 
 			if cr.Done {

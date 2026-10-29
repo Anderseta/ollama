@@ -1,0 +1,338 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1514,10 +1514,19 @@
+     // mirror of llama_sampler_i:
+     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
+     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
++#ifdef __cplusplus
++    LLAMA_API void                   llama_sampler_accept(      struct llama_sampler * smpl, llama_token token) noexcept(false);
++#else
+     LLAMA_API void                   llama_sampler_accept(      struct llama_sampler * smpl, llama_token token);
++#endif
+     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
+     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
++    // C++ clone callbacks may throw; retain caller cleanup with MSVC /EHsc.
++#ifdef __cplusplus
++    LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl) noexcept(false);
++#else
+     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
++#endif
+     LLAMA_API void                   llama_sampler_copy  (const struct llama_sampler * src, struct llama_sampler * dst);
+     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)
+     LLAMA_API void                   llama_sampler_free  (      struct llama_sampler * smpl);
+@@ -1528,7 +1537,11 @@
+     LLAMA_API struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params);
+ 
+     // important: takes ownership of the sampler object and will free it when llama_sampler_free is called
++#ifdef __cplusplus
++    LLAMA_API void                   llama_sampler_chain_add(      struct llama_sampler * chain, struct llama_sampler * smpl) noexcept(false);
++#else
+     LLAMA_API void                   llama_sampler_chain_add(      struct llama_sampler * chain, struct llama_sampler * smpl);
++#endif
+ 
+     // return NULL if:
+     //   - the sampler is NULL
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -1062,6 +1062,12 @@
+     COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+ };
+ 
++// A sampler snapshot is needed only if rollback can require a context restore.
++inline bool common_context_needs_rollback_checkpoint(common_context_seq_rm_type type, size_t n_tokens, uint32_t n_rs_seq) {
++    return n_tokens > 0 && (type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++            (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_tokens > n_rs_seq));
++}
++
+ // check if the llama_context can remove sequences
+ // note: clears the memory of the context
+ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -519,17 +519,23 @@
+ }
+ 
+ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
++    llama_sampler_ptr grmr(llama_sampler_clone(gsmpl->grmr));
++    llama_sampler_ptr rbudget(llama_sampler_clone(gsmpl->rbudget));
++    llama_sampler_ptr chain(llama_sampler_clone(gsmpl->chain));
+     auto * result = new common_sampler {
+         /* .params  = */ gsmpl->params,
+-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
++        /* .grmr    = */ grmr.get(),
++        /* .rbudget = */ rbudget.get(),
++        /* .chain   = */ chain.get(),
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
+     };
+     result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
++    grmr.release();
++    rbudget.release();
++    chain.release();
+     return result;
+ }
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-sampler.h"
++#include "llama-cpp.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-vocab.h"
+@@ -369,7 +370,7 @@
+     return smpl->iface->name(smpl);
+ }
+ 
+-void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
++void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) noexcept(false) {
+     if (!smpl) {
+         return;
+     }
+@@ -398,7 +399,7 @@
+     }
+ }
+ 
+-struct llama_sampler * llama_sampler_clone(const struct llama_sampler * smpl) {
++struct llama_sampler * llama_sampler_clone(const struct llama_sampler * smpl) noexcept(false) {
+     if (!smpl) {
+         return nullptr;
+     }
+@@ -711,13 +712,16 @@
+ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampler * smpl) {
+     const auto * chain_src = (const llama_sampler_chain *) smpl->ctx;
+ 
+-    auto * result = llama_sampler_chain_init(chain_src->params);
+-
++    llama_sampler_ptr result(llama_sampler_chain_init(chain_src->params));
++    auto * chain_dst = (llama_sampler_chain *) result->ctx;
++    chain_dst->samplers.reserve(chain_src->samplers.size());
+     for (const auto & smpl : chain_src->samplers) {
+-        llama_sampler_chain_add(result, llama_sampler_clone(smpl.ptr));
+-    }
+-
+-    return result;
++        llama_sampler_ptr child(llama_sampler_clone(smpl.ptr));
++        llama_sampler_chain_add(result.get(), child.get());
++        child.release();
++    }
++
++    return result.release();
+ }
+ 
+ static void llama_sampler_chain_free(struct llama_sampler * smpl) {
+@@ -963,7 +967,7 @@
+ }
+ 
+ 
+-void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler * smpl) {
++void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler * smpl) noexcept(false) {
+     auto * p = (llama_sampler_chain *) chain->ctx;
+     p->samplers.push_back({
+         /* .is_backend = */ false,
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4904,7 +4904,12 @@
+ 
+             // verify and try to accept the draft
+             {
+-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
++                const uint32_t n_rs_seq = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? llama_n_rs_seq(ctx_tgt) : 0;
++                common_sampler_ptr smpl_save;
++                // At least one token is accepted, so rollback cannot exceed n_draft.
++                if (common_context_needs_rollback_checkpoint(ctx_tgt_seq_rm_type, n_draft, n_rs_seq)) {
++                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
++                }
+ 
+                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
+                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+@@ -4927,13 +4932,11 @@
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                 }
+ 
+-                GGML_ASSERT(accepted.size() >= 1);
++                GGML_ASSERT(accepted.size() >= 1 && accepted.size() <= n_draft + 1);
+ 
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+ 
+-                const bool use_ckpt_tgt =
+-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
++                const bool use_ckpt_tgt = common_context_needs_rollback_checkpoint(ctx_tgt_seq_rm_type, n_rollback, n_rs_seq);
+ 
+                 // check for partial draft acceptance
+                 if (n_rollback > 0) {
+@@ -4959,6 +4962,7 @@
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+ 
+                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
++                        GGML_ASSERT(smpl_save);
+                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+ 
+                         return;
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -336,6 +336,143 @@
+             require(common_sampler_sample(sampler.get(), context.get(), 0) == 2, "completed grammar did not retain its EOG constraint");
+         }
+     }
++}
++
++struct clone_tracker {
++    int * live;
++    bool * fail;
++    bool cloned;
++};
++
++static const char * tracked_name(const llama_sampler *) { return "clone-lifetime-fixture"; }
++static void tracked_apply(llama_sampler *, llama_token_data_array *) {}
++static void tracked_accept(llama_sampler * sampler, llama_token) {
++    const auto * tracker = static_cast<const clone_tracker *>(sampler->ctx);
++    if (*tracker->fail) { throw std::bad_alloc(); }
++}
++static llama_sampler * tracked_clone(const llama_sampler * sampler);
++static void tracked_free(llama_sampler * sampler) {
++    auto * tracker = static_cast<clone_tracker *>(sampler->ctx);
++    if (tracker->cloned) { --*tracker->live; }
++    delete tracker;
++}
++static llama_sampler * tracked_sampler(int * live, bool * fail, bool cloned = false) {
++    static llama_sampler_i iface = {
++        tracked_name, tracked_accept, tracked_apply, nullptr, tracked_clone, tracked_free,
++        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
++    };
++    auto tracker = std::unique_ptr<clone_tracker>(new clone_tracker{live, fail, cloned});
++    auto * result = llama_sampler_init(&iface, tracker.get());
++    tracker.release();
++    if (cloned) { ++*live; }
++    return result;
++}
++static llama_sampler * tracked_clone(const llama_sampler * sampler) {
++    const auto * tracker = static_cast<const clone_tracker *>(sampler->ctx);
++    if (*tracker->fail) { throw std::bad_alloc(); }
++    return tracked_sampler(tracker->live, tracker->fail, true);
++}
++
++#if defined(_MSC_VER)
++__declspec(noinline)
++#elif defined(__GNUC__)
++__attribute__((noinline))
++#endif
++static void owned_accept(int * live, bool * fail) {
++    llama_sampler_ptr pending(tracked_sampler(live, fail, true));
++    llama_sampler_accept(pending.get(), 0);
++}
++
++static void sampler_callback_recovery() {
++    int live = 0;
++    bool fail = true;
++    for (int repeat = 0; repeat < 32; ++repeat) {
++        bool rejected = false;
++        try { owned_accept(&live, &fail); }
++        catch (const std::bad_alloc &) { rejected = true; }
++        require(rejected && live == 0, "throwing accept callback skipped caller cleanup");
++    }
++    fail = false;
++    owned_accept(&live, &fail);
++    require(live == 0, "successful accept did not release owned sampler");
++    std::puts("PASS: 32 throwing accept callbacks preserve C++ caller cleanup");
++}
++
++static void sampler_clone_recovery(llama_model * model, common_params_sampling params) {
++    auto context = fixture_context(model);
++    params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= [A-Z]+\n");
++    common_sampler_ptr source(common_sampler_init(model, params));
++    common_batch batch(context.get()); batch.add(3 + 'x', 0, 0, true);
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "clone recovery decode failed");
++    common_sampler_sample(source.get(), context.get(), 0);
++    common_sampler_ptr reference(common_sampler_clone(source.get()));
++    const auto * view = common_sampler_get_candidates(source.get(), false);
++    const std::vector<llama_token_data> expected(view->data, view->data + view->size);
++    auto * chain = common_sampler_get(source.get());
++    const auto original_children = llama_sampler_chain_n(chain);
++    int live = 0;
++    bool pass = false, fail = true;
++    llama_sampler_chain_add(chain, tracked_sampler(&live, &pass));
++    llama_sampler_chain_add(chain, tracked_sampler(&live, &fail));
++    for (bool common : {false, true}) {
++        for (int repeat = 0; repeat < 32; ++repeat) {
++            bool rejected = false;
++            try {
++                if (common) { common_sampler_ptr clone(common_sampler_clone(source.get())); }
++                else { llama_sampler_ptr clone(llama_sampler_clone(chain)); }
++            } catch (const std::bad_alloc &) { rejected = true; }
++            require(rejected, "clone did not preserve child allocation failure");
++            require(live == 0, "failed chain clone leaked an already cloned child");
++            require(llama_sampler_chain_n(chain) == original_children + 2, "failed clone changed source chain");
++            view = common_sampler_get_candidates(source.get(), false);
++            require(view->size == expected.size() &&
++                    std::memcmp(view->data, expected.data(), expected.size()*sizeof(llama_token_data)) == 0,
++                    "failed clone changed source candidate values");
++            fail = false;
++            {
++                common_sampler_ptr retry(common_sampler_clone(source.get()));
++                require(live == 2, "successful retry lost a child");
++                same_candidates(*view, *common_sampler_get_candidates(retry.get(), false));
++            }
++            require(live == 0, "successful clone did not release children");
++            fail = true;
++        }
++    }
++    fail = false;
++    for (int i = 0; i < 8; ++i) {
++        const auto expected_token = common_sampler_sample(reference.get(), context.get(), 0);
++        const auto token = common_sampler_sample(source.get(), context.get(), 0);
++        require(token == expected_token, "failed clone changed source grammar/RNG state");
++        common_sampler_accept(source.get(), token, true);
++        common_sampler_accept(reference.get(), token, true);
++    }
++    std::puts("PASS: 64 failed clones release returned children, preserve source state and allow retries");
++}
++
++static void speculative_checkpoint_requirements() {
++    size_t checked = 0, avoided = 0;
++    for (auto type : {COMMON_CONTEXT_SEQ_RM_TYPE_NO, COMMON_CONTEXT_SEQ_RM_TYPE_PART,
++                     COMMON_CONTEXT_SEQ_RM_TYPE_FULL, COMMON_CONTEXT_SEQ_RM_TYPE_RS}) {
++        for (uint32_t recurrent = 0; recurrent <= 8; ++recurrent) {
++            for (size_t draft = 1; draft <= 8; ++draft) {
++                const bool save = common_context_needs_rollback_checkpoint(type, draft, recurrent);
++                if (!save) { ++avoided; }
++                for (size_t accepted = 1; accepted <= draft + 1; ++accepted) {
++                    const auto rollback = draft + 1 - accepted;
++                    const bool expected = rollback > 0 && (type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                            (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && rollback > recurrent));
++                    const bool restore = common_context_needs_rollback_checkpoint(type, rollback, recurrent);
++                    require(restore == expected, "rollback checkpoint condition changed");
++                    require(!restore || save, "skipped a sampler snapshot needed by rollback");
++                    ++checked;
++                }
++            }
++        }
++    }
++    require(!common_context_needs_rollback_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_FULL, 0, 0),
++            "zero rollback unexpectedly needs checkpoint");
++    require(avoided == 180 && checked == 1584, "rollback coverage changed");
++    std::printf("PASS: %zu rollback cases, %zu of 288 artificial verification rounds avoid sampler clones\n", checked, avoided);
+ }
+ 
+ static void sampler_candidate_ownership(llama_model * model, common_params_sampling params) {
+@@ -542,6 +679,9 @@
+         params.penalty_repeat = 1.f; params.penalty_freq = params.penalty_present = 0.f;
+         params.no_perf = true;
+         sampler_init_recovery(model.get(), params);
++        sampler_callback_recovery();
++        sampler_clone_recovery(model.get(), params);
++        speculative_checkpoint_requirements();
+         sampler_candidate_ownership(model.get(), params);
+         batch_eog(model.get(), params);
+         auto batch_params = params;

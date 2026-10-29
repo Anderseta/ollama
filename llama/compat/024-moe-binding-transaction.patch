@@ -1,0 +1,118 @@
+diff --git a/src/llama-model-ram.cpp b/src/llama-model-ram.cpp
+--- a/src/llama-model-ram.cpp
++++ b/src/llama-model-ram.cpp
+@@ -780,7 +780,20 @@
+     r->data = (uint8_t *) reserve(r->reserved);
+     r->pages.resize(r->reserved / page_size);
+     for (size_t i = 0; i < r->pages.size(); ++i) { r->pages[i].owner = r.get(); r->pages[i].index = i; }
+-    t->data = r->data; p.addresses.emplace((uintptr_t) r->data, r.get()); p.regions.push_back(std::move(r));
++    // Publish the tensor only after both owning and lookup containers succeed.
++    // Growing either container can throw; no address may outlive its region.
++    // Keep vector's geometric growth instead of reserving exactly size()+1.
++    auto * bound = r.get();
++    p.regions.push_back(std::move(r));
++    try {
++        if (!p.addresses.emplace((uintptr_t) bound->data, bound).second) {
++            throw std::runtime_error("MoE RAM cache: duplicate reservation address");
++        }
++    } catch (...) {
++        p.regions.pop_back();
++        throw;
++    }
++    t->data = bound->data;
+ }
+ bool llama_model_ram_cache::contains(const ggml_tensor * t) const { return pimpl->find(t) != nullptr; }
+ bool llama_model_ram_cache::needs_prepare(const ggml_tensor * node) const {
+diff --git a/tests/test-moe-ram.cpp b/tests/test-moe-ram.cpp
+--- a/tests/test-moe-ram.cpp
++++ b/tests/test-moe-ram.cpp
+@@ -16,6 +16,34 @@
+ #include <random>
+ #include <cstring>
+ #include <future>
++#include <cstdlib>
++#include <new>
++
++// This target compiles llama-model-ram.cpp locally, so these failures exercise
++// the real region/vector/map allocations even when libllama is a Windows DLL.
++static thread_local int fail_binding_allocation_after = -1;
++#if defined(_MSC_VER)
++#define TEST_NOINLINE __declspec(noinline)
++#elif defined(__GNUC__)
++#define TEST_NOINLINE __attribute__((noinline))
++#else
++#define TEST_NOINLINE
++#endif
++TEST_NOINLINE void * operator new(std::size_t size) {
++    if (fail_binding_allocation_after == 0) {
++        fail_binding_allocation_after = -1;
++        throw std::bad_alloc();
++    }
++    if (fail_binding_allocation_after > 0) { --fail_binding_allocation_after; }
++    if (void * result = std::malloc(size ? size : 1)) { return result; }
++    throw std::bad_alloc();
++}
++TEST_NOINLINE void * operator new[](std::size_t size) { return ::operator new(size); }
++TEST_NOINLINE void operator delete(void * ptr) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete[](void * ptr) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete(void * ptr, std::size_t) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete[](void * ptr, std::size_t) noexcept { std::free(ptr); }
++#undef TEST_NOINLINE
+ 
+ static void test_parallel_contexts(const char * path, size_t budget, int gpu_layers, size_t gpu_cache) {
+     if (gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+@@ -64,6 +92,46 @@
+     if (!condition) { throw std::runtime_error(message); }
+ }
+ 
++static void test_binding_failures(const llama_files & files, ggml_tensor * shape, const std::vector<uint8_t> & raw) {
++    constexpr size_t page = 65536;
++    unsigned failures = 0;
++    bool completed = false;
++    for (int allocation = 0; allocation < 16; ++allocation) {
++        llama_model_ram_cache cache(2*page, files);
++        ggml_tensor established = *shape, candidate = *shape, alias = *shape;
++        uint8_t original = 0;
++        candidate.data = &original;
++        cache.bind(&established, 0, 31);
++        const auto * previous = established.data;
++        bool failed = false;
++        fail_binding_allocation_after = allocation;
++        try { cache.bind(&candidate, 0, 31 + page); }
++        catch (const std::bad_alloc &) { failed = true; }
++        fail_binding_allocation_after = -1;
++        if (!failed) { completed = true; break; }
++        ++failures;
++        require(candidate.data == &original, "failed binding published a released reservation into the tensor");
++        require(!cache.contains(&candidate), "failed binding published an unowned address");
++        require(established.data == previous && cache.contains(&established), "failed binding damaged an existing region");
++        cache.bind(&candidate, 0, 31 + page);
++        require(cache.contains(&candidate), "binding retry lost the region lookup");
++        // Tied tensors continue to reuse their live region without allocation.
++        fail_binding_allocation_after = 0;
++        try { cache.bind(&alias, 0, 31 + page); }
++        catch (...) { fail_binding_allocation_after = -1; throw; }
++        fail_binding_allocation_after = -1;
++        require(alias.data == candidate.data, "binding retry duplicated tied weights");
++        uint8_t bytes[73];
++        cache.read(&candidate, 17, bytes, sizeof(bytes));
++        require(!std::memcmp(bytes, raw.data() + 31 + page + 17, sizeof(bytes)), "binding retry read incorrect bytes");
++        cache.read(&established, 17, bytes, sizeof(bytes));
++        require(!std::memcmp(bytes, raw.data() + 31 + 17, sizeof(bytes)), "binding failure corrupted previous weight bytes");
++    }
++    require(failures >= 4, "binding regression did not cover region, page, owner and lookup allocations");
++    require(completed, "binding regression did not reach a successful allocation control");
++    std::printf("PASS binding transaction: %u allocation failures preserve tensors, prior regions and tied-weight retries\n", failures);
++}
++
+ static void test_cache(const char * directory, bool gpu = false) {
+     constexpr size_t page = 65536;
+     struct fixture {
+@@ -94,6 +162,7 @@
+     require(backend != nullptr, "test backend missing");
+     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+     require(buf != nullptr, "cannot allocate test tensors");
++    test_binding_failures(files, tail, raw);
+     llama_model_ram_cache cache(4*page, files);
+     cache.bind(weights, 0, 31); cache.bind(alias, 0, 31);
+     cache.bind(table, 0, 31 + 8*page); cache.bind(bias, 0, 31 + 16*page);

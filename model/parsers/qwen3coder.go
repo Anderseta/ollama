@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/logutil"
@@ -371,9 +372,19 @@ func parseTypedToolValue(raw string, paramType api.PropertyType) any {
 
 	// Try number (float)
 	if typeSet["number"] {
-		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		// Preserve integer literals exactly before float64 rounding, including
+		// integers above 2^53 that are still representable as int64.
+		if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			if i >= math.MinInt32 && i <= math.MaxInt32 {
+				return int(i)
+			}
+			return i
+		}
+		if f, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			// If the number has no decimal part, return as int (matching reference)
-			if f == math.Trunc(f) {
+			// only inside int64's range. Its upper boundary is exclusive because
+			// float64(math.MaxInt64) rounds up to 2^63.
+			if f == math.Trunc(f) && f >= -0x1p63 && f < 0x1p63 {
 				i := int64(f)
 				if i >= math.MinInt32 && i <= math.MaxInt32 {
 					return int(i)
@@ -477,6 +488,33 @@ func transformToXML(raw string) string {
 // escapeTextNode escapes XML character data without altering other characters
 // like newlines or tabs (which is why we don't use xml.EscapeText for this)
 func escapeTextNode(sb *strings.Builder, s string) {
+	if utf8.ValidString(s) {
+		// Most tool arguments need no escaping. Copy runs instead of decoding
+		// and appending every rune; retain the old invalid-UTF-8 behavior below.
+		// Count expansion first so heavily escaped payloads also allocate once.
+		sb.Grow(len(s) + 4*strings.Count(s, "&") + 3*strings.Count(s, "<") + 3*strings.Count(s, ">"))
+		start := 0
+		for i := 0; i < len(s); i++ {
+			var escaped string
+			switch s[i] {
+			case '&':
+				escaped = "&amp;"
+			case '<':
+				escaped = "&lt;"
+			case '>':
+				escaped = "&gt;"
+			default:
+				continue
+			}
+			if start < i {
+				sb.WriteString(s[start:i])
+			}
+			sb.WriteString(escaped)
+			start = i + 1
+		}
+		sb.WriteString(s[start:])
+		return
+	}
 	for _, r := range s {
 		switch r {
 		case '&':

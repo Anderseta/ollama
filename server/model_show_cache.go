@@ -549,6 +549,7 @@ func cloneShowResponse(in *api.ShowResponse) *api.ShowResponse {
 	out.Details.Families = slices.Clone(in.Details.Families)
 	out.Messages = cloneMessages(in.Messages)
 	out.Capabilities = slices.Clone(in.Capabilities)
+	out.Voices = slices.Clone(in.Voices)
 	out.Manifests = slices.Clone(in.Manifests)
 	out.ModelInfo = cloneAnyMap(in.ModelInfo)
 	out.ProjectorInfo = cloneAnyMap(in.ProjectorInfo)

@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-29",
+  "artifact": "conditional_speculation_snapshots_and_runtime_copy_safety",
+  "status": "passed",
+  "base_commit": "c62ec38c9b152b9ab5f49856d5c31243558d919e",
+  "native_base": "llama.cpp b11845 plus WildLlama patches 001-024",
+  "scope": "Small Windows CPU/CUDA fixtures; no large model loaded and no new model throughput measurement.",
+  "changes": {
+    "speculation": "Skip a sampler snapshot only when maximum possible rollback cannot require a context restore; FULL and insufficient RS capacity retain snapshots.",
+    "sampler_clone": "Own returned grammar/reasoning/chain handles during construction; reserve chain child vector once and release completed child clones on failure.",
+    "windows_exception_contract": "C++ clone, accept and chain-add APIs explicitly permit exceptions; C prototypes and exported names remain unchanged.",
+    "moe_binding": "Publish tensor address only after owning vector and lookup map succeed; roll back partial binding while preserving existing regions.",
+    "raw_generation": "Do not retain an unused second full response for token context in raw mode.",
+    "metadata": "Cached voice slices have independent ownership on store and return.",
+    "tool_text": "Bulk text escaping with one exact reservation; same Unicode, invalid-UTF-8 replacement and control-character behavior.",
+    "tool_numbers": "Preserve int64 decimal literals exactly, avoid out-of-range float-to-int casts, and use existing string fallback for NaN/Inf."
+  },
+  "validation": {
+    "go_complete_packages": [
+      "server",
+      "llm",
+      "model/parsers",
+      "model/renderers"
+    ],
+    "go_race": "Passed voice ownership, large raw/nonraw stream/nonstream generation, HTTP disconnect and writer cancellation tests.",
+    "go_release_build_and_cli_help": "passed",
+    "native_cpu": {
+      "passed": 20,
+      "failed": 0,
+      "tests": [
+        "cuda-tuning-policy",
+        "moe-admission",
+        "moe-budget",
+        "moe-partition",
+        "moe-readiness",
+        "moe-read-plan",
+        "moe-copy-plan",
+        "moe-work-batch",
+        "moe-ram-admission",
+        "moe-packed-rows",
+        "moe-expert-plan",
+        "speculative-depth",
+        "state-transfer",
+        "scheduler-exceptions",
+        "prepare-async",
+        "test-kv-trim-ranges",
+        "test-prompt-state-transaction",
+        "mtp-state",
+        "mtp-carry-state",
+        "cuda-graph-reuse-policy"
+      ]
+    },
+    "native_cuda": {
+      "passed": 4,
+      "failed": 0,
+      "tests": [
+        "cuda-dense",
+        "dense-embedding",
+        "cuda-graph-reuse",
+        "cuda-graph-reuse-disabled"
+      ]
+    },
+    "native_server_components": {
+      "passed": 44,
+      "assertions": 184,
+      "failed": 0
+    },
+    "native_moe_binding": {
+      "allocation_failures": 4,
+      "baseline_failure_reproduced": true,
+      "cpu_and_cuda_cache_tests": "passed",
+      "exact_retry_bytes_and_tied_weights_preserved": true
+    },
+    "native_sampler": {
+      "failed_clones_and_retries": 64,
+      "rollback_cases": 1584,
+      "ordinary_batch_equivalence_cases": 42,
+      "accept_callback_unwinds": 32
+    },
+    "native_accept_contract_probe": {
+      "baseline_exit_code": -1073740791,
+      "corrected_exit_code": 0,
+      "corrected_diagnostic": "rejected=1 retained=0",
+      "C11_header_syntax": "passed"
+    },
+    "cuda_custom_host_provider_failure_recovery": "passed",
+    "tool_number_regressions": 45,
+    "text_escape_reference_comparisons": 262,
+    "cpu_http_before_after": {
+      "status": "passed",
+      "fixture_bytes": 28628288,
+      "cases_per_payload": 8,
+      "cpu_only": true,
+      "content_tokens_probabilities_equal": true,
+      "outputs_sha256": "156cb87235ab35e1fd290a9a50a24b7eb236ec5e3874a1aace873a1376cafb47",
+      "large_model_loaded": false,
+      "throughput_measured": false
+    },
+    "patch_replay": {
+      "patches": [
+        "001-llama-cpp-hooks.patch",
+        "002-moe-ram-limit.patch",
+        "003-runtime-performance.patch",
+        "004-gpu-first-moe.patch",
+        "005-live-runtime-activity.patch",
+        "006-moe-residency-pipeline.patch",
+        "007-dense-runtime.patch",
+        "008-runtime-efficiency.patch",
+        "009-bounded-copy-pipeline.patch",
+        "010-scheduler-exception-contract.patch",
+        "011-moe-read-and-execution-batching.patch",
+        "012-expert-major-and-packed-rows.patch",
+        "013-resident-gpu-tuning.patch",
+        "014-kv-reclamation-and-prompt-state.patch",
+        "015-mtp-checkpoint-state.patch",
+        "016-tuning-reuse.patch",
+        "017-sampler-output-view.patch",
+        "018-speculative-round-efficiency.patch",
+        "019-cuda-graph-reuse.patch",
+        "020-checkpoint-restore-transaction.patch",
+        "021-sampler-batch-fences-and-owned-candidates.patch",
+        "022-sampler-init-and-mtp-state-transactions.patch",
+        "023-speculative-snapshot-and-clone-ownership.patch",
+        "024-moe-binding-transaction.patch"
+      ],
+      "files": 127,
+      "comparison": "exact UTF-8 text with CRLF/LF normalized",
+      "line_ending_only_differences": [
+        "src/llama-model-ram.cpp",
+        "src/llama-moe-cache.cpp",
+        "src/llama-state-transfer.h",
+        "tests/test-state-transfer.cpp"
+      ],
+      "fresh_apply_passed": true,
+      "second_apply_passed": true
+    },
+    "build_source_integrity": "Native source, patch and fixture hashes stable across final build."
+  },
+  "parser_microbenchmarks": {
+    "method": "Prebuilt Go test executables, GOMAXPROCS=2, artificial ASCII/Unicode/escape text and streamed tools. Medians of 3 baseline and 2 final samples; background host activity may affect timings.",
+    "metrics": {
+      "BenchmarkQwenStreamedToolCall/qwen3-coder/8KiB-2": {
+        "before": {
+          "ns": 319377.0,
+          "bytes": 133482.0,
+          "allocs": 114.0
+        },
+        "after": {
+          "ns": 295768.5,
+          "bytes": 108711.5,
+          "allocs": 104.0
+        },
+        "speed_ratio": 1.0798208734195833
+      },
+      "BenchmarkQwenStreamedToolCall/qwen3-coder/64KiB-2": {
+        "before": {
+          "ns": 2349991.0,
+          "bytes": 1066936.0,
+          "allocs": 139.0
+        },
+        "after": {
+          "ns": 2102754.0,
+          "bytes": 852558.5,
+          "allocs": 119.5
+        },
+        "speed_ratio": 1.117577709993656
+      },
+      "BenchmarkQwenStreamedToolCall/qwen3-coder/256KiB-2": {
+        "before": {
+          "ns": 9466988.0,
+          "bytes": 4274316.0,
+          "allocs": 173.0
+        },
+        "after": {
+          "ns": 6997333.0,
+          "bytes": 3352112.0,
+          "allocs": 147.5
+        },
+        "speed_ratio": 1.3529423281698898
+      },
+      "BenchmarkQwenStreamedToolCall/qwen3.5/8KiB-2": {
+        "before": {
+          "ns": 333455.0,
+          "bytes": 133675.0,
+          "allocs": 114.0
+        },
+        "after": {
+          "ns": 276037.5,
+          "bytes": 108713.5,
+          "allocs": 104.0
+        },
+        "speed_ratio": 1.2080061585835258
+      },
+      "BenchmarkQwenStreamedToolCall/qwen3.5/64KiB-2": {
+        "before": {
+          "ns": 2210002.0,
+          "bytes": 1067091.0,
+          "allocs": 139.0
+        },
+        "after": {
+          "ns": 1822003.5,
+          "bytes": 854048.0,
+          "allocs": 120.5
+        },
+        "speed_ratio": 1.2129515667780002
+      },
+      "BenchmarkQwenStreamedToolCall/qwen3.5/256KiB-2": {
+        "before": {
+          "ns": 8572034.0,
+          "bytes": 4275075.0,
+          "allocs": 173.0
+        },
+        "after": {
+          "ns": 7580004.0,
+          "bytes": 3352184.0,
+          "allocs": 147.5
+        },
+        "speed_ratio": 1.1308746011215824
+      },
+      "BenchmarkEscapeToolText/ascii/8KiB-2": {
+        "before": {
+          "ns": 76653.0,
+          "bytes": 34296.0,
+          "allocs": 15.0
+        },
+        "after": {
+          "ns": 10603.5,
+          "bytes": 8192.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 7.22902815108219
+      },
+      "BenchmarkEscapeToolText/unicode/8KiB-2": {
+        "before": {
+          "ns": 69391.0,
+          "bytes": 34296.0,
+          "allocs": 15.0
+        },
+        "after": {
+          "ns": 21350.5,
+          "bytes": 8192.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 3.250087819957378
+      },
+      "BenchmarkEscapeToolText/escaped/8KiB-2": {
+        "before": {
+          "ns": 109261.0,
+          "bytes": 113400.0,
+          "allocs": 19.0
+        },
+        "after": {
+          "ns": 66389.5,
+          "bytes": 24576.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 1.6457572357074537
+      },
+      "BenchmarkEscapeToolText/ascii/256KiB-2": {
+        "before": {
+          "ns": 2673656.0,
+          "bytes": 1186553.0,
+          "allocs": 27.0
+        },
+        "after": {
+          "ns": 319334.5,
+          "bytes": 262144.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 8.372587365286243
+      },
+      "BenchmarkEscapeToolText/unicode/256KiB-2": {
+        "before": {
+          "ns": 2324878.0,
+          "bytes": 1186553.0,
+          "allocs": 27.0
+        },
+        "after": {
+          "ns": 775747.5,
+          "bytes": 262144.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 2.996951972130107
+      },
+      "BenchmarkEscapeToolText/escaped/256KiB-2": {
+        "before": {
+          "ns": 3616570.0,
+          "bytes": 3242751.0,
+          "allocs": 31.0
+        },
+        "after": {
+          "ns": 3192302.0,
+          "bytes": 704512.0,
+          "allocs": 1.0
+        },
+        "speed_ratio": 1.132903465900156
+      }
+    },
+    "model_tokens_per_second_claim": false
+  },
+  "payload_sha256": {
+    "ollama.exe": "ed563ed8c454726806c6cc8c225dd7f2278eec8c34d766f975f69a1f1c359059",
+    "lib/ollama/llama.dll": "fb1e8f378fd568f764f79d1a372f7095d46e65dd62dd3dd692cc844785f7f914",
+    "lib/ollama/llama-common.dll": "ba9a56086c5437f7212351d44871e3a1978683f7557dd63c41bdb890c969ad7c",
+    "lib/ollama/llama-server-impl.dll": "92f478bc575bc856246a531fc4c6c93ae05789c68396b3dcdb412bf97d7c01fe",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "7acf6c738f00549b08b9786d1e298b2d3a040cec2e932c52c3e13636aa6ab7be"
+  },
+  "limits": [
+    "Windows execution only; Linux and other GPU platforms were not runtime-tested.",
+    "Memory-failure coverage is specific to returned sampler handles, callback unwinding and managed region publication, not every native allocator/device OOM path.",
+    "Tests do not establish end-to-end quality or throughput for every model.",
+    "Weights, quantization, logical context, sampling settings and saved profiles remain unchanged."
+  ]
+}

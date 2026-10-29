@@ -683,3 +683,55 @@ timer publications, MTP allocation failures and retries, and all two-chunk split
 positions around Qwen reasoning/tool boundaries. Complete Go suites and small
 native CPU/CUDA fixtures are used; no large model or new throughput benchmark
 is part of this round.
+
+## Avoid redundant inference copies and preserve failed allocations
+
+Patch `023` creates a speculative sampler checkpoint only when a rejected draft
+could require a full context restore. Partial rollback, including recurrent
+rollback whose capacity covers the entire draft, no longer clones the grammar,
+sampler chain, history and vocabulary-sized candidate buffer every round. Full
+restore paths retain their snapshots. The decision uses rollback capability and
+draft length; it does not change acceptance, sampling or model configuration.
+
+Cloning a sampler chain reserves its child list once. Returned sampler handles
+remain owned during cloning, so a later child failure releases earlier clones
+and leaves the source usable. This covers returned handles, not every allocation
+inside third-party sampler callbacks. The C++ clone, accept and chain-add APIs
+explicitly permit exceptions so Windows `/EHsc` builds unwind caller-owned
+resources when those operations throw. Their C declarations remain unchanged.
+
+Patch `024` publishes a managed MoE tensor binding only after its owning region
+and address lookup are both installed. If either container allocation fails,
+the incomplete region is released and the original tensor and existing bindings
+remain valid. Tied weights still share their region without another allocation;
+normal region growth and cache admission are unchanged.
+
+Raw `/api/generate` requests no longer accumulate a second complete response
+solely for a token context they never return. Ordinary generation retains its
+context behavior; non-streaming raw generation still collects the requested
+response. Cached model voice lists are copied on return, like other mutable
+metadata.
+
+Qwen tool text escaping copies unchanged runs and reserves the expanded size,
+instead of appending one rune at a time. Escapes, whitespace, Unicode and the
+previous replacement of invalid UTF-8 remain identical. The shared Qwen/Glimmer
+numeric parser also preserves decimal integer literals within `int64` exactly,
+keeps larger finite values as floats instead of overflowing an integer, and
+uses its existing string fallback for non-finite values that JSON cannot encode.
+
+Validation uses small fixtures and component benchmarks. No model weights,
+quantization, context, generation settings or saved profiles are changed.
+
+In the 256 KiB text-escaping fixture, ordinary ASCII input uses one allocation
+instead of 27 (256 KiB instead of approximately 1.13 MiB of transient allocated
+bytes). The heavily escaped fixture also uses one allocation instead of 31.
+Full streamed-tool parsing retains the same arguments and reduces transient
+allocations from 173 to 148 per call. These are parser measurements, not model
+tokens/s or a guarantee of end-to-end latency improvement.
+
+The [validation record](benchmarks/runtime-general-20261029.json) includes the
+complete Go suites and focused race tests, native CPU/CUDA fixtures, injected
+allocation and callback failures, and exact before/after HTTP comparisons with
+the 27.3 MiB artificial CPU model. Fresh and repeated application of patches
+`001`–`024` reproduce the tested native sources. Linux runtime validation and
+new full-model throughput measurements remain outside this round's scope.
