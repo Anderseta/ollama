@@ -1,0 +1,338 @@
+diff --git a/common/mtp-state.h b/common/mtp-state.h
+--- a/common/mtp-state.h
++++ b/common/mtp-state.h
+@@ -65,8 +65,12 @@
+     bool begin_record(int64_t first_position, size_t count) {
+         if (!width || !count || count > SIZE_MAX/width || first_position < 0 ||
+             uint64_t(first_position) + count - 1 > uint64_t(INT32_MAX)) { return false; }
++        if (first_position && !at(first_position - 1)) { return false; }
++        // Allocation failure must leave the previous carry and its provenance
++        // intact. Reacquire the row after reserve, which can move verify.
++        positions.reserve(count);
++        verify.reserve(count*width);
+         const float * previous = first_position ? at(first_position - 1) : nullptr;
+-        if (first_position && !previous) { return false; }
+         if (previous) { std::copy_n(previous, width, boundary.begin()); }
+         else { std::fill(boundary.begin(), boundary.end(), 0.0f); }
+         boundary_pos = first_position - 1;
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -208,16 +208,19 @@
+ 
+     lparams.no_perf = params.no_perf;
+ 
+-    llama_sampler * grmr = nullptr;
+-    llama_sampler * rbudget = nullptr;
+-    llama_sampler * chain = llama_sampler_chain_init(lparams);
+-
+-    std::vector<llama_sampler *> samplers;
++    llama_sampler_ptr grmr;
++    llama_sampler_ptr rbudget;
++    llama_sampler_ptr chain(llama_sampler_chain_init(lparams));
++    auto add_sampler = [&](llama_sampler * sampler) {
++        llama_sampler_ptr pending(sampler);
++        llama_sampler_chain_add(chain.get(), pending.get());
++        pending.release();
++    };
+ 
+     const std::string & grammar_str = common_grammar_value(params.grammar);
+     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
+ #ifdef LLAMA_USE_LLGUIDANCE
+-        grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
++        grmr.reset(llama_sampler_init_llg(vocab, "lark", grammar_str.c_str()));
+ #else
+         throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
+ #endif // LLAMA_USE_LLGUIDANCE
+@@ -268,11 +271,11 @@
+ 
+         if (!grammar_str.empty()) {
+              if (params.grammar_lazy) {
+-                 grmr = llama_sampler_init_grammar_lazy_patterns(vocab, grammar_str.c_str(), "root",
++                 grmr.reset(llama_sampler_init_grammar_lazy_patterns(vocab, grammar_str.c_str(), "root",
+                          trigger_patterns_c.data(), trigger_patterns_c.size(),
+-                         trigger_tokens.data(), trigger_tokens.size());
++                         trigger_tokens.data(), trigger_tokens.size()));
+              } else {
+-                 grmr = llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
++                 grmr.reset(llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root"));
+              }
+         }
+     }
+@@ -302,27 +305,27 @@
+     if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
+         try {
+             for (const auto & token : prefill_tokens) {
+-                llama_sampler_accept(grmr, token);
++                llama_sampler_accept(grmr.get(), token);
+                 LOG_DBG("%s: grammar accepted prefill token (%d)\n", __func__, token);
+             }
+-        } catch (std::exception &e) {
++        } catch (const std::exception &) {
+             LOG_ERR("%s: error initializing grammar sampler for grammar:\n%s\n\nGeneration prompt:\n'%s'\n", __func__,
+                 common_grammar_value(params.grammar).c_str(), params.generation_prompt.c_str());
+-            throw e;
++            throw;
+         }
+     }
+ 
+     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
+     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+-        rbudget = common_reasoning_budget_init(
++        rbudget.reset(common_reasoning_budget_init(
+             vocab,
+             {params.reasoning_budget_start},
+             params.reasoning_budget_end,
+             params.reasoning_budget_forced,
+-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
++            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens));
+ 
+         for (const auto & token : prefill_tokens) {
+-            llama_sampler_accept(rbudget, token);
++            llama_sampler_accept(rbudget.get(), token);
+             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+         }
+     }
+@@ -338,7 +341,7 @@
+         }
+ 
+         if (!merged.empty()) {
+-            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
++            add_sampler(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+         }
+     }
+ 
+@@ -355,35 +358,35 @@
+                         for (const auto & str : params.dry_sequence_breakers) {
+                             c_breakers.push_back(str.c_str());
+                         }
+-                        samplers.push_back(llama_sampler_init_dry(vocab, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
++                        add_sampler(llama_sampler_init_dry(vocab, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
+                     }
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_K:
+-                    samplers.push_back(llama_sampler_init_top_k(params.top_k));
++                    add_sampler(llama_sampler_init_top_k(params.top_k));
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_P:
+-                    samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
++                    add_sampler(llama_sampler_init_top_p(params.top_p, params.min_keep));
+                     break;
+                 case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+-                    samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
++                    add_sampler(llama_sampler_init_top_n_sigma(params.top_n_sigma));
+                     break;
+                 case COMMON_SAMPLER_TYPE_MIN_P:
+-                    samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
++                    add_sampler(llama_sampler_init_min_p(params.min_p, params.min_keep));
+                     break;
+                 case COMMON_SAMPLER_TYPE_XTC:
+-                    samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
++                    add_sampler(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
+                     break;
+                 case COMMON_SAMPLER_TYPE_TYPICAL_P:
+-                    samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
++                    add_sampler(llama_sampler_init_typical(params.typ_p, params.min_keep));
+                     break;
+                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
+-                    samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
++                    add_sampler(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                     break;
+                 case COMMON_SAMPLER_TYPE_INFILL:
+-                    samplers.push_back(llama_sampler_init_infill(vocab));
++                    add_sampler(llama_sampler_init_infill(vocab));
+                     break;
+                 case COMMON_SAMPLER_TYPE_PENALTIES:
+-                    samplers.push_back(llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
++                    add_sampler(llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
+                     break;
+                 case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                     // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
+@@ -398,28 +401,24 @@
+         }
+         if (use_adaptive_p) {
+             // only if user explicitly included adaptive-p sampler
+-            samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
++            add_sampler(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+         } else {
+             // Keep distribution sampling when callers request probabilities.
+             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
+-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
++            add_sampler(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+         }
+     } else if (params.mirostat == 1) {
+-        samplers.push_back(llama_sampler_init_temp(params.temp));
+-        samplers.push_back(llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), params.seed, params.mirostat_tau, params.mirostat_eta, 100));
++        add_sampler(llama_sampler_init_temp(params.temp));
++        add_sampler(llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), params.seed, params.mirostat_tau, params.mirostat_eta, 100));
+     } else if (params.mirostat == 2) {
+-        samplers.push_back(llama_sampler_init_temp(params.temp));
+-        samplers.push_back(llama_sampler_init_mirostat_v2(params.seed, params.mirostat_tau, params.mirostat_eta));
++        add_sampler(llama_sampler_init_temp(params.temp));
++        add_sampler(llama_sampler_init_mirostat_v2(params.seed, params.mirostat_tau, params.mirostat_eta));
+     } else {
+         GGML_ASSERT(false && "unknown mirostat version");
+     }
+ 
+-    for (auto * smpl : samplers) {
+-        llama_sampler_chain_add(chain, smpl);
+-    }
+-
+     if (grmr && params.backend_sampling) {
+         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
+ 
+@@ -434,16 +433,19 @@
+ 
+     auto * result = new common_sampler {
+         /* .params  = */ params,
+-        /* .grmr    = */ grmr,
+-        /* .rbudget = */ rbudget,
+-        /* .chain   = */ chain,
++        /* .grmr    = */ grmr.get(),
++        /* .rbudget = */ rbudget.get(),
++        /* .chain   = */ chain.get(),
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+         /* .cur_p   = */ {},
+         // mix it, the chain and the draft are seeded from this one too
+-        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
++        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain.get()) ^ 0x9e3779b9u),
+     };
+ 
++    grmr.release();
++    rbudget.release();
++    chain.release();
+     return result;
+ }
+ 
+diff --git a/tests/test-mtp-carry-state.cpp b/tests/test-mtp-carry-state.cpp
+--- a/tests/test-mtp-carry-state.cpp
++++ b/tests/test-mtp-carry-state.cpp
+@@ -1,7 +1,33 @@
+ #include "../common/mtp-state.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <limits>
++#include <new>
+ #include <stdexcept>
++
++static int fail_allocation_after = -1;
++#if defined(_MSC_VER)
++#define TEST_NOINLINE __declspec(noinline)
++#elif defined(__GNUC__)
++#define TEST_NOINLINE __attribute__((noinline))
++#else
++#define TEST_NOINLINE
++#endif
++TEST_NOINLINE void * operator new(std::size_t size) {
++    if (fail_allocation_after == 0) {
++        fail_allocation_after = -1;
++        throw std::bad_alloc();
++    }
++    if (fail_allocation_after > 0) { --fail_allocation_after; }
++    if (void * result = std::malloc(size ? size : 1)) { return result; }
++    throw std::bad_alloc();
++}
++TEST_NOINLINE void * operator new[](std::size_t size) { return ::operator new(size); }
++TEST_NOINLINE void operator delete(void * ptr) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete[](void * ptr) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete(void * ptr, std::size_t) noexcept { std::free(ptr); }
++TEST_NOINLINE void operator delete[](void * ptr, std::size_t) noexcept { std::free(ptr); }
++#undef TEST_NOINLINE
+ 
+ static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
+ 
+@@ -55,6 +81,32 @@
+         require(!state.load(invalid, 4, 64), "pending row differed from its verification copy");
+         std::vector<uint8_t> unchanged;
+         require(state.save(unchanged, 64) && unchanged == saved, "malformed snapshot partially replaced valid state");
++        for (int allocation = 0; allocation < 2; ++allocation) {
++            common_mtp_state probe(4);
++            require(probe.load(saved, 4, 64), "allocation fixture load failed");
++            bool failed = false;
++            fail_allocation_after = allocation;
++            try { probe.begin_record(4, 8); } catch (const std::bad_alloc &) { failed = true; }
++            fail_allocation_after = -1;
++            require(failed, "expected verification-history allocation did not fail");
++            std::vector<uint8_t> retained;
++            require(probe.save(retained, 64) && retained == saved, "failed history allocation corrupted the prior carry snapshot");
++            require(probe.begin_record(4, 8), "history allocation retry failed");
++            for (int i = 0; i < 8; ++i) {
++                probe.positions[i] = 4 + i;
++                std::fill_n(probe.verify.data() + 4*i, 4, float(14 + i));
++            }
++            probe.finish_record();
++            require(probe.valid(4, 64) && probe.boundary_pos == 3 && probe.boundary[0] == 13 && probe.pending_pos == 11,
++                    "history allocation retry lost the correct predecessor");
++            auto * const rows = probe.verify.data();
++            auto * const positions = probe.positions.data();
++            fail_allocation_after = 0;
++            const bool reused = probe.begin_record(12, 8);
++            fail_allocation_after = -1;
++            require(reused && probe.verify.data() == rows && probe.positions.data() == positions,
++                    "history hot path allocated instead of reusing capacity");
++        }
+         require(state.load({}, 4, 64) && state.positions.empty() && state.pending_pos == -1 && state.boundary_pos == -1,
+                 "empty reset retained history provenance");
+         require(state.can_resume(0) && !state.can_resume(1) && state.pending == std::vector<float>(4,0), "empty reset retained usable carry");
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -62,6 +62,7 @@
+         gguf_set_arr_data(meta.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
+     }
+     gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_space_prefix", false);
+     std::vector<std::string> names = {"<unk>", "<s>", "</s>"};
+     for (int i = 0; i < 256; ++i) {
+         char value[16]; std::snprintf(value, sizeof(value), "<0x%02X>", i);
+@@ -300,6 +301,39 @@
+             require(expected == actual, "sampled token/RNG/controller result changed");
+             same_candidates(reference.current, *common_sampler_get_candidates(next.get(), false));
+             reference.accept(expected); common_sampler_accept(next.get(), actual, true);
++        }
++    }
++}
++
++static void sampler_init_recovery(llama_model * model, common_params_sampling params) {
++    auto context = fixture_context(model);
++    common_batch batch(context.get()); batch.add(3 + 'x', 0, 0, true);
++    require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "sampler init fixture decode failed");
++    for (int repeat = 0; repeat < 8; ++repeat) {
++        auto invalid = params;
++        invalid.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "root ::= (\n");
++        bool rejected = false;
++        try { common_sampler_ptr sampler(common_sampler_init(model, invalid)); }
++        catch (const std::runtime_error & error) { rejected = std::string(error.what()).find("failed to parse grammar") != std::string::npos; }
++        require(rejected, "invalid grammar was not rejected");
++        for (auto type : {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, COMMON_GRAMMAR_TYPE_TOOL_CALLS}) {
++            invalid.grammar = common_grammar(type, "root ::= \"AB\"\n");
++            invalid.generation_prompt = "Z";
++            rejected = false;
++            try { common_sampler_ptr sampler(common_sampler_init(model, invalid)); }
++            catch (const std::runtime_error & error) {
++                rejected = std::string(error.what()).find("Unexpected empty grammar stack after accepting piece: Z") != std::string::npos;
++            }
++            require(rejected, "grammar prefill failure lost its original exception type or diagnostic");
++            auto valid = invalid;
++            valid.generation_prompt = "A";
++            common_sampler_ptr sampler(common_sampler_init(model, valid));
++            // Request initialization resets the chain after grammar prefill.
++            common_sampler_reset(sampler.get());
++            const auto token = common_sampler_sample(sampler.get(), context.get(), 0);
++            require(token == 3 + 'B', "valid grammar retry lost its prefilled prefix");
++            common_sampler_accept(sampler.get(), token, true);
++            require(common_sampler_sample(sampler.get(), context.get(), 0) == 2, "completed grammar did not retain its EOG constraint");
+         }
+     }
+ }
+@@ -507,6 +541,7 @@
+         params.seed = 424242; params.temp = .7f; params.top_k = 20; params.top_p = .9f;
+         params.penalty_repeat = 1.f; params.penalty_freq = params.penalty_present = 0.f;
+         params.no_perf = true;
++        sampler_init_recovery(model.get(), params);
+         sampler_candidate_ownership(model.get(), params);
+         batch_eog(model.get(), params);
+         auto batch_params = params;

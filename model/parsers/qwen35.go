@@ -110,6 +110,13 @@ func (p *Qwen35Parser) Add(s string, done bool) (content string, thinking string
 
 	p.buffer.WriteString(s)
 	events := p.parseEvents()
+	if done && p.state == qwen35ParserStateCollectingThinking && p.buffer.Len() > 0 {
+		// At EOF a partial delimiter can no longer become a control tag.
+		events = append(events, qwen35EventThinkingContent{content: p.buffer.String()})
+		p.buffer.Reset()
+		p.allowLeadingThinkOpenTag = false
+		p.trimLeadingThinkingSpace = false
+	}
 
 	var contentSb strings.Builder
 	var thinkingSb strings.Builder
@@ -214,7 +221,23 @@ func (p *Qwen35Parser) eat() ([]qwen35Event, bool) {
 			p.trimLeadingThinkingSpace = false
 		}
 
-		if strings.Contains(acc, qwen35ThinkingCloseTag) {
+		thinkingClose := strings.Index(acc, qwen35ThinkingCloseTag)
+		toolOpen := strings.Index(acc, qwen35ToolCallOpenTag)
+		if toolOpen >= 0 && (thinkingClose < 0 || toolOpen < thinkingClose) {
+			// Some checkpoints omit </think> before a tool call. Once its opener
+			// appears, later thinking tags belong to the tool payload.
+			thinking, tooling := p.splitAtTag(qwen35ToolCallOpenTag, true)
+			if thinking != "" {
+				events = append(events, qwen35EventThinkingContent{content: thinking})
+			}
+			p.buffer.Reset()
+			p.buffer.WriteString(qwen35ToolCallOpenTag)
+			p.buffer.WriteString(tooling)
+			p.state = qwen35ParserStateCollectingContent
+			return events, true
+		}
+
+		if thinkingClose >= 0 {
 			thinking, remaining := p.splitAtTag(qwen35ThinkingCloseTag, true)
 			if len(thinking) > 0 {
 				events = append(events, qwen35EventThinkingContent{content: thinking})
@@ -238,14 +261,6 @@ func (p *Qwen35Parser) eat() ([]qwen35Event, bool) {
 				events = append(events, qwen35EventThinkingContent{content: unambiguous})
 			}
 			return events, false
-		} else if strings.Contains(acc, qwen35ToolCallOpenTag) {
-			// qwen3.5:9b model forgets sometimes to use </think> tag before the <tool_call> block starts
-			// this condition ends the Think block and continues with the <tool_call> when the tag
-			// is found
-			thinking, tooling := p.splitAtTag(qwen35ToolCallOpenTag, true)
-			p.buffer.Reset()
-			p.buffer.WriteString(thinking + qwen35ThinkingCloseTag + qwen35ToolCallOpenTag + tooling)
-			return events, true
 		}
 
 		whitespaceLen := trailingWhitespaceLen(acc)

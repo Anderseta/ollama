@@ -481,6 +481,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				slog.Error("finished request signal received after model unloaded", "modelPath", finishedKey)
 				continue
 			}
+			expire := false
 			runner.refMu.Lock()
 			runner.refCount--
 			if runner.refCount <= 0 {
@@ -491,85 +492,120 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 						runner.expireTimer.Stop()
 						runner.expireTimer = nil
 					}
-					s.expiredCh <- runner
+					expire = true
 				} else if runner.expireTimer == nil {
 					slog.Debug("runner with non-zero duration has gone idle, adding timer", "runner", runner, "duration", runner.sessionDuration)
-					runner.expireTimer = time.AfterFunc(runner.sessionDuration, func() {
-						slog.Debug("timer expired, expiring to unload", "runner", runner)
-						runner.refMu.Lock()
-						defer runner.refMu.Unlock()
-						if runner.expireTimer != nil {
-							runner.expireTimer.Stop()
-							runner.expireTimer = nil
-						}
-						s.expiredCh <- runner
-					})
+					s.scheduleExpirationLocked(ctx, runner)
 					runner.expiresAt = time.Now().Add(runner.sessionDuration)
 				} else {
 					slog.Debug("runner with non-zero duration has gone idle, resetting timer", "runner", runner, "duration", runner.sessionDuration)
-					runner.expireTimer.Reset(runner.sessionDuration)
+					// An AfterFunc callback may already be queued even after Stop.
+					// Give the renewed idle interval a different timer identity.
+					runner.expireTimer.Stop()
+					s.scheduleExpirationLocked(ctx, runner)
 					runner.expiresAt = time.Now().Add(runner.sessionDuration)
 				}
 			}
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
 			runner.publishStatusLocked()
 			runner.refMu.Unlock()
+			if expire {
+				// This loop also consumes expiredCh. Sending to its own full
+				// queue would prevent either event from ever being processed.
+				s.unloadExpiredRunner(runner)
+			}
 		case runner := <-s.expiredCh:
-			slog.Debug("runner expired event received", "runner", runner)
-			runner.refMu.Lock()
-			if runner.refCount > 0 {
-				slog.Debug("expired event with positive ref count, retrying", "runner", runner, "refCount", runner.refCount)
-				go func(runner *runnerRef) {
-					// We can't unload yet, but want to as soon as the current request completes
-					// So queue up another expired event
-					time.Sleep(10 * time.Millisecond)
-					s.expiredCh <- runner
-				}(runner)
-				runner.refMu.Unlock()
-				continue
-			}
-
-			s.loadedMu.Lock()
-			slog.Debug("got lock to unload expired event", "runner", runner)
-			runnerToUnload := s.loaded[runner.modelKey]
-			if runnerToUnload == nil {
-				// If runnerToUnload is nil, we already processed an event and
-				// unloaded it. This double unload can happen if the initial
-				// request is canceled and we're trying to load another model
-				// that requires this one to be evicted, or the settings change
-				// and require a reload
-				s.loadedMu.Unlock()
-				runner.refMu.Unlock()
-				slog.Debug("duplicate expired event, ignoring", "runner", runner)
-			} else if runner.pid != runnerToUnload.pid {
-				// If the pids do not match, we likely had multiple load
-				// failures for the same model in quick succession due to
-				// request context canceled and are draining the queue of
-				// events. Ensure the orphaned runner is properly shut down, but
-				// do not delete the mismatched loaded runner, or wait for VRAM
-				// convergence.
-				slog.Debug("orphaned runner shutting down", "orphan", runner, "loaded", runnerToUnload)
-				runner.unload()
-				s.loadedMu.Unlock()
-				runner.refMu.Unlock()
-			} else {
-				slog.Debug("starting background wait for VRAM recovery", "runner", runner)
-				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
-				for _, r := range s.loaded {
-					runnersSnapshot = append(runnersSnapshot, r)
-				}
-				finished := s.waitForVRAMRecovery(runner, runnersSnapshot)
-				runner.unload()
-				delete(s.loaded, runner.modelKey)
-				s.publishLoadedSnapshotLocked()
-				s.loadedMu.Unlock()
-				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
-				<-finished
-				runner.refMu.Unlock()
-				slog.Debug("sending an unloaded event", "runner", runner)
-				s.unloadedCh <- struct{}{}
-			}
+			s.unloadExpiredRunner(runner)
 		}
+	}
+}
+
+func (s *Scheduler) unloadExpiredRunner(runner *runnerRef) {
+	slog.Debug("runner expired event received", "runner", runner)
+	runner.refMu.Lock()
+	if runner.refCount > 0 {
+		// Finishing the last reference schedules a new keep-alive timer or
+		// immediately unloads an explicitly expired model. Replaying this event
+		// would bypass that newer policy and poll throughout generation.
+		slog.Debug("ignoring expiration for a busy runner", "runner", runner, "refCount", runner.refCount)
+		runner.refMu.Unlock()
+		return
+	}
+	if runner.sessionDuration > 0 && runner.expireTimer != nil && time.Now().Before(runner.expiresAt) {
+		slog.Debug("ignoring expiration superseded by a newer keep-alive timer", "runner", runner)
+		runner.refMu.Unlock()
+		return
+	}
+
+	s.loadedMu.Lock()
+	slog.Debug("got lock to unload expired event", "runner", runner)
+	runnerToUnload := s.loaded[runner.modelKey]
+	if runnerToUnload == nil {
+		// If runnerToUnload is nil, we already processed an event and
+		// unloaded it. This double unload can happen if the initial
+		// request is canceled and we're trying to load another model
+		// that requires this one to be evicted, or the settings change
+		// and require a reload
+		s.loadedMu.Unlock()
+		runner.refMu.Unlock()
+		slog.Debug("duplicate expired event, ignoring", "runner", runner)
+	} else if runner.pid != runnerToUnload.pid {
+		// If the pids do not match, we likely had multiple load
+		// failures for the same model in quick succession due to
+		// request context canceled and are draining the queue of
+		// events. Ensure the orphaned runner is properly shut down, but
+		// do not delete the mismatched loaded runner, or wait for VRAM
+		// convergence.
+		slog.Debug("orphaned runner shutting down", "orphan", runner, "loaded", runnerToUnload)
+		runner.unload()
+		s.loadedMu.Unlock()
+		runner.refMu.Unlock()
+	} else {
+		slog.Debug("starting background wait for VRAM recovery", "runner", runner)
+		runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
+		for _, r := range s.loaded {
+			runnersSnapshot = append(runnersSnapshot, r)
+		}
+		finished := s.waitForVRAMRecovery(runner, runnersSnapshot)
+		runner.unload()
+		delete(s.loaded, runner.modelKey)
+		s.publishLoadedSnapshotLocked()
+		s.loadedMu.Unlock()
+		slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
+		<-finished
+		runner.refMu.Unlock()
+		slog.Debug("sending an unloaded event", "runner", runner)
+		s.unloadedCh <- struct{}{}
+	}
+}
+
+// The caller holds runner.refMu, including while publishing the timer pointer.
+func (s *Scheduler) scheduleExpirationLocked(ctx context.Context, runner *runnerRef) {
+	expiration := &runnerExpiration{}
+	expiration.timer = time.AfterFunc(runner.sessionDuration, func() {
+		s.expirationTimerFired(ctx, runner, expiration)
+	})
+	runner.expireTimer = expiration.timer
+}
+
+type runnerExpiration struct {
+	// The holder exists before AfterFunc starts; publish and read its timer
+	// under runner.refMu even when a nanosecond callback runs immediately.
+	timer *time.Timer
+}
+
+func (s *Scheduler) expirationTimerFired(ctx context.Context, runner *runnerRef, expiration *runnerExpiration) {
+	runner.refMu.Lock()
+	if runner.expireTimer != expiration.timer || runner.unloaded {
+		runner.refMu.Unlock()
+		return
+	}
+	runner.expireTimer = nil
+	runner.refMu.Unlock()
+	slog.Debug("timer expired, expiring to unload", "runner", runner)
+	select {
+	case <-ctx.Done():
+	case s.expiredCh <- runner:
 	}
 }
 

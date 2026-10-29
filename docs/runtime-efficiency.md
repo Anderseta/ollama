@@ -623,3 +623,63 @@ real context synchronization per batch. Separate regression cases cover candidat
 ownership, early end tokens and empty terminal chunks. Eight before/after HTTP
 cases with the 27.3 MiB artificial CPU model retain identical content, tokens and
 probabilities. No large model was loaded in this round.
+
+## Keep-alive races, failed setup and response boundaries
+
+### Keep expiration events tied to their idle interval
+
+Scheduler keep-alive timers now carry their own identity. An already queued
+callback from an older interval cannot stop a replacement timer or evict a
+model whose keep-alive was renewed by another request. A stale expiration for
+a busy model is discarded: completion of its last request already schedules
+the current keep-alive policy, including explicit unloads and OOM recovery.
+This removes the former goroutine and 10 ms polling loop for each busy event.
+
+Timer publication and identity checks use the runner mutex, including very short
+positive intervals. Expiration dispatch releases that mutex before waiting for
+queue space and can stop on scheduler shutdown. Explicit `keep_alive: 0` and
+runtime-OOM unloads retain their intent when the active request finishes.
+
+An immediately expired completed request now enters the shared unload handler
+after releasing the runner mutex. It does not send to the same bounded queue
+that its own loop must consume, avoiding a deadlock when that queue is full.
+
+### Preserve native state when setup fails
+
+Patch `022` makes MTP verification-history preparation allocate before modifying
+its boundary or position data. A failed reservation leaves the previous carry
+semantically intact and reusable; vector capacity may have grown. The predecessor
+row is reacquired after any relocation. Successful warm reuse retains capacity
+without adding allocations per round.
+
+Sampler initialization now owns its grammar, reasoning budget, chain and pending
+children through setup. Invalid grammars, rejected prefills or allocation
+exceptions release partial setup instead of leaking raw sampler handles. Children
+are added directly in the same order, removing the temporary raw-pointer vector.
+Ownership is transferred only after the complete common sampler is constructed.
+Prefill failures retain their original exception and diagnostic.
+This ownership guarantee covers handles returned to common sampler setup;
+inner allocator contracts and the caller's handling of device OOM are unchanged.
+
+### Keep Qwen reasoning and tool payloads separate
+
+When a checkpoint omits the reasoning close tag before a tool call, Qwen3.5 now
+honors the first complete boundary in the stream. A later literal `</think>` in
+the tool's arguments remains argument text. A complete tool opener also takes
+precedence over a partial tag at the end of the received chunk. This removes
+chunk-dependent parsing and avoids constructing and reparsing a synthetic
+reasoning close tag.
+
+At an unfinished reasoning EOF, pending literal tag prefixes and trailing
+reasoning whitespace are emitted once in the reasoning channel. Complete control
+tags keep their existing trimming behavior. Incomplete tools remain non-executable.
+These fixes preserve generated data; they do not change model weights or decoding
+settings.
+
+The [validation record](benchmarks/runtime-safety-20261029.json) separates
+reproduced failures from ordinary-path equivalence. Tests cover stale timer
+callbacks, full queues, cancellation, explicit/OOM unloads, 256 one-nanosecond
+timer publications, MTP allocation failures and retries, and all two-chunk split
+positions around Qwen reasoning/tool boundaries. Complete Go suites and small
+native CPU/CUDA fixtures are used; no large model or new throughput benchmark
+is part of this round.
