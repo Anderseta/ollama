@@ -1,0 +1,175 @@
+diff --git a/common/state-transaction.h b/common/state-transaction.h
+--- a/common/state-transaction.h
++++ b/common/state-transaction.h
+@@ -13,6 +13,15 @@
+     std::vector<uint8_t> spec;
+ 
+     size_t size() const { return main.size() + drft.size() + spec.size(); }
++};
++
++// A checkpoint can own the same three blobs in a different container. Borrow
++// their vectors only for the synchronous restore; do not duplicate large states
++// just to adapt their storage to the transactional helper.
++struct common_state_view {
++    const std::vector<uint8_t> & main;
++    const std::vector<uint8_t> & drft;
++    const std::vector<uint8_t> & spec;
+ };
+ 
+ template <typename Main, typename Draft, typename Spec>
+@@ -36,7 +45,7 @@
+ }
+ 
+ template <typename Main, typename Draft, typename Spec, typename Clear>
+-bool common_state_restore(const common_state_data & data, Main restore_main,
++bool common_state_restore(const common_state_view & data, Main restore_main,
+                           Draft restore_draft, Spec restore_spec, Clear clear) {
+     try {
+         if (!data.main.empty() && restore_main(data.main.data(), data.main.size()) == data.main.size() &&
+@@ -50,3 +59,10 @@
+     clear();
+     return false;
+ }
++
++template <typename Main, typename Draft, typename Spec, typename Clear>
++bool common_state_restore(const common_state_data & data, Main restore_main,
++                          Draft restore_draft, Spec restore_spec, Clear clear) {
++    return common_state_restore(common_state_view{data.main, data.drft, data.spec},
++            std::move(restore_main), std::move(restore_draft), std::move(restore_spec), std::move(clear));
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,7 @@
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
++#include "state-transaction.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+ #include "base64.hpp"
+@@ -4212,24 +4213,30 @@
+                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+ 
+                                     if (!do_reset) {
+-                                        // restore the context checkpoint
+-                                        if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+-                                            !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+-                                            if (it->id_task != -1) {
+-                                                GGML_ABORT("failed to restore context checkpoint\n");
+-                                            }
+-                                            // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
+-                                            SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
++                                        const common_state_view state {it->data_tgt, it->data_dft, it->data_spec};
++                                        const bool restored = common_state_restore(state,
++                                                [&](const uint8_t * src, size_t size) {
++                                                    return llama_state_seq_set_data_ext(ctx_tgt, src, size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                                },
++                                                [&](const uint8_t * src, size_t size) {
++                                                    return ctx_dft ? llama_state_seq_set_data_ext(ctx_dft, src, size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : size_t(0);
++                                                },
++                                                [&](const std::vector<uint8_t> & data) {
++                                                    if (!common_speculative_set_state(spec.get(), slot.id, data)) {
++                                                        throw std::runtime_error("invalid speculative checkpoint state");
++                                                    }
++                                                },
++                                                [&] {
++                                                    slot.mem.seq_rm(slot.id, -1, -1);
++                                                    common_speculative_set_state(spec.get(), slot.id, {});
++                                                });
++                                        if (!restored) {
++                                            SLT_WRN(slot, "%s", "failed to restore complete context checkpoint; target and draft cleared, reprocessing the full prompt\n");
+                                             do_reset = true;
+                                         }
+                                     }
+ 
+                                     if (!do_reset) {
+-                                        // restore the draft's speculative state
+-                                        if (!common_speculative_set_state(spec.get(), slot.id, it->data_spec)) {
+-                                            common_speculative_set_state(spec.get(), slot.id, {});
+-                                        }
+-
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+diff --git a/tests/test-prompt-state-transaction.cpp b/tests/test-prompt-state-transaction.cpp
+--- a/tests/test-prompt-state-transaction.cpp
++++ b/tests/test-prompt-state-transaction.cpp
+@@ -5,6 +5,67 @@
+ 
+ static void require(bool value, const char * message) {
+     if (!value) { throw std::runtime_error(message); }
++}
++
++static void borrowed_checkpoint_restore() {
++    const std::vector<uint8_t> target{21,22,23,24}, draft{25,26}, speculative{27,28};
++    const auto saved_target = target, saved_draft = draft, saved_speculative = speculative;
++    const common_state_view entry{target, draft, speculative};
++    require(&entry.main == &target && &entry.drft == &draft && &entry.spec == &speculative,
++            "borrowed view copied checkpoint vectors");
++    common_state_data live;
++    int failure = 0;
++    size_t clears = 0, main_calls = 0, draft_calls = 0, spec_calls = 0;
++    auto main = [&](const uint8_t * src, size_t size) {
++        require(src == target.data() && size == target.size(), "target restore did not borrow original bytes");
++        ++main_calls;
++        live.main.assign(src, src+size);
++        if (failure == 4) { throw std::runtime_error("target backend allocation failure"); }
++        return failure == 1 ? size-1 : size;
++    };
++    auto drft = [&](const uint8_t * src, size_t size) {
++        require(src == draft.data() && size == draft.size(), "draft restore did not borrow original bytes");
++        ++draft_calls;
++        live.drft.assign(src, src+size);
++        return failure == 2 ? size-1 : size;
++    };
++    auto spec = [&](const std::vector<uint8_t> & data) {
++        require(&data == &speculative, "spec restore did not borrow original vector");
++        ++spec_calls;
++        live.spec = data;
++        if (failure == 3) { throw std::runtime_error("invalid speculative checkpoint state"); }
++    };
++    auto clear = [&] { live = {}; ++clears; };
++    for (failure = 1; failure <= 4; ++failure) {
++        main_calls = draft_calls = spec_calls = 0;
++        live = {{99}, {98}, {97}};
++        require(!common_state_restore(entry, main, drft, spec, clear), "partial borrowed checkpoint accepted");
++        require(live.size() == 0 && clears == size_t(failure), "failed borrowed restore left live state");
++        require(main_calls == 1 && draft_calls == size_t(failure == 2 || failure == 3) &&
++                spec_calls == size_t(failure == 3), "restore continued after a failed checkpoint component");
++        require(target == saved_target && draft == saved_draft && speculative == saved_speculative,
++                "failed restore changed checkpoint bytes");
++        const int injected = failure;
++        failure = 0;
++        require(common_state_restore(entry, main, drft, spec, clear), "borrowed checkpoint retry failed");
++        require(live.main == target && live.drft == draft && live.spec == speculative,
++                "borrowed checkpoint retry changed state bytes");
++        require(clears == size_t(injected), "successful retry cleared state");
++        failure = injected;
++    }
++    const std::vector<uint8_t> empty;
++    const common_state_view target_only{target, empty, empty};
++    size_t optional_calls = 0;
++    require(common_state_restore(target_only, main,
++            [&](const uint8_t *, size_t size) { ++optional_calls; return size; },
++            [&](const auto & data) { require(&data == &empty, "empty spec storage copied"); live.spec = data; }, clear),
++            "target-only checkpoint rejected");
++    require(optional_calls == 0 && live.main == target && live.spec.empty(), "optional draft was restored");
++    const common_state_view missing_target{empty, draft, speculative};
++    main_calls = draft_calls = spec_calls = 0;
++    require(!common_state_restore(missing_target, main, drft, spec, clear), "checkpoint without target accepted");
++    require(live.size() == 0 && !main_calls && !draft_calls && !spec_calls,
++            "missing-target checkpoint changed contexts before fallback");
+ }
+ 
+ int main() {
+@@ -37,7 +98,8 @@
+             require(live.main == entry.main && live.drft == entry.drft && live.spec == entry.spec, "replay changed state bytes");
+         }
+         require(clears == 2 && spec_restores == 3, "successful replay incorrectly cleared state");
+-        std::puts("PASS: capture atomicity, target/draft/spec failure cleanup, preserved entry, retries and byte-identical replay");
++        borrowed_checkpoint_restore();
++        std::puts("PASS: capture atomicity, borrowed checkpoint buffers, target/draft/spec failure cleanup, preserved entry, retries and byte-identical replay");
+         return 0;
+     } catch (const std::exception & e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
+ }

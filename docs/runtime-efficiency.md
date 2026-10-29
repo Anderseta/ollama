@@ -499,3 +499,60 @@ worktrees. Without that isolation, a retained source archive nested inside
 another repository could silently report no patch paths and fail to recognize
 an already applied patch stack. The regression fixture checks repeated
 application and preservation of the enclosing Git index.
+
+## CUDA graph checks, bounded host caches and checkpoint recovery
+
+### Reuse eligibility for an unchanged CUDA graph
+
+Patch `019` reuses the eligibility of a graph whose nonzero GGML UID and node
+count match the same backend's previously accepted graph object. The existing
+UID contract identifies the same graph. A changed identity, UID zero, custom
+operations, disabled graphs and incompatible nodes retain the original checks.
+Warmup, capture, replay and arithmetic remain unchanged.
+
+The UID is published only after allocation and population of its property
+snapshot succeed, so a failed allocation cannot publish a partial certificate.
+
+The warm path avoids two metadata scans. It also looks up the backend graph
+once per execution and passes that same object to the internal helpers,
+instead of performing up to four cache lookups with timestamps and eviction
+checks. No additional graph cache or device allocation is introduced.
+
+### Bound retained JSON-schema grammars by bytes
+
+The Go schema-to-grammar LRU now retains at most 64 entries and 8 MiB of schema
+and grammar string payloads combined. The former entry-only limit could retain
+arbitrarily large strings. Container metadata and in-flight conversions are
+outside this payload budget.
+
+A conversion larger than the budget still returns its complete grammar; it
+does not enter the cache or displace useful entries. Failed conversions are
+not retained, cache hits remain shared across runners, and duplicate concurrent
+insertions do not charge or retain the same schema twice. This does not change
+structured-output constraints or introduce a new model setting.
+
+### Recover from a failed context-checkpoint restore
+
+Patch `020` treats target, draft and speculative checkpoint state as one restore
+transaction. A short restore, exception or rejected speculative state clears
+both live sequences and the auxiliary state, then follows the existing full
+prompt reprocessing path. A failed internal checkpoint no longer aborts the
+runner in this path. The saved checkpoint remains intact.
+
+The transactional view borrows the original state buffers. It adds no large
+state copies. Ordinary successful restores retain their flags, token positions
+and reuse behavior. Speculative verification and rollback assertions outside
+this context-checkpoint path are unchanged.
+
+The [validation record](benchmarks/runtime-efficiency-20261029.json) includes
+the full Go `llm` suite and focused race tests, nine native CPU tests, 44 server
+component cases, four small CUDA tests and CUDA CUSTOM-provider failure
+recovery. The new CUDA fixture executes 24 exact comparisons with graphs and
+24 without them. Its enabled run records real warmup and UID-reuse events;
+the disabled run records neither. Its allocation quota covers tracked native
+allocations, separately from driver/context memory.
+
+Eight before/after HTTP cases with a 27.3 MiB artificial CPU model retain
+identical text, generated token IDs and probabilities. No model weights,
+quantization, requested context or saved profiles changed. These tests
+establish component behavior; they do not claim a new Qwen tokens/s result.

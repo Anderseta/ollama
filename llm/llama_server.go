@@ -17,7 +17,6 @@ package llm
 import (
 	"bufio"
 	"bytes"
-	"container/list"
 	"context"
 	crand "crypto/rand"
 	"encoding/base64"
@@ -1633,35 +1632,16 @@ type llamaServerCompletionRequest struct {
 	TimingsPerToken     bool            `json:"timings_per_token,omitempty"`
 }
 
-// schemaGrammars caches the grammars llama-server derives from JSON schemas,
-// most recently used first. The conversion depends only on the llama-server
-// build, which is fixed for the process, so entries are shared by every
-// runner and never expire.
-var schemaGrammars = struct {
-	sync.Mutex
-	entries map[string]*list.Element
-	order   list.List
-}{entries: map[string]*list.Element{}}
-
-const schemaGrammarsSize = 64
-
-type schemaGrammar struct {
-	schema, grammar string
-}
-
 // schemaGrammar converts a JSON schema to GBNF with llama-server's own
 // converter. An empty completion evaluates and generates nothing, but its
 // final response still reports the grammar the schema was converted to.
 func (s *llamaServerRunner) schemaGrammar(ctx context.Context, schema json.RawMessage) (string, error) {
-	key := string(schema)
-	schemaGrammars.Lock()
-	if e, ok := schemaGrammars.entries[key]; ok {
-		schemaGrammars.order.MoveToFront(e)
-		schemaGrammars.Unlock()
-		return e.Value.(*schemaGrammar).grammar, nil
-	}
-	schemaGrammars.Unlock()
+	return schemaGrammars.getOrConvert(string(schema), func() (string, error) {
+		return s.convertSchemaGrammar(ctx, schema)
+	})
+}
 
+func (s *llamaServerRunner) convertSchemaGrammar(ctx context.Context, schema json.RawMessage) (string, error) {
 	body, err := json.Marshal(struct {
 		Prompt         [][]int         `json:"prompt"`
 		NPredict       int             `json:"n_predict"`
@@ -1699,16 +1679,6 @@ func (s *llamaServerRunner) schemaGrammar(ctx context.Context, schema json.RawMe
 		return "", errors.New("llama-server returned no grammar for the schema")
 	}
 
-	schemaGrammars.Lock()
-	defer schemaGrammars.Unlock()
-	if _, ok := schemaGrammars.entries[key]; !ok {
-		if schemaGrammars.order.Len() == schemaGrammarsSize {
-			oldest := schemaGrammars.order.Back()
-			delete(schemaGrammars.entries, oldest.Value.(*schemaGrammar).schema)
-			schemaGrammars.order.Remove(oldest)
-		}
-		schemaGrammars.entries[key] = schemaGrammars.order.PushFront(&schemaGrammar{schema: key, grammar: lsRes.Grammar})
-	}
 	return lsRes.Grammar, nil
 }
 

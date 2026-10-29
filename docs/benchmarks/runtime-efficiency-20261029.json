@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-29",
+  "artifact": "cuda_graph_reuse_bounded_grammar_cache_checkpoint_recovery",
+  "status": "passed",
+  "base_commit": "907a8c581f4b4a513dc7e57220af2fa5f8cd9d25",
+  "native_base": "llama.cpp b11845 plus WildLlama patches 001-020",
+  "scope": "Windows CPU and small synthetic CUDA fixtures. No large model loaded or new model throughput benchmark.",
+  "changes": {
+    "cuda_graphs": {
+      "known_nonzero_uid_skips_two_metadata_scans": true,
+      "graph_cache_lookups_per_execution_before_up_to": 4,
+      "graph_cache_lookups_per_execution_after": 1,
+      "uid_published_after_property_allocation_and_fill": true,
+      "uid_zero_custom_disabled_incompatible_and_changed_identity_keep_validation": true
+    },
+    "grammar_cache": {
+      "max_entries": 64,
+      "max_schema_and_grammar_string_bytes": 8388608,
+      "oversize_conversions_complete_but_not_retained": true,
+      "metadata_and_inflight_conversion_memory_not_in_payload_budget": true
+    },
+    "checkpoint_restore": {
+      "target_draft_and_auxiliary_state_transactional": true,
+      "short_restore_exception_or_rejected_auxiliary_state_clears_live_sequences": true,
+      "fallback": "existing full prompt reprocessing",
+      "saved_checkpoint_preserved": true,
+      "borrowed_buffers_no_adaptation_copies": true
+    }
+  },
+  "validation": {
+    "go_llm_package": "passed",
+    "go_cache_and_thinking_format_race": "passed",
+    "go_cli_help": "passed",
+    "native_cpu": {
+      "passed": 9,
+      "failed": 0,
+      "includes": [
+        "checkpoint transaction failures/retry/borrowed buffers",
+        "tiny MTP state continuity",
+        "sampler output equivalence",
+        "CUDA graph reuse policy"
+      ]
+    },
+    "native_server_components": {
+      "passed": 44,
+      "assertions": 184,
+      "failed": 0
+    },
+    "native_cuda": {
+      "ctest_passed": 4,
+      "tests": [
+        "cuda-dense",
+        "dense-embedding",
+        "cuda-graph-reuse",
+        "cuda-graph-reuse-disabled"
+      ],
+      "custom_host_provider_failure_recovery": "passed",
+      "graph_evidence": {
+        "cuda-graph-reuse": {
+          "warmup_completions": 2,
+          "uid_reuse_events": 14,
+          "managed_peak_bytes": 6656,
+          "managed_quota_bytes": 67108864,
+          "exact_executions": 24
+        },
+        "cuda-graph-reuse-disabled": {
+          "warmup_completions": 0,
+          "uid_reuse_events": 0,
+          "managed_peak_bytes": 6656,
+          "managed_quota_bytes": 67108864,
+          "exact_executions": 24
+        }
+      }
+    },
+    "component_work_counter": {
+      "nodes": 4096,
+      "executions": 257,
+      "legacy_metadata_inspections": 2105344,
+      "new_metadata_inspections": 8192,
+      "not_model_tokens_per_second": true
+    },
+    "cpu_http_before_after": {
+      "status": "passed",
+      "fixture_bytes": 28628288,
+      "cases_per_payload": 8,
+      "cpu_only": true,
+      "content_tokens_probabilities_equal": true,
+      "outputs_sha256": "156cb87235ab35e1fd290a9a50a24b7eb236ec5e3874a1aace873a1376cafb47",
+      "large_model_loaded": false,
+      "throughput_measured": false
+    },
+    "patch_replay": {
+      "patches": [
+        "001-llama-cpp-hooks.patch",
+        "002-moe-ram-limit.patch",
+        "003-runtime-performance.patch",
+        "004-gpu-first-moe.patch",
+        "005-live-runtime-activity.patch",
+        "006-moe-residency-pipeline.patch",
+        "007-dense-runtime.patch",
+        "008-runtime-efficiency.patch",
+        "009-bounded-copy-pipeline.patch",
+        "010-scheduler-exception-contract.patch",
+        "011-moe-read-and-execution-batching.patch",
+        "012-expert-major-and-packed-rows.patch",
+        "013-resident-gpu-tuning.patch",
+        "014-kv-reclamation-and-prompt-state.patch",
+        "015-mtp-checkpoint-state.patch",
+        "016-tuning-reuse.patch",
+        "017-sampler-output-view.patch",
+        "018-speculative-round-efficiency.patch",
+        "019-cuda-graph-reuse.patch",
+        "020-checkpoint-restore-transaction.patch"
+      ],
+      "files": 126,
+      "comparison": "exact UTF-8 text with CRLF/LF normalized",
+      "line_ending_only_differences": [
+        "src/llama-model-ram.cpp",
+        "src/llama-moe-cache.cpp",
+        "src/llama-state-transfer.h",
+        "tests/test-state-transfer.cpp"
+      ],
+      "fresh_apply_passed": true,
+      "second_apply_passed": true
+    },
+    "patch_applier_regression": "passed, including nested archive and index preservation",
+    "build_source_integrity": "native sources, compatibility patches and validation fixture sources unchanged across build"
+  },
+  "build": {
+    "go": "1.26.10",
+    "native_cuda_toolkit": "12.8",
+    "cuda_architecture": "120",
+    "go_package_parallelism": 1,
+    "native_parallelism": 1,
+    "outputs_and_caches": "G:",
+    "new_tools_installed": false
+  },
+  "payload_sha256": {
+    "ollama.exe": "86d732715c0a25a572ce5dd808f13f2758f24a992064af30aa6eccb42cce8327",
+    "lib/ollama/llama-server.exe": "b1f9b3e2020ee3948a0a54194cb5ee3d2e4f81deda04e031d1a2d09685818fe5",
+    "lib/ollama/llama-server-impl.dll": "93c036a8417af65eafe8e8373ee92b87339f3a3c03ee7b7f599828376ed8d43d",
+    "lib/ollama/llama.dll": "c16f91d03f1fb528ef5c0a278ebb4e39aa46785206516fa9824ee4a82dacd4a7",
+    "lib/ollama/llama-common.dll": "f70ab305e4c803478d88ca17a2f975d08a25d163d0787fbb4aee18ac8554e303",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "7acf6c738f00549b08b9786d1e298b2d3a040cec2e932c52c3e13636aa6ab7be"
+  },
+  "unchanged_controls": [
+    "model weights",
+    "quantization",
+    "logical context capacity",
+    "sampling parameters",
+    "saved profiles"
+  ],
+  "limitations": [
+    "No new large-model tokens/s or quality benchmark.",
+    "CUDA quota in fixture counts tracked native allocations, not driver or other-process memory.",
+    "Linux/HIP/MUSA execution was not tested in this round."
+  ]
+}

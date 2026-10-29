@@ -7,7 +7,7 @@ param(
     [string]$CudaVersion = '',
     [string]$CudaArchitectures = '120',
     [int]$Parallel = 4,
-    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-expert-trace','test-cuda-dense','test-cuda-kv-growth','test-kv-growth','test-dense-embedding','test-moe-readiness','test-moe-read-plan','test-moe-copy-plan','test-moe-work-batch','test-moe-ram-admission','test-moe-packed-rows','test-moe-expert-plan','test-speculative-depth','test-state-transfer','test-scheduler-exceptions','test-kv-trim-ranges','test-prompt-state-transaction','test-mtp-state','test-mtp-carry-state','test-sampler-output-view')
+    [string[]]$Targets = @('llama-server','llama-quantize','test-moe-ram','test-moe-ram-metrics','test-gpu-exclusive-scheduler','test-gpu-exclusive','test-gpu-exclusive-op','test-gpu-exclusive-ssm','test-gpu-layer-diagnostics','test-cuda-memory-budget','test-server-component','test-moe-admission','test-moe-budget','test-moe-partition','test-cuda-upload','test-cuda-host-op','test-prepare-async','test-moe-ram-pool','test-expert-trace','test-cuda-dense','test-cuda-kv-growth','test-kv-growth','test-dense-embedding','test-moe-readiness','test-moe-read-plan','test-moe-copy-plan','test-moe-work-batch','test-moe-ram-admission','test-moe-packed-rows','test-moe-expert-plan','test-speculative-depth','test-state-transfer','test-scheduler-exceptions','test-kv-trim-ranges','test-prompt-state-transaction','test-mtp-state','test-mtp-carry-state','test-sampler-output-view','test-cuda-graph-reuse-policy','test-cuda-graph-reuse')
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-integrity.ps1')
@@ -78,10 +78,10 @@ if(!$SkipConfigure) {
     if($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 }
 $sourceRoots = @($nativeDirectory, (Join-Path $repoRoot 'llama\compat'),
-    (Join-Path $repoRoot 'llama\server'))
+    (Join-Path $repoRoot 'llama\server'), (Join-Path $PSScriptRoot 'tests'))
 $sourceFiles = @((Join-Path $repoRoot 'LLAMA_CPP_VERSION'),
     (Join-Path $PSScriptRoot 'CMakeLists.txt'), (Join-Path $PSScriptRoot 'build-windows.ps1'),
-    (Join-Path $PSScriptRoot 'build-integrity.ps1'))
+    (Join-Path $PSScriptRoot 'build-integrity.ps1'), (Join-Path $PSScriptRoot 'cuda-calibrate.cpp'))
 if($Build) {
     New-Item -ItemType Directory -Force -Path $integrityDirectory | Out-Null
     if(Test-Path -LiteralPath $taintMarker -PathType Leaf) {

@@ -1,0 +1,193 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -39,6 +39,7 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/dense-reuse.h"
++#include "ggml-cuda/graph-reuse.h"
+ #include "ggml-cuda/resident-tuning-policy.h"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+@@ -3511,11 +3512,8 @@
+     return cgraph->nodes[0];
+ }
+ 
+-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
++static bool ggml_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph * cgraph) {
+     bool res = false;
+-
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (cgraph->uid != 0 &&
+         cgraph->uid == graph->uid) {
+@@ -3525,8 +3523,6 @@
+         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+         return false;
+     }
+-
+-    graph->uid = cgraph->uid;
+ 
+     // Check if the graph size has changed
+     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+@@ -3552,6 +3548,8 @@
+         }
+     }
+ 
++    // Publish only after allocation and every property copy have succeeded.
++    graph->uid = cgraph->uid;
+     return res;
+ }
+ 
+@@ -5396,7 +5394,7 @@
+     return 0;
+ }
+ 
+-static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, ggml_cuda_graph * cuda_graph) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -5408,7 +5406,7 @@
+     bool                         should_launch_concurrent_events = false;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
++    ggml_cuda_graph * graph      = use_cuda_graph ? cuda_graph : nullptr;
+     const int         chunk_size = ggml_cuda_graph_chunk_size();
+     int               chunk_end  = chunk_size;
+     size_t            n_chunks   = 0;
+@@ -5625,7 +5623,7 @@
+             CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+         }
+ #else
+-        GGML_UNUSED(graph_key);
++        GGML_UNUSED(cuda_graph);
+         graph_evaluated_or_captured = true;
+ #endif  // USE_CUDA_GRAPH
+     }
+@@ -5633,9 +5631,7 @@
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-
++static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+     if (graph->instances.empty()) {
+         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
+@@ -5754,28 +5750,32 @@
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+-    for (int i = 0; i < cgraph->n_nodes; ++i) {
+-        if (cgraph->nodes[i]->op == GGML_OP_CUSTOM) {
+-            cuda_ctx->curr_stream_no = 0;
+-            cuda_ctx->stream_context().reset();
+-            break;
+-        }
+-    }
++    const auto scan_custom = [&] {
++        for (int i = 0; i < cgraph->n_nodes; ++i) {
++            if (cgraph->nodes[i]->op == GGML_OP_CUSTOM) {
++                cuda_ctx->curr_stream_no = 0;
++                cuda_ctx->stream_context().reset();
++                return true;
++            }
++        }
++        return false;
++    };
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+-    const void * graph_key = nullptr;
++    ggml_cuda_graph * graph         = nullptr;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    graph_key = ggml_cuda_graph_get_key(cgraph);
+-
+-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+-
+-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
+-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+-        if (graph_compatible) {
+-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
++    // One lookup owns the eviction/last-used update for this execution. The
++    // following helpers borrow this object and never re-enter the cache map.
++    graph = cuda_ctx->cuda_graph(ggml_cuda_graph_get_key(cgraph));
++    const bool graph_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph);
++    const auto eligibility = ggml_cuda_graph_reuse::classify(
++            cgraph->uid, graph->uid, cgraph->n_nodes, graph->node_props.size(), graph_enabled,
++            scan_custom, [&] { return ggml_cuda_graph_check_compability(cgraph); });
++    if (graph_enabled) {
++        if (eligibility.compatible) {
++            const bool properties_changed = ggml_cuda_graph_update_required(graph, cgraph);
+ 
+             if (!graph->warmup_complete) {
+                 // Warmup: need at least 2 calls with no property change on the 2nd call
+@@ -5803,6 +5803,8 @@
+             }
+         }
+     }
++#else
++    scan_custom();
+ #endif // USE_CUDA_GRAPH
+ 
+     // Weight-copy callbacks run in the scheduler before entering this function.
+@@ -5820,7 +5822,7 @@
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+     }
+ 
+-    const bool success = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
++    const bool success = ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph);
+     if (timing) { timing->end(timing_slot, cuda_ctx->stream()); }
+ 
+     return success ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+@@ -5981,7 +5983,8 @@
+ 
+ #ifdef USE_CUDA_GRAPH
+     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+-    const bool use_cuda_graph = !has_host_provider && ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
++    const bool use_cuda_graph = !has_host_provider &&
++        ggml_cuda_graph_set_enabled(cuda_ctx, cuda_ctx->cuda_graph(graph_key));
+ #else
+     const bool use_cuda_graph = false;
+     GGML_UNUSED(has_host_provider);
+diff --git a/ggml/src/ggml-cuda/graph-reuse.h b/ggml/src/ggml-cuda/graph-reuse.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/graph-reuse.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ggml_cuda_graph_reuse {
++
++struct eligibility {
++    bool has_custom;
++    bool compatible;
++};
++
++// accepted_uid/node_count must come from the SAME backend graph object. Its
++// uid is published only after compatibility, all vector growth, and property
++// copies have succeeded. Allocation failure must not certify a partial update.
++// Matching nonzero GGML UIDs identify the same graph; uid 0 never certifies reuse.
++// The count guard is conservative, not permission to mutate a graph under its UID.
++template <typename ScanCustom, typename CheckCompatibility>
++eligibility classify(uint64_t uid, uint64_t accepted_uid, size_t node_count,
++                     size_t accepted_node_count, bool enabled,
++                     ScanCustom scan_custom, CheckCompatibility check_compatibility) {
++    if (enabled && uid != 0 && uid == accepted_uid && node_count != 0 &&
++            node_count == accepted_node_count) {
++        return {false, true};
++    }
++    const bool has_custom = scan_custom();
++    return {has_custom, enabled && check_compatibility()};
++}
++
++} // namespace ggml_cuda_graph_reuse
