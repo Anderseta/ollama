@@ -1,0 +1,592 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,5 +1,7 @@
+ #include "sampling.h"
++#include "sampling-probability.h"
+ #include "../src/llama-ext.h"
++#include "../src/llama-sampler.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -164,6 +166,17 @@
+         }
+ 
+         cur_p = { cur.data(), cur.size(), -1, false };
++        ++candidate_rows;
++    }
++
++    void set_backend_logits(struct llama_context * ctx, const llama_sampler_output & output) {
++        set_logits(ctx, output);
++        for (size_t i = 0; i < cur_p.size; ++i) {
++            if (cur_p.data[i].id == output.sampled_token) {
++                cur_p.selected = i;
++                break;
++            }
++        }
+     }
+ 
+     common_time_meas tm() {
+@@ -171,6 +184,10 @@
+     }
+ 
+     mutable int64_t t_total_us = 0;
++    uint64_t candidate_rows = 0;
++
++    // Rejection-only workspace, not sampler state: do not clone/copy it.
++    std::vector<uint32_t> residual_order;
+ };
+ 
+ std::string common_params_sampling::print() const {
+@@ -558,6 +575,7 @@
+     dst->cur_p.data = src->cur_p.data ? dst->cur.data() + (src->cur_p.data - src->cur.data()) : nullptr;
+     dst->rng        = src->rng;
+     dst->t_total_us = src->t_total_us;
++    dst->candidate_rows = src->candidate_rows;
+ }
+ 
+ void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
+@@ -618,13 +636,20 @@
+     return gsmpl && gsmpl->params.backend_sampling && !gsmpl->grmr && !gsmpl->rbudget ? gsmpl->chain : nullptr;
+ }
+ 
+-static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
++static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
++        llama_sampler_output * deferred_backend = nullptr) {
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
+     // Borrow after the existing fence/timer boundary: output reordering remains
+     // included in sampler CPU time while GPU waits remain excluded.
+     const auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    auto flush_backend = [&] {
++        if (deferred_backend && deferred_backend->sampled_token != LLAMA_TOKEN_NULL) {
++            gsmpl->set_backend_logits(ctx, *deferred_backend);
++            deferred_backend->sampled_token = LLAMA_TOKEN_NULL;
++        }
++    };
+ 
+     llama_token id = LLAMA_TOKEN_NULL;
+ 
+@@ -633,8 +658,6 @@
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, output);
+-
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+     {
+@@ -646,16 +669,21 @@
+             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+ 
+-            for (size_t i = 0; i < cur_p.size; ++i) {
+-                if (cur_p.data[i].id == id) {
+-                    cur_p.selected = i;
+-                    break;
+-                }
+-            }
+-
++            const size_t count = output.sampled_probs ? output.sampled_probs_count :
++                output.sampled_logits ? output.sampled_logits_count : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++            // Grow before acceptance as usual. Warm deferred rows cannot fail
++            // allocation when their final candidate view is materialized.
++            if (deferred_backend && count <= gsmpl->cur.capacity()) { *deferred_backend = output; }
++            else {
++                flush_backend();
++                gsmpl->set_backend_logits(ctx, output);
++            }
+             return id;
+         }
+     }
++
++    flush_backend();
++    gsmpl->set_logits(ctx, output);
+ 
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+@@ -723,9 +751,15 @@
+     // update only host sampler state; no context work is submitted between rows.
+     llama_synchronize(ctx);
+ 
++    llama_sampler_output last_backend{};
++    last_backend.sampled_token = LLAMA_TOKEN_NULL;
++    // Candidate values are unobservable between these non-throwing accepts.
++    auto * deferred = gsmpl->params.backend_sampling && !gsmpl->grmr && !gsmpl->rbudget &&
++        llama_sampler_can_defer_candidates(gsmpl->chain) ? &last_backend : nullptr;
++
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+-        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first, deferred);
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+@@ -739,13 +773,17 @@
+     }
+ 
+     if (i == draft.size()) {
+-        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first);
++        const llama_token id = common_sampler_sample_synchronized(gsmpl, ctx, idxs[i], grammar_first, deferred);
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+         result.push_back(id);
+     }
+ 
++    if (last_backend.sampled_token != LLAMA_TOKEN_NULL) {
++        const auto tm = gsmpl->tm();
++        gsmpl->set_backend_logits(ctx, last_backend);
++    }
+     return result;
+ }
+ 
+@@ -834,9 +872,10 @@
+ 
+         // rejected: tokens outside q's support keep all of p
+         residual.clear();
++        const common_sampling_probability_index q_index(q.data(), q.size(), cur_p->size, gsmpl->residual_order);
+         float sum = 0.0f;
+         for (size_t k = 0; k < cur_p->size; ++k) {
+-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
++            const float r = p_of(k) - q_index.probability(cur_p->data[k].id);
+             if (r > 0.0f) {
+                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                 sum += r;
+@@ -880,6 +919,10 @@
+     }
+ 
+     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
++}
++
++uint64_t common_sampler_get_candidate_rows(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->candidate_rows : 0;
+ }
+ 
+ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -92,6 +92,9 @@
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+ 
++// Successful candidate-row materializations. Like the timer, reset preserves
++// the cumulative count, cloning starts at zero and copying inherits the count.
++uint64_t common_sampler_get_candidate_rows(const struct common_sampler * gsmpl);
+ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+ 
+ // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+diff --git a/common/sampling-probability.h b/common/sampling-probability.h
+new file mode 100644
+--- /dev/null
++++ b/common/sampling-probability.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include "llama.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <new>
++#include <numeric>
++#include <vector>
++
++// A rejection residual repeatedly looks up q(token) for each target token.
++// Index only large supports. Sorting indexes (not probabilities) preserves the
++// first duplicate, all float bits and the caller's original arithmetic order.
++class common_sampling_probability_index {
++public:
++    static constexpr size_t max_entries = 262144; // at most 1 MiB of uint32_t indexes
++
++    common_sampling_probability_index(const llama_token_data * data, size_t size, size_t queries,
++                                     std::vector<uint32_t> & workspace) : data(data), size(size) {
++        if (size < 64 || queries < 64 || size > max_entries || queries <= 4096 / size) {
++            return;
++        }
++        try {
++            // Avoid vector's geometric capacity growth beyond the entry limit.
++            if (workspace.capacity() < size) {
++                std::vector<uint32_t> next(size);
++                workspace.swap(next);
++            } else {
++                workspace.resize(size);
++            }
++        } catch (const std::bad_alloc &) {
++            return; // The optimization must not make an otherwise viable sample fail.
++        }
++        std::iota(workspace.begin(), workspace.end(), uint32_t{0});
++        std::sort(workspace.begin(), workspace.end(), [data](uint32_t a, uint32_t b) {
++            return data[a].id < data[b].id || (data[a].id == data[b].id && a < b);
++        });
++        order = workspace.data();
++    }
++
++    float probability(llama_token id) const {
++        if (!order) {
++            for (size_t i = 0; i < size; ++i) {
++                if (data[i].id == id) { return data[i].p; }
++            }
++            return 0.0f;
++        }
++        const auto * found = std::lower_bound(order, order + size, id, [this](uint32_t index, llama_token token) {
++            return data[index].id < token;
++        });
++        return found != order + size && data[*found].id == id ? data[*found].p : 0.0f;
++    }
++
++    bool indexed() const { return order != nullptr; }
++
++private:
++    const llama_token_data * data;
++    const size_t size;
++    const uint32_t * order = nullptr;
++};
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4360,6 +4360,18 @@
+     return LLAMA_DEFAULT_SEED;
+ }
+ 
++bool llama_sampler_can_defer_candidates(const llama_sampler * sampler) {
++    if (!sampler || !sampler->iface) { return false; }
++    if (sampler->iface == &llama_sampler_chain_i) {
++        const auto * chain = static_cast<const llama_sampler_chain *>(sampler->ctx);
++        return std::all_of(chain->samplers.begin(), chain->samplers.end(), [](const llama_sampler_chain::info & entry) {
++            return llama_sampler_can_defer_candidates(entry.ptr);
++        });
++    }
++    const auto accept = sampler->iface->accept;
++    return !accept || accept == llama_sampler_empty_accept || accept == llama_sampler_dist_accept;
++}
++
+ // perf
+ 
+ struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -36,6 +36,8 @@
+ };
+ 
+ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
++// Accept handlers cannot inspect candidate storage or throw in this subset.
++LLAMA_API bool llama_sampler_can_defer_candidates(const llama_sampler * sampler);
+ void llama_sampler_backend_begin(llama_sampler * sampler);
+ 
+ struct llama_sampler * llama_sampler_init_dry_testing(
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -2,6 +2,7 @@
+ #include "ggml-cpp.h"
+ #include "../ggml/src/ggml-backend-impl.h"
+ #include "../src/llama-ext.h"
++#include "../src/llama-sampler.h"
+ #include "sampling.h"
+ #include "reasoning-budget.h"
+ 
+@@ -39,6 +40,7 @@
+     return backend;
+ }
+ 
++static ggml_backend_dev_t fixture_gpu_device = nullptr;
+ constexpr int width = 32, n_vocab = 259;
+ static llama_model_ptr fixture_model(bool hybrid = false) {
+     const std::string architecture = hybrid ? "qwen35" : "llama";
+@@ -94,11 +96,12 @@
+         ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+     };
+     auto params = llama_model_default_params();
+-    ggml_backend_dev_t devices[] = {nullptr};
+-    params.devices = devices; params.n_gpu_layers = 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
++    ggml_backend_dev_t devices[] = {fixture_gpu_device, nullptr};
++    params.devices = devices; params.n_gpu_layers = fixture_gpu_device ? 99 : 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
+     params.use_extra_bufts = false; params.no_host = true;
+     llama_model_ptr model(llama_model_init_from_user(meta.get(), init, nullptr, params));
+-    require(bool(model) && llama_model_size(model.get()) < 1024 * 1024, "tiny CPU model unavailable/oversized");
++    require(bool(model) && llama_model_size(model.get()) < 1024 * 1024, "tiny model unavailable/oversized");
++    require(!fixture_gpu_device || llama_model_n_devices(model.get()) > 0, "fixture model did not use GPU");
+     return model;
+ }
+ 
+@@ -506,6 +509,79 @@
+     }
+ }
+ 
++struct candidate_observer {
++    common_sampler * sampler;
++    int calls = 0;
++    int fail_at = 0;
++};
++static void observe_accept(llama_sampler * sampler, llama_token token) {
++    auto * observer = static_cast<candidate_observer *>(sampler->ctx);
++    const auto * candidates = common_sampler_get_candidates(observer->sampler, false);
++    require(candidates->selected >= 0 && candidates->selected < int64_t(candidates->size) &&
++            candidates->data[candidates->selected].id == token, "accept callback observed stale candidate state");
++    if (++observer->calls == observer->fail_at) { throw std::runtime_error("expected accept failure"); }
++}
++static void backend_candidate_fallbacks(llama_model * model, common_params_sampling params) {
++    params.backend_sampling = true;
++    params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
++    for (int fail_at : {0, 2}) {
++        auto context = fixture_context(model);
++        common_sampler_ptr sampler(common_sampler_init(model, params));
++        candidate_observer observer{sampler.get(), 0, fail_at};
++        static llama_sampler_i iface = {
++            tracked_name, observe_accept, tracked_apply, nullptr, nullptr, nullptr,
++            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
++        };
++        auto * chain = common_sampler_get(sampler.get());
++        llama_sampler_chain_add(chain, llama_sampler_init(&iface, &observer));
++        require(!llama_sampler_can_defer_candidates(chain), "custom accept callback entered deferred path");
++        require(llama_set_sampler(context.get(), 0, common_sampler_get_backend(sampler.get())), "observer backend registration failed");
++        common_batch batch(context.get());
++        for (int i = 0; i < 3; ++i) { batch.add(3 + 'x', i, 0, true); }
++        require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "observer decode failed");
++        llama_tokens draft;
++        for (int i = 0; i < 2; ++i) {
++            const auto output = llama_get_sampler_output_ith(context.get(), i);
++            require(output.sampled_token != LLAMA_TOKEN_NULL, "observer fixture needs backend selected tokens");
++            draft.push_back(output.sampled_token);
++        }
++        common_sampler_sample(sampler.get(), context.get(), 0);
++        const auto before = common_sampler_get_candidate_rows(sampler.get());
++        bool failed = false;
++        try { common_sampler_sample_and_accept_n(sampler.get(), context.get(), {0, 1, 2}, draft); }
++        catch (const std::runtime_error & error) { failed = std::string(error.what()) == "expected accept failure"; }
++        require(failed == bool(fail_at), "custom accept exception handling changed");
++        const auto expected = fail_at ? fail_at : 3;
++        require(observer.calls == expected && common_sampler_get_candidate_rows(sampler.get()) - before == size_t(expected),
++                "custom accept fallback skipped candidate materialization");
++        if (failed) { require(common_sampler_last(sampler.get()) == draft.front(), "failed accept updated history"); }
++    }
++    // A cold backend sampler grows storage before accepting tokens. Once warm,
++    // a three-row match must materialize only the final row.
++    for (bool warm : {false, true}) {
++        auto context = fixture_context(model);
++        common_sampler_ptr sampler(common_sampler_init(model, params));
++        require(llama_set_sampler(context.get(), 0, common_sampler_get_backend(sampler.get())), "capacity backend registration failed");
++        common_batch batch(context.get());
++        for (int i = 0; i < 3; ++i) { batch.add(3 + 'x', i, 0, true); }
++        require(llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "capacity fixture decode failed");
++        llama_tokens draft;
++        for (int i = 0; i < 2; ++i) { draft.push_back(llama_get_sampler_output_ith(context.get(), i).sampled_token); }
++        if (warm) { common_sampler_sample(sampler.get(), context.get(), 0); }
++        const auto before = common_sampler_get_candidate_rows(sampler.get());
++        require(common_sampler_sample_and_accept_n(sampler.get(), context.get(), {0, 1, 2}, draft).size() == 3, "capacity fixture did not accept three rows");
++        require(common_sampler_get_candidate_rows(sampler.get()) - before == (warm ? 1u : 2u), "candidate capacity growth ordering changed");
++        common_sampler_ptr cloned(common_sampler_clone(sampler.get()));
++        require(common_sampler_get_candidate_rows(cloned.get()) == 0, "clone did not reset work counter");
++        common_sampler_copy(sampler.get(), cloned.get());
++        const auto copied = common_sampler_get_candidate_rows(cloned.get());
++        require(copied == common_sampler_get_candidate_rows(sampler.get()), "copy lost work counter");
++        common_sampler_reset(cloned.get());
++        require(common_sampler_get_candidate_rows(cloned.get()) == copied, "reset cleared cumulative work counter");
++    }
++    std::puts("PASS: candidate callback/exception fallback, cold storage growth and clone/copy/reset counters");
++}
++
+ static void sort_reference_candidates(reference_sampler & sampler) {
+     auto & cur = sampler.current;
+     if (cur.sorted) { return; }
+@@ -609,8 +685,24 @@
+                 draft.push_back(token); draft_q.emplace_back(candidates->data, candidates->data + candidates->size);
+                 common_sampler_accept(preview.get(), token, true);
+             }
+-            if (mismatch >= 0) { draft[mismatch] = 0; draft_q[mismatch] = {{0, 0.f, 1.f}}; }
++            if (mismatch >= 0) {
++                draft[mismatch] = 0; draft_q[mismatch] = {{0, 0.f, 1.f}};
++                if (params.top_k == 0) {
++                    // Full support exercises the indexed residual with exact
++                    // comparison against the original linear lookup and RNG.
++                    for (llama_token id = 1; id < llama_vocab_n_tokens(llama_model_get_vocab(model)); ++id) {
++                        draft_q[mismatch].push_back({id, 0.f, 0.f});
++                    }
++                    draft_q[mismatch].push_back({0, 0.f, 0.f}); // first duplicate wins
++                }
++            }
+             std::mt19937 rng(common_sampler_get_seed(reference.chain.get()) ^ 0x9e3779b9u);
++            if (params.backend_sampling) {
++                // The backend token was already sampled by decode; this read does
++                // not advance RNG. Reuse its candidate capacity as serving does.
++                common_sampler_sample(next.get(), right.get(), idxs.front(), grammar_first);
++            }
++            const auto rows_before = common_sampler_get_candidate_rows(next.get());
+             synchronizations = 0;
+             const auto expected = rejection ? reference_batch_rejection(reference, rng, left.get(), idxs, draft, draft_q, grammar_first) :
+                                               reference_batch(reference, left.get(), idxs, draft, grammar_first);
+@@ -621,6 +713,11 @@
+             require(synchronizations.load() == 1, "batch sampling did not use exactly one context fence");
+             require(old_fences == expected.size(), "reference did not fence once per output token");
+             require(expected == actual, "batch sampling changed accepted tokens");
++            if (!rejection && params.backend_sampling) {
++                const auto rows = common_sampler_get_candidate_rows(next.get()) - rows_before;
++                require(rows == 1, "backend matching materialized intermediate candidate rows");
++                std::printf("PASS backend matching work: %zu legacy candidate rows -> %llu final row\n", expected.size(), (unsigned long long) rows);
++            }
+             same_candidates(reference.current, *common_sampler_get_candidates(next.get(), false));
+             require(common_sampler_last(next.get()) == expected.back(), "batch acceptance history changed");
+             // The next sample also checks continued sampler/grammar/reasoning RNG state.
+@@ -662,11 +759,22 @@
+     }
+ }
+ 
+-int main() {
++int main(int argc, char ** argv) {
+     try {
++        const bool cuda = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
++        require(argc == 1 || cuda, "usage: test-sampler-output-view [--cuda]");
+         require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
++        if (cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "explicit CUDA backend unavailable");
++            fixture_gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++            require(fixture_gpu_device, "CUDA fixture needs an available GPU");
++#else
++            std::puts("SKIP: CUDA backend not built"); return 77;
++#endif
++        }
+         auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-        require(device && ggml_backend_dev_count() == 1, "fixture must register CPU only");
++        require(device && (cuda || ggml_backend_dev_count() == 1), "CPU fixture must register CPU only");
+         original_init = device->iface.init_backend;
+         device->iface.init_backend = counted_init;
+         struct restore { ggml_backend_dev_t device; ~restore() { device->iface.init_backend = original_init; } } restore{device};
+@@ -684,9 +792,13 @@
+         speculative_checkpoint_requirements();
+         sampler_candidate_ownership(model.get(), params);
+         batch_eog(model.get(), params);
++        backend_candidate_fallbacks(model.get(), params);
+         auto batch_params = params;
+         batch_params.logit_bias = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}};
+         run_batch(model.get(), "CPU seeded matching/rejection", batch_params);
++        batch_params.top_k = 0; batch_params.top_p = 1.f; batch_params.min_p = 0.f;
++        run_batch(model.get(), "CPU full-support indexed rejection", batch_params);
++        batch_params.top_k = 20; batch_params.top_p = .9f; batch_params.min_p = params.min_p;
+         batch_params.temp = 0;
+         run_batch(model.get(), "CPU greedy matching/rejection", batch_params);
+         batch_params.temp = .7f;
+diff --git a/tests/test-sampling-probability.cpp b/tests/test-sampling-probability.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-sampling-probability.cpp
+@@ -0,0 +1,115 @@
++#include "sampling-probability.h"
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <random>
++#include <stdexcept>
++
++static bool fail_allocation = false;
++void * operator new(size_t size) {
++    if (fail_allocation) { throw std::bad_alloc(); }
++    if (void * p = std::malloc(size ? size : 1)) { return p; }
++    throw std::bad_alloc();
++}
++void operator delete(void * p) noexcept { std::free(p); }
++void operator delete(void * p, size_t) noexcept { std::free(p); }
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++static float linear(const std::vector<llama_token_data> & q, llama_token token) {
++    for (const auto & item : q) { if (item.id == token) { return item.p; } }
++    return 0.f;
++}
++static bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
++
++int main() {
++    try {
++        std::vector<uint32_t> workspace;
++        std::vector<llama_token_data> q;
++        for (int i = 0; i < 1024; ++i) { q.push_back({(i * 97) % 2048 - 1024, 0.f, float(i) / 1024.f}); }
++        q[1].p = -0.f;
++        q[2].p = std::numeric_limits<float>::quiet_NaN();
++        q[3].p = std::numeric_limits<float>::infinity();
++        q.push_back({q[1].id, 0.f, .7f});
++        q.push_back({q[2].id, 0.f, .8f});
++        const common_sampling_probability_index indexed(q.data(), q.size(), 2048, workspace);
++        require(indexed.indexed(), "large support did not index");
++        for (int id = -2048; id <= 2048; ++id) {
++            require(same_bits(indexed.probability(id), linear(q, id)), "lookup changed probability bits or first duplicate");
++        }
++        for (llama_token id : {std::numeric_limits<llama_token>::min(), std::numeric_limits<llama_token>::max()}) {
++            require(same_bits(indexed.probability(id), linear(q, id)), "extreme token lookup changed");
++        }
++        const auto * storage = workspace.data();
++        const auto capacity = workspace.capacity();
++        const common_sampling_probability_index reused(q.data(), q.size(), 2048, workspace);
++        require(workspace.data() == storage && workspace.capacity() == capacity, "warm lookup allocated workspace");
++        require(!common_sampling_probability_index(q.data(), 20, 2048, workspace).indexed(), "small support unnecessarily indexed");
++        require(!common_sampling_probability_index(q.data(), q.size(), 20, workspace).indexed(), "few queries unnecessarily indexed");
++        // A rejected oversize index must not read the hypothetical input.
++        require(!common_sampling_probability_index(nullptr, common_sampling_probability_index::max_entries + 1, 2048, workspace).indexed(),
++                "oversize support exceeded bounded workspace");
++        std::vector<uint32_t> empty;
++        fail_allocation = true;
++        const common_sampling_probability_index fallback(q.data(), q.size(), 2048, empty);
++        fail_allocation = false;
++        require(!fallback.indexed() && same_bits(fallback.probability(q[1].id), q[1].p), "allocation failure did not retain linear fallback");
++
++        q.clear();
++        constexpr size_t count = 8192;
++        for (size_t i = 0; i < count; ++i) { q.push_back({llama_token((i * 97) % count), 0.f, float(i % 7) / float(8 * count)}); }
++        const common_sampling_probability_index residual_index(q.data(), q.size(), count, workspace);
++        std::vector<llama_token_data> old_residual, new_residual;
++        float old_sum = 0.f, new_sum = 0.f;
++        for (size_t k = 0; k < count; ++k) {
++            const float p = float(k % 11) / float(9 * count);
++            const float a = p - linear(q, llama_token(k));
++            const float b = p - residual_index.probability(llama_token(k));
++            if (a > 0.f) { old_residual.push_back({llama_token(k), 0.f, a}); old_sum += a; }
++            if (b > 0.f) { new_residual.push_back({llama_token(k), 0.f, b}); new_sum += b; }
++        }
++        require(same_bits(old_sum, new_sum) && old_residual.size() == new_residual.size() &&
++                std::memcmp(old_residual.data(), new_residual.data(), old_residual.size() * sizeof(llama_token_data)) == 0,
++                "residual order or arithmetic changed");
++        std::mt19937 old_rng(424242), new_rng(424242);
++        auto sample = [](const std::vector<llama_token_data> & residual, float sum, std::mt19937 & rng) {
++            std::uniform_real_distribution<float> uniform(0.f, 1.f);
++            float u = uniform(rng) * sum;
++            for (const auto & item : residual) { u -= item.p; if (u <= 0.f) { return item.id; } }
++            return residual.back().id;
++        };
++        for (int i = 0; i < 4096; ++i) {
++            require(sample(old_residual, old_sum, old_rng) == sample(new_residual, new_sum, new_rng), "residual token changed");
++        }
++        require(old_rng == new_rng, "residual RNG state changed");
++
++        // Component benchmark includes rebuilding the index each rejection,
++        // with retained storage as on a warm sampler; it is not model tokens/s.
++        volatile float checksum = 0.f;
++        auto measure = [&](bool use_index) {
++            const auto begin = std::chrono::steady_clock::now();
++            for (int repeat = 0; repeat < 3; ++repeat) {
++                if (use_index) {
++                    const common_sampling_probability_index index(q.data(), q.size(), count, workspace);
++                    for (size_t k = 0; k < count; ++k) { checksum += index.probability(llama_token(k)); }
++                } else {
++                    for (size_t k = 0; k < count; ++k) { checksum += linear(q, llama_token(k)); }
++                }
++            }
++            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
++        };
++        const auto old_ms = measure(false), new_ms = measure(true);
++        std::printf("PASS: 4097 bit-exact lookups, duplicates/nonfinite/extreme IDs, allocation fallback, bounded warm reuse, 4096 residual draws and RNG\n");
++        std::printf("BENCH: 8192-support x 8192 lookups, 3 repeats including index sort: linear=%.3f ms indexed=%.3f ms workspace=%zu bytes checksum=%f\n",
++                    old_ms, new_ms, workspace.capacity() * sizeof(uint32_t), double(checksum));
++        return 0;
++    } catch (const std::exception & error) {
++        fail_allocation = false;
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}

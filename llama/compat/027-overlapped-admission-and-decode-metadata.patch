@@ -1,0 +1,842 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++#include "server-admission.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -1084,6 +1085,8 @@
+     llama_context * ctx_tgt = nullptr;
+ 
+     server_batch batch;
++    server_decode_metadata decode_metadata;
++    server_admission admission;
+ 
+     llama_model   * model_dft = nullptr;
+     llama_context * ctx_dft   = nullptr;
+@@ -1136,6 +1139,7 @@
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        admission.clear();
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1950,6 +1954,12 @@
+     }
+ 
+     bool launch_slot_with_task(server_slot & slot, server_task && task) {
++        auto prepared = std::move(task.preparation);
++        const auto work = prepared ? prepared->work : nullptr;
++        if (work && work->valid_model) {
++            GGML_ASSERT(work->ready.load(std::memory_order_acquire));
++            task.params.sampling = std::move(work->sampling);
++        }
+         // process per-request lora adapters
+         if (!task.params.lora.empty()) {
+             auto task_loras = construct_lora_list(task.params.lora);
+@@ -2015,7 +2025,7 @@
+             }
+         }
+ 
+-        if (!task.tokens.validate(ctx_tgt)) {
++        if (!(work && work->valid_model ? work->tokens_valid : task.tokens.validate(ctx_tgt))) {
+             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+             return false;
+         }
+@@ -2048,7 +2058,14 @@
+         // initialize samplers
+         if (task.need_sampling()) {
+             try {
+-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
++                if (work && work->valid_model) {
++                    if (work->error) {
++                        std::rethrow_exception(work->error);
++                    }
++                    slot.smpl = std::move(work->sampler);
++                } else {
++                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
++                }
+             } catch (std::exception & e) {
+                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+@@ -2989,8 +3006,16 @@
+ 
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+-        // while yielding, an encode / decode is running and only reading the server state is safe
++        // Slot/KV changes stay on the main thread. Prepare only task-owned CPU state here.
+         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
++            if (server_admission::eligible(task)) {
++                admission.prepare(task, slots.size(),
++                    [&] { return task.tokens.validate(ctx_tgt); },
++                    [model = model_tgt](common_params_sampling & sampling) {
++                        return common_sampler_init(model, sampling);
++                    },
++                    [this] { queue_tasks.wake(); });
++            }
+             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
+             return false;
+         }
+@@ -3004,6 +3029,12 @@
+             case SERVER_TASK_TYPE_TTS:
+             case SERVER_TASK_TYPE_DECISION:
+                 {
++                    if (task.preparation && task.preparation->work->valid_model &&
++                        !task.preparation->work->ready.load(std::memory_order_acquire)) {
++                        task.preparation->work->waiting = true;
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
+                     // special case: if input is provided via CLI, tokenize it first
+                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
+                     if (task.cli) {
+@@ -3495,6 +3526,7 @@
+     }
+ 
+     void update_slots() {
++        admission.resume_ready([this](int id_task) { queue_tasks.pop_deferred_task_by_id(id_task); });
+ #ifdef DEBUG_TIMINGS
+         static int64_t t_prev = 0;
+         int64_t t_start = ggml_time_us();
+@@ -4656,8 +4688,18 @@
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+-            if (ret == 0 && has_output) {
+-                llama_synchronize(ctx_tgt);
++            if (ret == 0) {
++                try {
++                    // Host-only work overlaps the asynchronous forward; the batch stays immutable.
++                    decode_metadata.prepare(batch.tokens, off, batch.view.size(), slots.size());
++                } catch (...) {
++                    // The caller may release slots or reuse the batch after an error.
++                    llama_synchronize(ctx_tgt);
++                    throw;
++                }
++                if (has_output) {
++                    llama_synchronize(ctx_tgt);
++                }
+             }
+         });
+ 
+@@ -4711,7 +4753,7 @@
+             return false; // retry with the updated n_batch
+         } else {
+             // success, apply batch metrics
+-            metrics_post_decode(off, batch.view.size(), has_output);
++            metrics_post_decode(has_output);
+         }
+ 
+         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+@@ -5084,36 +5126,21 @@
+     }
+ 
+     // has_output is computed by the caller, which also already synchronized the context if it is set
+-    void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
++    void metrics_post_decode(bool has_output) {
+         metrics.n_decode++;
+-        for (const auto & slot : slots) {
++        for (size_t i = 0; i < slots.size(); ++i) {
++            auto & slot = slots[i];
+             if (slot.is_processing()) {
+                 metrics.n_busy_slots++;
+             }
+             metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+-        }
+-
+-        // apply enqueued prompt tokens stats
+-        // note: a slot can be released before we get here, which clears its stats
+-        //       the tokens were still computed, counted in the global metrics, not in slot
+-        uint64_t n_prompt_tokens = 0;
+-
+-        for (int i = off; i < off + n_tokens; ++i) {
+-            const auto & t = batch.tokens[i];
+-
+-            if (!t.is_prompt) {
+-                continue; // generated tokens are handled after sampling
+-            }
+-
+-            n_prompt_tokens++;
+-
+-            auto & slot = slots[t.id_slot];
++            // Released slots no longer have stats, but their tokens still count globally.
+             if (slot.stats.is_set()) {
+-                slot.stats.n_prompt_processed++;
+-            }
+-        }
+-
+-        metrics_queue_prompt(n_prompt_tokens);
++                slot.stats.n_prompt_processed += decode_metadata.prompt_by_slot[i];
++            }
++        }
++
++        metrics_queue_prompt(decode_metadata.n_prompt);
+ 
+         if (has_output) {
+             // the context is already synchronized, so the timings are correct
+@@ -5123,10 +5150,9 @@
+         // advance the prompt timing of the slots that had tokens in this batch
+         // note: a second pass, it must run after the sync to reflect the compute
+         const int64_t t_now = ggml_time_us();
+-        for (int i = off; i < off + n_tokens; ++i) {
+-            const auto & t = batch.tokens[i];
+-            auto & slot = slots[t.id_slot];
+-            if (t.is_prompt && slot.stats.is_set()) {
++        for (size_t i : decode_metadata.prompt_slots) {
++            auto & slot = slots[i];
++            if (slot.stats.is_set()) {
+                 slot.stats.set_prompt_last(t_now);
+             }
+         }
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -3,6 +3,7 @@
+ #include "server-task.h"
+ 
+ #include <condition_variable>
++#include <atomic>
+ #include <deque>
+ #include <exception>
+ #include <mutex>
+@@ -17,7 +18,9 @@
+     int id = 0;
+     bool running  = false;
+     bool sleeping = false;
++    bool sleep_transition = false;
+     bool req_stop_sleeping = false;
++    std::atomic<bool> req_update{false};
+     int64_t time_last_task = 0;
+ 
+     // queues
+@@ -64,6 +67,10 @@
+     // Call when the state of one slot is changed, it will move one task from deferred to main queue
+     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
+     void pop_deferred_task(int id_slot);
++    void pop_deferred_task_by_id(int id_task);
++
++    // Wake the main loop without allocating a task (e.g. CPU admission completed).
++    void wake();
+ 
+     // if sleeping, request exiting sleep state and wait until it is done
+     // returns immediately if not sleeping
+@@ -71,6 +78,7 @@
+ 
+     bool is_sleeping() {
+         std::unique_lock<std::mutex> lock(mutex_tasks);
++        condition_tasks.wait(lock, [&] { return !sleep_transition; });
+         return sleeping;
+     }
+ 
+@@ -131,7 +139,7 @@
+     // for example: register order cb0, cb1, cb2
+     // entering sleep: queue.sleeping = true --> cb0(true) --> cb1(true) --> cb2(true)
+     // leaving sleep: cb2(false) --> cb1(false) --> cb0(false) --> queue.sleeping = false
+-    // note: caller will hold mutex_tasks while calling the callbacks
++    // entering callbacks run unlocked so workers can finish before model unload
+     void on_sleeping_state(std::function<void(bool)> callback) {
+         callback_sleeping_state.push_back(std::move(callback));
+     }
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -129,6 +129,24 @@
+     }
+ }
+ 
++void server_queue::pop_deferred_task_by_id(int id_task) {
++    std::lock_guard<std::mutex> lock(mutex_tasks);
++    auto it = std::find_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(),
++        [id_task](const server_task & task) { return task.id == id_task; });
++    if (it != queue_tasks_deferred.end()) {
++        queue_tasks.emplace_back(std::move(*it));
++        queue_tasks_deferred.erase(it);
++        time_last_task = ggml_time_ms();
++        condition_tasks.notify_one();
++    }
++}
++
++void server_queue::wake() {
++    req_update.store(true, std::memory_order_release);
++    std::lock_guard<std::mutex> lock(mutex_tasks);
++    condition_tasks.notify_all();
++}
++
+ void server_queue::terminate() {
+     std::unique_lock<std::mutex> lock(mutex_tasks);
+     running = false;
+@@ -289,7 +307,7 @@
+     constexpr auto max_wait_time = std::chrono::seconds(1);
+     auto should_sleep = [&]() -> bool {
+         // caller must hold mutex_tasks
+-        if (idle_sleep_ms < 0) {
++        if (idle_sleep_ms < 0 || !queue_tasks_deferred.empty()) {
+             return false;
+         }
+         int64_t now = ggml_time_ms();
+@@ -298,6 +316,10 @@
+ 
+     while (true) {
+         QUE_DBG("%s", "processing new tasks\n");
++        {
++            std::lock_guard<std::mutex> lock(mutex_tasks);
++            req_update = false;
++        }
+         if (process_new_tasks(false)) {
+             break; // terminate
+         }
+@@ -319,7 +341,7 @@
+         QUE_DBG("%s", "waiting for new tasks\n");
+         while (true) {
+             std::unique_lock<std::mutex> lock(mutex_tasks);
+-            if (!running || !queue_tasks.empty()) {
++            if (!running || !queue_tasks.empty() || req_update) {
+                 break; // go back to process new tasks or terminate
+             }
+ 
+@@ -327,11 +349,23 @@
+             if (should_sleep()) {
+                 QUE_INF("%s", "entering sleeping state\n");
+                 sleeping = true;
++                req_stop_sleeping = false;
++                sleep_transition = true;
++                // Unload may join a worker whose completion needs mutex_tasks.
++                lock.unlock();
+                 // Call order cb0 -> cb1 -> cb{N}
+-                for (auto & cb : callback_sleeping_state) {
+-                    cb(true);
++                std::exception_ptr sleep_error;
++                try {
++                    for (auto & cb : callback_sleeping_state) {
++                        cb(true);
++                    }
++                } catch (...) {
++                    sleep_error = std::current_exception();
+                 }
+-                req_stop_sleeping = false;
++                lock.lock();
++                sleep_transition = false;
++                condition_tasks.notify_all();
++                if (sleep_error) { std::rethrow_exception(sleep_error); }
+                 // wait until we are requested to exit sleeping state
+                 condition_tasks.wait(lock, [&]{
+                     return (!running || req_stop_sleeping);
+@@ -352,7 +386,7 @@
+             } else {
+                 // wait for new tasks or timeout for checking sleeping condition
+                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+-                    return (!queue_tasks.empty() || !running);
++                    return (!queue_tasks.empty() || !running || req_update);
+                 });
+                 if (res) {
+                     break; // new task arrived or terminate
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -16,6 +16,7 @@
+ 
+ 
+ struct common_speculative;
++struct server_task_preparation;
+ 
+ enum server_task_type {
+     SERVER_TASK_TYPE_COMPLETION,
+@@ -172,6 +173,7 @@
+     // used by SERVER_TASK_TYPE_INFERENCE
+     task_params   params;
+     server_tokens tokens;
++    std::shared_ptr<server_task_preparation> preparation;
+ 
+     // only used by CLI, this allow tokenizing CLI inputs on server side
+     // we need this because mtmd_context and vocab are not accessible outside of server_context
+diff --git a/tools/server/server-admission.h b/tools/server/server-admission.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-admission.h
+@@ -0,0 +1,187 @@
++#pragma once
++
++#include "server-task.h"
++#include "sampling.h"
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <exception>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++#include <utility>
++#include <vector>
++
++struct server_admission_work {
++    common_params_sampling sampling;
++    common_sampler_ptr sampler;
++    std::exception_ptr error;
++    std::function<common_sampler *(common_params_sampling &)> make_sampler;
++    std::function<void()> wake;
++    std::weak_ptr<server_task_preparation> owner;
++    std::atomic<bool> ready{false};
++    int id = -1;
++    bool tokens_valid = false;
++    bool valid_model = true;
++    bool waiting = false; // main thread only
++};
++
++struct server_task_preparation {
++    std::shared_ptr<server_admission_work> work;
++};
++
++// One persistent worker prepares CPU samplers without delaying the decode fence.
++struct server_admission {
++private:
++    std::vector<std::weak_ptr<server_admission_work>> pending;
++    std::deque<std::shared_ptr<server_admission_work>> queued;
++    std::mutex mutex;
++    std::condition_variable condition;
++    std::thread worker;
++    bool stopping = false;
++
++    void run() {
++        while (true) {
++            std::shared_ptr<server_admission_work> work;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                condition.wait(lock, [&] { return stopping || !queued.empty(); });
++                if (stopping) { return; }
++                work = std::move(queued.front());
++                queued.pop_front();
++            }
++            if (work->owner.expired()) { continue; }
++            try {
++                work->sampler.reset(work->make_sampler(work->sampling));
++            } catch (...) {
++                work->error = std::current_exception();
++            }
++            // No sampler/config access after publishing; admission can move them.
++            work->ready.store(true, std::memory_order_release);
++            try { work->wake(); } catch (...) { /* the ready result remains available */ }
++        }
++    }
++
++public:
++    ~server_admission() { clear(); }
++
++    static bool eligible(const server_task & task) {
++        if (task.cli || task.id_slot != -1 || task.is_parent() || task.is_child() || task.tokens.has_mtmd) {
++            return false;
++        }
++        if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
++            return false;
++        }
++        // The optional external grammar engine has a separate threading contract.
++        const auto & grammar = common_grammar_value(task.params.sampling.grammar);
++        return grammar.compare(0, 11, "%llguidance") != 0 && grammar.size() <= 64 * 1024 &&
++            task.params.sampling.generation_prompt.size() <= 64 * 1024;
++    }
++
++    template<typename Validate, typename Prepare, typename Wake>
++    bool prepare(server_task & task, size_t capacity, Validate && validate, Prepare && make_sampler, Wake && wake) {
++        if (!eligible(task) || (task.preparation && task.preparation->work->valid_model)) {
++            return false;
++        }
++        pending.erase(std::remove_if(pending.begin(), pending.end(),
++            [](const auto & p) { return p.expired(); }), pending.end());
++        if (pending.size() >= capacity) {
++            return false;
++        }
++        try {
++            auto prepared = std::make_shared<server_task_preparation>();
++            auto work = std::make_shared<server_admission_work>();
++            prepared->work = work;
++            work->owner = prepared;
++            work->id = task.id;
++            work->sampling = task.params.sampling;
++            work->tokens_valid = validate();
++            work->make_sampler = std::forward<Prepare>(make_sampler);
++            work->wake = std::forward<Wake>(wake);
++            pending.push_back(work);
++            if (work->tokens_valid) {
++                std::lock_guard<std::mutex> lock(mutex);
++                if (!worker.joinable()) { worker = std::thread([this] { run(); }); }
++                queued.push_back(work);
++            } else {
++                work->ready.store(true, std::memory_order_release);
++            }
++            task.preparation = std::move(prepared);
++            condition.notify_one();
++            return true;
++        } catch (...) {
++            return false; // Lookahead bookkeeping must not abort an active decode.
++        }
++    }
++
++    template<typename Resume>
++    void resume_ready(Resume && resume) {
++        for (auto & weak : pending) {
++            if (auto work = weak.lock()) {
++                if (work->waiting && work->ready.load(std::memory_order_acquire)) {
++                    resume(work->id);
++                    work->waiting = false;
++                }
++            }
++        }
++    }
++
++    // Prepared samplers hold vocab pointers. Drop them before unloading the model.
++    void clear() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++            queued.clear();
++        }
++        condition.notify_one();
++        if (worker.joinable()) { worker.join(); }
++        for (auto & weak : pending) {
++            if (auto work = weak.lock()) {
++                work->sampler.reset();
++                work->error = nullptr;
++                work->valid_model = false;
++                work->make_sampler = {};
++                work->wake = {};
++            }
++        }
++        pending.clear();
++        stopping = false;
++    }
++};
++
++struct server_decode_metadata {
++    std::vector<uint64_t> prompt_by_slot;
++    std::vector<size_t> prompt_slots;
++    uint64_t n_prompt = 0;
++
++    template<typename Tokens>
++    void prepare(const Tokens & tokens, size_t off, size_t count, size_t n_slots) {
++        if (off > tokens.size() || count > tokens.size() - off) {
++            throw std::out_of_range("decode metadata is outside the batch");
++        }
++        for (size_t slot : prompt_slots) {
++            prompt_by_slot[slot] = 0;
++        }
++        prompt_by_slot.resize(n_slots, 0);
++        prompt_slots.clear();
++        n_prompt = 0;
++        for (size_t i = off; i < off + count; ++i) {
++            const auto & token = tokens[i];
++            if (!token.is_prompt) {
++                continue;
++            }
++            if (token.id_slot < 0 || size_t(token.id_slot) >= n_slots) {
++                throw std::out_of_range("decode metadata has an invalid slot");
++            }
++            if (prompt_by_slot[token.id_slot] == 0) {
++                prompt_slots.push_back(token.id_slot);
++            }
++            ++prompt_by_slot[token.id_slot];
++            ++n_prompt;
++        }
++    }
++};
+diff --git a/tests/test-server-admission.cpp b/tests/test-server-admission.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-server-admission.cpp
+@@ -0,0 +1,291 @@
++#include "../tools/server/server-admission.h"
++#include "../tools/server/server-queue.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <future>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool ok, const char * message) {
++    if (!ok) { throw std::runtime_error(message); }
++}
++
++static server_task task_with_id(int id, server_task_type type = SERVER_TASK_TYPE_COMPLETION) {
++    server_task task(type); task.id = id; return task;
++}
++
++static void wait_ready(const server_task & task) {
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (!task.preparation->work->ready.load(std::memory_order_acquire)) {
++        require(std::chrono::steady_clock::now() < deadline, "sampler job did not finish");
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++}
++
++static void test_capacity_and_invalidation() {
++    server_admission admission;
++    auto a = task_with_id(1), b = task_with_id(2), c = task_with_id(3);
++    std::promise<void> entered, release;
++    auto started = entered.get_future(); auto gate = release.get_future().share();
++    std::atomic<int> calls{0};
++    auto valid = [] { return true; };
++    auto wake = [] {};
++    auto prepare = [&](common_params_sampling & params) -> common_sampler * {
++        ++calls; params.backend_sampling = false; return nullptr;
++    };
++    require(!admission.prepare(a, 0, valid, prepare, wake), "zero capacity must not prepare");
++    a.params.sampling.backend_sampling = true;
++    require(admission.prepare(a, 2, valid, [&, gate](common_params_sampling & params) -> common_sampler * {
++        entered.set_value(); gate.wait(); return prepare(params);
++    }, wake), "prepare first request");
++    require(started.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "worker did not start");
++    require(admission.prepare(b, 2, valid, prepare, wake), "prepare second request");
++    require(!admission.prepare(a, 2, valid, prepare, wake), "a deferred task is prepared once");
++    require(!admission.prepare(c, 2, valid, prepare, wake), "lookahead exceeds parallel capacity");
++    require(a.params.sampling.backend_sampling, "worker mutated queued request config");
++    std::weak_ptr<server_task_preparation> owner = a.preparation;
++    auto moved = std::move(a);
++    require(!owner.expired(), "queue moves must preserve prepared state");
++    moved.preparation.reset();
++    require(owner.expired(), "cancelled request must release its owner ticket");
++    require(!admission.prepare(c, 2, valid, prepare, wake), "cancelled running job must remain in memory budget");
++    release.set_value();
++    wait_ready(b);
++    require(admission.prepare(c, 2, valid, prepare, wake), "completed cancelled capacity is reusable");
++    wait_ready(c);
++    require(calls == 3, "unexpected repeated preparation");
++    admission.clear();
++    require(!b.preparation->work->valid_model && !c.preparation->work->valid_model,
++        "model unload must invalidate all live preparations");
++    require(admission.prepare(b, 2, valid, prepare, wake), "reload must prepare again");
++    wait_ready(b);
++    require(calls == 4, "reload reused old model preparation");
++
++    for (auto type : {SERVER_TASK_TYPE_CANCEL, SERVER_TASK_TYPE_CONTROL, SERVER_TASK_TYPE_TTS,
++            SERVER_TASK_TYPE_TRANSCRIBE_RT, SERVER_TASK_TYPE_EMBEDDING,
++            SERVER_TASK_TYPE_RERANK, SERVER_TASK_TYPE_DECISION}) {
++        require(!server_admission::eligible(task_with_id(9, type)), "unsafe/unprofitable task prepared");
++    }
++    auto excluded = task_with_id(9);
++    excluded.cli = true;
++    require(!server_admission::eligible(excluded), "CLI tokenization is not lookahead-safe");
++    excluded.cli = false; excluded.id_slot = 0;
++    require(!server_admission::eligible(excluded), "explicit slot affinity changed");
++    excluded.id_slot = -1; excluded.tokens.has_mtmd = true;
++    require(!server_admission::eligible(excluded), "media must keep existing path");
++    excluded.tokens.has_mtmd = false;
++    excluded.params.sampling.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, "%llguidance test");
++    require(!server_admission::eligible(excluded), "external grammar must keep existing path");
++    excluded.params.sampling.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, std::string(65537, 'a'));
++    require(!server_admission::eligible(excluded), "large grammar must keep existing path");
++    excluded.params.sampling.grammar = {}; excluded.id_parent = 1;
++    require(!server_admission::eligible(excluded), "child preparation must keep independent RNG");
++    excluded.id_parent = -1; excluded.child_tasks.emplace_back(SERVER_TASK_TYPE_COMPLETION);
++    require(!server_admission::eligible(excluded), "parent scheduling remains atomic");
++
++    auto invalid = task_with_id(10);
++    require(admission.prepare(invalid, 2, [] { return false; }, prepare, wake), "invalid token result not retained");
++    require(invalid.preparation->work->ready && !invalid.preparation->work->tokens_valid && calls == 4,
++        "invalid prompt must not construct a sampler");
++    admission.clear();
++    auto wake_failure = task_with_id(11);
++    require(admission.prepare(wake_failure, 1, valid, prepare,
++        [] { throw std::runtime_error("fixture wake failure"); }), "wake failure job not prepared");
++    wait_ready(wake_failure);
++    admission.clear(); // a failing notification must not terminate the worker/process
++}
++
++struct counted_tokens {
++    struct token { int32_t id_slot; bool is_prompt; };
++    std::vector<token> values;
++    mutable size_t reads = 0;
++    size_t size() const { return values.size(); }
++    const token & operator[](size_t i) const { ++reads; return values.at(i); }
++};
++
++static void test_decode_metadata() {
++    counted_tokens tokens;
++    for (int i = 0; i < 4096; ++i) { tokens.values.push_back({i % 3, i % 7 != 0}); }
++    server_decode_metadata metadata;
++    metadata.prepare(tokens, 17, 2048, 4);
++    require(tokens.reads == 2048, "metadata must scan each submitted token once");
++    std::vector<uint64_t> reference(4, 0);
++    for (size_t i = 17; i < 17 + 2048; ++i) {
++        const auto & token = tokens.values[i];
++        if (token.is_prompt) { ++reference[token.id_slot]; }
++    }
++    require(metadata.prompt_by_slot == reference, "mixed prompt/generated counts changed");
++    require(metadata.n_prompt == reference[0] + reference[1] + reference[2], "global count changed");
++    require(metadata.prompt_slots.size() == 3, "each prompt slot should be timed once");
++    const auto capacity = metadata.prompt_by_slot.capacity();
++    metadata.prepare(tokens, 0, 1, 4);
++    require(metadata.prompt_slots.empty() && metadata.n_prompt == 0, "stale counts on decode");
++    require(metadata.prompt_by_slot == std::vector<uint64_t>(4, 0), "stale counts after reuse");
++    require(metadata.prompt_by_slot.capacity() == capacity, "fixed slots must reuse storage");
++    bool thrown = false;
++    try { metadata.prepare(tokens, 4095, 2, 4); } catch (const std::out_of_range &) { thrown = true; }
++    require(thrown, "reject invalid sub-batch without unsigned overflow");
++    counted_tokens invalid; invalid.values = {{1, true}, {-1, true}};
++    thrown = false;
++    try { metadata.prepare(invalid, 0, 2, 2); } catch (const std::out_of_range &) { thrown = true; }
++    require(thrown, "reject invalid prompt slot");
++    metadata.prepare(tokens, 1, 2, 3);
++    require(metadata.n_prompt == 2 && metadata.prompt_by_slot == std::vector<uint64_t>({0, 1, 1}),
++        "retry after failure must clear partial metadata");
++    std::puts("metadata: 2048 token reads; previous two post-forward scans required 4096");
++}
++
++static void test_real_queue_overlap() {
++    server_queue queue;
++    server_admission admission;
++    std::promise<void> enqueued, entered, release;
++    auto submitted = enqueued.get_future(), started = entered.get_future();
++    auto gate = release.get_future().share();
++    std::weak_ptr<server_task_preparation> cancelled;
++    std::vector<int> committed;
++    int failures = 0, cancellations = 0, updates = 0;
++    std::atomic<bool> forwarding{false};
++    queue.on_new_task([&](server_task && task, bool yielding) {
++        if (task.type == SERVER_TASK_TYPE_METRICS) { enqueued.set_value(); return true; }
++        if (yielding) {
++            if (server_admission::eligible(task)) {
++                const int id = task.id;
++                admission.prepare(task, 3, [] { return true; },
++                    [&, id, gate](common_params_sampling & params) -> common_sampler * {
++                        if (id == 501) { entered.set_value(); gate.wait(); }
++                        params.backend_sampling = false;
++                        if (id == 503) { throw std::invalid_argument("fixture sampler failure"); }
++                        return nullptr;
++                    }, [&] { queue.wake(); });
++                if (id == 501) { cancelled = task.preparation; }
++            }
++            return false;
++        }
++        require(!forwarding, "slot commit ran before forward completion");
++        if (task.type == SERVER_TASK_TYPE_CANCEL) { ++cancellations; return true; }
++        auto work = task.preparation->work;
++        if (!work->ready.load(std::memory_order_acquire)) {
++            work->waiting = true;
++            queue.defer(std::move(task));
++            return true;
++        }
++        committed.push_back(task.id);
++        require(!work->sampling.backend_sampling, "worker config changes were not published");
++        if (work->error) {
++            try { std::rethrow_exception(work->error); }
++            catch (const std::invalid_argument & e) {
++                require(std::string(e.what()) == "fixture sampler failure", "request error changed");
++                ++failures;
++            }
++        }
++        if (task.id == 503) { queue.terminate(); }
++        return true;
++    });
++    queue.on_update_slots([&] {
++        admission.resume_ready([&](int id) { queue.pop_deferred_task_by_id(id); });
++        if (++updates == 1) {
++            queue.yield_to_queue([&] {
++                forwarding = true;
++                queue.post(task_with_id(501)); queue.post(task_with_id(502)); queue.post(task_with_id(503));
++                queue.post(task_with_id(901, SERVER_TASK_TYPE_METRICS));
++                require(submitted.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "enqueue did not overlap");
++                require(started.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "persistent worker did not start");
++                forwarding = false;
++            });
++            // The slow sampler is still blocked, but the current forward fence returned.
++            require(committed.empty(), "pending sampler was synchronously admitted");
++        } else if (updates == 2) {
++            require(queue.queue_tasks_deferred_size() == 3, "pending preparation was not deferred");
++            auto cancel = task_with_id(700, SERVER_TASK_TYPE_CANCEL); cancel.id_target = 501;
++            queue.post(std::move(cancel));
++            require(cancelled.expired(), "queue cancellation retained owner ticket");
++            release.set_value();
++        }
++    });
++    queue.on_sleeping_state([&](bool sleeping) {
++        require(!sleeping, "deferred preparation must prevent idle sleep, even at timeout zero");
++    });
++    queue.start_loop(0);
++    require(committed == std::vector<int>({502, 503}), "FIFO/cancellation order changed");
++    require(cancellations == 1 && failures == 1, "deferred error or cancellation was lost");
++    admission.clear();
++    std::puts("queue: blocked sampler did not stall forward; FIFO, cancellation, deferred errors and sleep-zero passed");
++}
++
++static void test_unload_wake_join() {
++    server_queue queue;
++    server_admission admission;
++    auto task = task_with_id(1);
++    std::promise<void> entered, release;
++    auto started = entered.get_future(); auto gate = release.get_future().share();
++    require(admission.prepare(task, 1, [] { return true; },
++        [&, gate](common_params_sampling &) -> common_sampler * {
++            entered.set_value(); gate.wait(); return nullptr;
++        }, [&] { queue.wake(); }), "unload preparation not started");
++    require(started.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "unload worker did not start");
++    queue.on_new_task([](server_task &&, bool) { return true; });
++    queue.on_update_slots([] {});
++    queue.on_sleeping_state([&](bool sleeping) {
++        if (sleeping) {
++            release.set_value();
++            admission.clear(); // worker wake must not wait on a mutex held by this callback
++            require(!task.preparation->work->valid_model, "unload retained sampler vocabulary");
++            queue.terminate();
++        }
++    });
++    queue.start_loop(0);
++    std::puts("unload: worker completion/wake joined before model invalidation without queue-lock deadlock");
++}
++
++static void test_sleep_publication_and_resume() {
++    server_queue queue;
++    std::atomic<bool> cache_ready{false};
++    bool resumed = false;
++    int sleeps = 0;
++    std::promise<void> reading, waking;
++    auto read_started = reading.get_future(), wake_started = waking.get_future();
++    std::future<bool> observer;
++    std::future<void> requester;
++    queue.on_new_task([](server_task &&, bool) { return true; });
++    queue.on_update_slots([&] { if (resumed) { queue.terminate(); } });
++    queue.on_sleeping_state([&](bool sleeping) {
++        if (!sleeping) { resumed = true; return; }
++        ++sleeps;
++        observer = std::async(std::launch::async, [&] {
++            reading.set_value();
++            (void) queue.is_sleeping();
++            return cache_ready.load();
++        });
++        requester = std::async(std::launch::async, [&] {
++            waking.set_value();
++            queue.wait_until_no_sleep();
++        });
++        require(read_started.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
++            "sleep observer did not start");
++        require(wake_started.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
++            "wake request did not start");
++        require(observer.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
++            "sleep was published before route caches were ready");
++        require(requester.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
++            "HTTP request continued before model reload");
++        cache_ready = true;
++    });
++    queue.start_loop(0);
++    require(sleeps == 1 && resumed, "wake during unload was lost");
++    require(observer.get(), "observer saw uninitialized sleeping caches");
++    requester.get();
++    std::puts("sleep: cached-state publication serialized; wake during unload preserved");
++}
++
++int main() {
++    try {
++        test_capacity_and_invalidation(); test_decode_metadata();
++        test_real_queue_overlap(); test_unload_wake_join(); test_sleep_publication_and_resume();
++        std::puts("server admission: all checks passed (CPU only, no model)"); return 0;
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "server admission: %s\n", e.what()); return 1;
++    }
++}

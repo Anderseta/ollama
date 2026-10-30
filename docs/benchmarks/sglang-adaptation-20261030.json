@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-30",
+  "status": "passed",
+  "artifact": "sglang_inspired_prefix_and_verification_and_admission",
+  "base_commit": "07f7bb2bcfbd712a003eaacf8b1e426628645939",
+  "native_base": "llama.cpp b11845 plus WildLlama patches 001-027",
+  "scope": "Windows native runtime, exact synthetic CPU/CUDA comparisons; no large-model download or new model TPS benchmark.",
+  "changes": {
+    "025_prefix_index": {
+      "method": "Borrowed immutable token spans, sorted with adjacent exact longest-common-prefix lengths.",
+      "activation": "At least four snapshots; original comparator for smaller/multimodal/incomplete indexes.",
+      "index_entry_payload_budget_bytes": 1048576,
+      "checkpoint_data_and_scoring_unchanged": true,
+      "shared_gpu_kv_pages_implemented": false,
+      "fixture": {
+        "entries": 128,
+        "shared_prefix_tokens": 8192,
+        "linear_token_comparisons": 1048705,
+        "indexed_token_comparisons": 8206
+      }
+    },
+    "026_verification": {
+      "matching": "Defer intermediate host candidate reconstruction only when target backend sampling already supplied selected tokens and acceptance cannot observe candidates or throw.",
+      "warm_candidate_materializations_per_batch": 1,
+      "cold_candidate_materializations_per_batch": 2,
+      "final_candidates_and_selected_index_preserved": true,
+      "graph_output_transfers_unchanged": true,
+      "device_side_commit_graph_added": false,
+      "residual_index": "Large supports use a bounded reusable sorted token index; preserves first duplicates, probability bits, arithmetic order and RNG.",
+      "residual_workspace_budget_bytes": 1048576,
+      "default_small_topk_cpu_target_path_unchanged": true
+    },
+    "027_overlap": {
+      "request_preparation": "One lazy persistent CPU worker; task-owned sampling configuration; outstanding jobs bounded by native parallel capacity.",
+      "no_join_at_decode_fence": true,
+      "model_unload_joins_before_vocab_release": true,
+      "cancelled_running_jobs_retain_budget_until_finish": true,
+      "grammar_and_generation_prompt_lookahead_limit_bytes": 65536,
+      "excluded": "CLI, media, parent/child, explicit slots, external LLGuidance, TTS/realtime, non-sampling tasks.",
+      "prefill_metadata_token_passes": {
+        "before": 2,
+        "after": 1
+      },
+      "sleep": "Deferred requests prevent sleep; entering callbacks release queue mutex, guard cached-state publication and retain wake requests.",
+      "next_token_execution_speculated_ahead_of_dependencies": false
+    }
+  },
+  "validation": {
+    "native_cpu_ctest": {
+      "passed": 23,
+      "failed": 0,
+      "tests": [
+        "test-server-prefix-cache",
+        "test-server-admission",
+        "cuda-tuning-policy",
+        "moe-admission",
+        "moe-budget",
+        "moe-partition",
+        "moe-readiness",
+        "moe-read-plan",
+        "moe-copy-plan",
+        "moe-work-batch",
+        "moe-ram-admission",
+        "moe-packed-rows",
+        "moe-expert-plan",
+        "speculative-depth",
+        "state-transfer",
+        "scheduler-exceptions",
+        "prepare-async",
+        "test-kv-trim-ranges",
+        "test-prompt-state-transaction",
+        "mtp-state",
+        "mtp-carry-state",
+        "sampler-output-view",
+        "cuda-graph-reuse-policy"
+      ]
+    },
+    "standalone_msvc_helpers": [
+      "prompt-prefix-index",
+      "sampling-probability"
+    ],
+    "native_cuda_ctest": {
+      "passed": 5,
+      "failed": 0,
+      "tests": [
+        "cuda-dense",
+        "dense-embedding",
+        "sampler-output-view-cuda",
+        "cuda-graph-reuse",
+        "cuda-graph-reuse-disabled"
+      ]
+    },
+    "server_components": {
+      "passed": 44,
+      "assertions": 184,
+      "failed": 0
+    },
+    "cpu_cuda_sampler_exact_equivalence": "Passed ordinary/greedy/backend matching/rejection, grammar, reasoning, sparse/negative output rows, candidates and subsequent RNG state; verifies warm/cold work counts and callback/exception fallback.",
+    "residual_probability_fixture": {
+      "bit_exact_lookups": 4097,
+      "residual_samples_and_subsequent_rng_states": 4096,
+      "allocation_failure_and_bounds": "passed"
+    },
+    "prefix_cache_fixture": "Original scoring/list tie order, cost-based selection, exact fallback, snapshot eviction/moves and contained prompt replacement.",
+    "admission_fixture": "Bounded preparation, real queue/worker overlap, cancellation, deferred errors, no decode-fence join, sleep-zero, unload/wake join and cached-state publication.",
+    "cpu_cuda_moe_cache": "passed",
+    "cuda_host_provider_failure_recovery": "passed",
+    "native_http_before_after": {
+      "cpu_plain": {
+        "status": "passed",
+        "cases_per_payload": 25,
+        "gpu": false,
+        "speculative": false,
+        "fixture_bytes": 28628288,
+        "outputs_sha256": "f424ebd7cfb35b36776dfa29338157d97123abf653fe486a25a31a62291b947e",
+        "throughput_measured": false
+      },
+      "cpu_draft": {
+        "status": "passed",
+        "cases_per_payload": 25,
+        "gpu": false,
+        "speculative": true,
+        "fixture_bytes": 28628288,
+        "outputs_sha256": "5a82cd91a311155391d6ca299c7075283d8fa76ac9d78e330f19758eba0a9281",
+        "throughput_measured": false
+      },
+      "gpu_plain": {
+        "status": "passed",
+        "cases_per_payload": 25,
+        "gpu": true,
+        "speculative": false,
+        "fixture_bytes": 28628288,
+        "outputs_sha256": "0638f9abf7d79db27a82d9f0ae052002b1e889fb00a67eb7bafcb62b2e7e3024",
+        "throughput_measured": false
+      },
+      "gpu_draft": {
+        "status": "passed",
+        "cases_per_payload": 25,
+        "gpu": true,
+        "speculative": true,
+        "fixture_bytes": 28628288,
+        "outputs_sha256": "b55edeea1af9ff7b990dcd9c1ead988ccfeacbbfb8d131a815fb9117699181f8",
+        "throughput_measured": false
+      }
+    },
+    "legacy_cpu_http_eight_sampling_cases": {
+      "status": "passed",
+      "fixture_bytes": 28628288,
+      "cases_per_payload": 8,
+      "cpu_only": true,
+      "content_tokens_probabilities_equal": true,
+      "outputs_sha256": "156cb87235ab35e1fd290a9a50a24b7eb236ec5e3874a1aace873a1376cafb47",
+      "large_model_loaded": false,
+      "throughput_measured": false
+    },
+    "patch_replay": {
+      "patches": [
+        "001-llama-cpp-hooks.patch",
+        "002-moe-ram-limit.patch",
+        "003-runtime-performance.patch",
+        "004-gpu-first-moe.patch",
+        "005-live-runtime-activity.patch",
+        "006-moe-residency-pipeline.patch",
+        "007-dense-runtime.patch",
+        "008-runtime-efficiency.patch",
+        "009-bounded-copy-pipeline.patch",
+        "010-scheduler-exception-contract.patch",
+        "011-moe-read-and-execution-batching.patch",
+        "012-expert-major-and-packed-rows.patch",
+        "013-resident-gpu-tuning.patch",
+        "014-kv-reclamation-and-prompt-state.patch",
+        "015-mtp-checkpoint-state.patch",
+        "016-tuning-reuse.patch",
+        "017-sampler-output-view.patch",
+        "018-speculative-round-efficiency.patch",
+        "019-cuda-graph-reuse.patch",
+        "020-checkpoint-restore-transaction.patch",
+        "021-sampler-batch-fences-and-owned-candidates.patch",
+        "022-sampler-init-and-mtp-state-transactions.patch",
+        "023-speculative-snapshot-and-clone-ownership.patch",
+        "024-moe-binding-transaction.patch",
+        "025-prompt-prefix-index.patch",
+        "026-postverify-candidate-and-residual-work.patch",
+        "027-overlapped-admission-and-decode-metadata.patch"
+      ],
+      "files": 137,
+      "comparison": "exact UTF-8 text with CRLF/LF normalized",
+      "line_ending_only_differences": [
+        "src/llama-model-ram.cpp",
+        "src/llama-moe-cache.cpp",
+        "src/llama-state-transfer.h",
+        "tests/test-server-admission.cpp",
+        "tests/test-state-transfer.cpp"
+      ],
+      "fresh_apply_passed": true,
+      "second_apply_passed": true
+    },
+    "final_build_source_integrity": "All source, compatibility patch and fixture hashes stable across final successful build.",
+    "native_payload_cli_help": "passed"
+  },
+  "inspiration": {
+    "sglang_commit": "3b6c28b0b9aff784115bafeecc67f37e1fe43454",
+    "scheduler": "https://github.com/sgl-project/sglang/blob/3b6c28b0b9aff784115bafeecc67f37e1fe43454/python/sglang/srt/managers/scheduler.py",
+    "prefix_cache": "https://github.com/sgl-project/sglang/blob/3b6c28b0b9aff784115bafeecc67f37e1fe43454/python/sglang/srt/mem_cache/unified_radix_cache.py",
+    "post_verification": "https://github.com/sgl-project/sglang/blob/3b6c28b0b9aff784115bafeecc67f37e1fe43454/python/sglang/srt/speculative/eagle_post_verify_graphs.py"
+  },
+  "component_benchmarks": {
+    "cache_selection": {
+      "entries": 32,
+      "shared_prefix_tokens": 8192,
+      "queries_per_sample": 1000,
+      "sample_order": "before/after/after/before",
+      "linear_median_ms": 153.4186,
+      "indexed_median_ms": 5.24365,
+      "scope": "Selection only, artificial token spans and snapshots; excludes inference/state transfer."
+    }
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublasLt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "55b232c7e337ffe76f05939066264af02091b467135ca06b1adf75f49a0a2690",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "4af0595e477888d2eaf73b408987c98450c805f99b7dc21c06e4fe1acc0f1d28",
+    "lib/ollama/ggml-cpu.dll": "d0eba92771ebf758ac70197e990b9a396e06f73c67f5cb2f06945912554fc523",
+    "lib/ollama/ggml.dll": "683e7236e9e89fb88cb38c78c6a47a510006d2277af64da62dd03b1baffff3bb",
+    "lib/ollama/llama-common.dll": "413436eb7ff381f2e7517ac22b91a4385f1e9271f7fbd0fe4315f27268103f42",
+    "lib/ollama/llama-quantize-impl.dll": "36f4e2e38e7b1cca7f72dfac9f92692081cd3865d192a09764db5893afbf81fe",
+    "lib/ollama/llama-quantize.exe": "b33b1d7b878161465d5bbf938aca9f850f75bb9f723f3a20124f336ba44ac6cb",
+    "lib/ollama/llama-server-impl.dll": "e9dc924a48758e947ef57f58fe75b734ba59b6338a1b47a08f8b07116bee1502",
+    "lib/ollama/llama-server.exe": "f3be8c3734a4e08aca4ed9333631b8e132182dc0d5b19193b2db10739e783c5f",
+    "lib/ollama/llama.dll": "615b8471a18be45c491a06d198bcf60cad849bab58633a296e4715b55a7f7949",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "9eb59d76982d3bfe13c528a46c825f09de0b8bb04b193908bf77bb6c52278cab",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715"
+  },
+  "limits": [
+    "No end-to-end performance comparison with SGLang or the user Qwen checkpoints was run.",
+    "Component work reductions are not model TPS gains.",
+    "No new shared GPU KV-page manager, next-token future pipeline or device-side verification commit graph is claimed.",
+    "The Ollama wrapper can serialize requests before the native queue for restricted architectures.",
+    "Backend candidate deferral requires target backend sampling; large-support residual indexing leaves small-top-k CPU-target MTP unchanged.",
+    "Index and sampler workspaces are bounded metadata, separate from model-weight RAM and CUDA allocation budgets.",
+    "Windows execution only; no Linux/HIP/Metal runtime validation in this update.",
+    "Model weights, quantization, requested logical context and saved sampling profiles are preserved."
+  ]
+}

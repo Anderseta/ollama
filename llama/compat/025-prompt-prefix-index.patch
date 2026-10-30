@@ -1,0 +1,816 @@
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -3,6 +3,7 @@
+ #include "common.h"
+ #include "llama.h"
+ #include "state-transaction.h"
++#include "server-prefix-index.h"
+ 
+ #include <string>
+ #include <unordered_set>
+@@ -679,6 +680,8 @@
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
++    // Scratch for a query on the inference thread; not part of serialized state.
++    mutable size_t indexed_lcp = 0;
+ 
+     size_t size() const {
+         size_t res = data.size();
+@@ -722,6 +725,13 @@
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec);
+ 
+     void update();
++
++private:
++    // Only immutable text snapshots enter this optional index. Multimodal keys
++    // retain server_tokens' exact media-ID and position-aware comparison.
++    server_prefix_index<llama_token, server_prompt_cache_state *> prefix_index;
++    bool prepare_prefix_lengths(const server_tokens & tokens) const;
++    void erase_state(std::list<server_prompt_cache_state>::iterator state);
+ };
+ 
+ // used exclusively by router mode
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1744,9 +1744,31 @@
+     return res;
+ }
+ 
++bool server_prompt_cache::prepare_prefix_lengths(const server_tokens & tokens) const {
++    // Tiny caches keep the simpler path. A missing index entry (capacity or
++    // allocation pressure) also preserves the original complete search.
++    if (tokens.has_mtmd || states.size() < 4 || prefix_index.size() != states.size()) {
++        return false;
++    }
++    const auto & text = tokens.get_tokens();
++    prefix_index.query(text.data(), text.size(), [](server_prompt_cache_state * state, size_t lcp) {
++        state->indexed_lcp = lcp;
++    });
++    return true;
++}
++
++void server_prompt_cache::erase_state(std::list<server_prompt_cache_state>::iterator state) {
++    // The index borrows this token span. Remove it before moving or destroying
++    // either the prompt or its state, including successful checkpoint restores.
++    prefix_index.erase(&*state);
++    states.erase(state);
++}
++
+ bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size) const {
++    const bool indexed = prepare_prefix_lengths(prompt.tokens);
+     for (const auto & state : states) {
+-        if (state.prompt.tokens.get_common_prefix(prompt.tokens) == (int) prompt.tokens.size()) {
++        const size_t lcp = indexed ? state.indexed_lcp : state.prompt.tokens.get_common_prefix(prompt.tokens);
++        if (lcp == prompt.tokens.size()) {
+             return false;
+         }
+     }
+@@ -1773,13 +1795,15 @@
+     }
+ 
+     // remove any cached prompts that are fully contained in the current prompt
++    const bool indexed = prepare_prefix_lengths(prompt.tokens);
+     for (auto it = states.begin(); it != states.end();) {
+-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
++        const int len = indexed ? it->indexed_lcp : it->prompt.tokens.get_common_prefix(prompt.tokens);
+ 
+         if (len == (int) it->prompt.tokens.size()) {
+             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+ 
+-            it = states.erase(it);
++            const auto obsolete = it++;
++            erase_state(obsolete);
+         } else {
+             ++it;
+         }
+@@ -1791,13 +1815,32 @@
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            erase_state(states.begin());
+         }
+     }
+ 
+     // Splice is noexcept: only a complete entry becomes visible, after all
+     // allocations and the target/draft/spec capture have succeeded.
+     states.splice(states.end(), pending);
++    auto & published = states.back();
++    if (states.size() < 4) {
++        // Do not pay index maintenance for caches that use the linear path.
++        prefix_index.clear();
++    } else {
++        const auto index_state = [&](server_prompt_cache_state & state) {
++            if (!state.prompt.tokens.has_mtmd) {
++                const auto & text = state.prompt.tokens.get_tokens();
++                // Indexing is optional; failure retains the complete snapshot
++                // and searches use the original exact linear path.
++                prefix_index.insert(&state, text.data(), text.size());
++            }
++        };
++        if (states.size() == 4 && prefix_index.size() == 0) {
++            for (auto & state : states) { index_state(state); }
++        } else {
++            index_state(published);
++        }
++    }
+     return &states.back();
+ }
+ 
+@@ -1817,12 +1860,13 @@
+     if (size_t(lcp_best) == tokens_new.size()) {
+         return states.end();
+     }
++    const bool indexed = prepare_prefix_lengths(tokens_new);
+ 
+     if (prompt_us_per_token > 0 && restore_us_per_byte > 0) {
+         auto best = states.end();
+         double saving_best = 0;
+         for (auto it = states.begin(); it != states.end(); ++it) {
+-            const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
++            const int lcp = indexed ? it->indexed_lcp : it->prompt.tokens.get_common_prefix(tokens_new);
+             if (lcp <= lcp_best) {
+                 continue;
+             }
+@@ -1844,7 +1888,7 @@
+ 
+     // find the most similar cached prompt, that would also preserve the most context
+     for (auto it = states.begin(); it != states.end(); ++it) {
+-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
++        const int lcp_cur = indexed ? it->indexed_lcp : it->prompt.tokens.get_common_prefix(tokens_new);
+ 
+         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+@@ -1889,6 +1933,7 @@
+             return false;
+         }
+ 
++        prefix_index.erase(&*it_best);
+         prompt = std::move(it_best->prompt);
+ 
+         const int64_t restore_us = ggml_time_us() - restore_start;
+@@ -1908,7 +1953,7 @@
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            erase_state(states.begin());
+         }
+     }
+ 
+@@ -1923,9 +1968,11 @@
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
+-        }
+-    }
++            erase_state(states.begin());
++        }
++    }
++
++    if (states.size() < 4) { prefix_index.clear(); }
+ 
+     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+diff --git a/tools/server/server-prefix-index.h b/tools/server/server-prefix-index.h
+new file mode 100644
+--- /dev/null
++++ b/tools/server/server-prefix-index.h
+@@ -0,0 +1,153 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <new>
++#include <vector>
++
++// Exact shared-prefix lookup over immutable, borrowed token spans. Sorted spans
++// plus adjacent LCP lengths encode a compact radix index without copying a token
++// or allocating a node per token. Owners must erase a key before moving/freeing
++// its span. All operations are confined to the server's inference thread.
++template <typename Token, typename Key>
++class server_prefix_index {
++    struct entry {
++        Key key;
++        const Token * tokens;
++        size_t count;
++        size_t previous_lcp;
++    };
++
++    struct comparison {
++        int order;
++        size_t lcp;
++    };
++
++    struct position {
++        size_t offset;
++        size_t previous_lcp;
++        size_t next_lcp;
++    };
++
++    std::vector<entry> entries;
++    size_t max_entries;
++
++    static comparison compare(const Token * tokens, size_t count, const entry & other, size_t start = 0) {
++        const size_t end = std::min(count, other.count);
++        while (start < end && tokens[start] == other.tokens[start]) {
++            ++start;
++        }
++        if (start < end) {
++            return { tokens[start] < other.tokens[start] ? -1 : 1, start };
++        }
++        return { count < other.count ? -1 : count > other.count ? 1 : 0, start };
++    }
++
++    size_t between(size_t a, size_t b) const {
++        if (a > b) { std::swap(a, b); }
++        size_t lcp = entries[a].count;
++        for (size_t i = a + 1; i <= b; ++i) {
++            lcp = std::min(lcp, entries[i].previous_lcp);
++        }
++        return lcp;
++    }
++
++    comparison compare_from_anchor(const Token * tokens, size_t count, size_t other,
++                                   size_t anchor, size_t anchor_lcp) const {
++        const size_t shared = between(anchor, other);
++        if (shared < anchor_lcp) {
++            // The query follows the anchor beyond this branch. Its ordering
++            // relative to the other span is therefore already known exactly.
++            return { anchor < other ? -1 : 1, shared };
++        }
++        return compare(tokens, count, entries[other], anchor_lcp);
++    }
++
++    position locate(const Token * tokens, size_t count) const {
++        if (entries.empty()) { return { 0, 0, 0 }; }
++        comparison low = compare(tokens, count, entries.front());
++        if (low.order <= 0) { return { 0, 0, low.lcp }; }
++        const size_t last = entries.size() - 1;
++        if (last == 0) { return { 1, low.lcp, 0 }; }
++        comparison high = compare_from_anchor(tokens, count, last, 0, low.lcp);
++        if (high.order > 0) { return { entries.size(), high.lcp, 0 }; }
++
++        size_t left = 0, right = last;
++        while (right - left > 1) {
++            const size_t mid = left + (right - left) / 2;
++            const comparison found = low.lcp >= high.lcp
++                ? compare_from_anchor(tokens, count, mid, left, low.lcp)
++                : compare_from_anchor(tokens, count, mid, right, high.lcp);
++            if (found.order > 0) {
++                left = mid;
++                low = found;
++            } else {
++                right = mid;
++                high = found;
++            }
++        }
++        return { right, low.lcp, high.lcp };
++    }
++
++public:
++    // At most one MiB of index entries by default, independent of prompt length.
++    // Cache snapshots and their token arrays remain owned by the existing cache.
++    explicit server_prefix_index(size_t max_entries = (1u << 20) / sizeof(entry)) : max_entries(max_entries) {}
++
++    size_t size() const { return entries.size(); }
++    size_t allocated_bytes() const { return entries.capacity() * sizeof(entry); }
++    void clear() { entries.clear(); }
++
++    bool insert(Key key, const Token * tokens, size_t count) {
++        if (entries.size() >= max_entries) { return false; }
++        const position where = locate(tokens, count);
++        // Reserve before changing any existing neighbor or entry. A failed
++        // optional index allocation must never invalidate a cache snapshot.
++        if (entries.size() == entries.capacity()) {
++            const size_t capacity = std::min(max_entries, std::max(size_t(4), entries.capacity() * 2));
++            try {
++                entries.reserve(capacity);
++            } catch (const std::bad_alloc &) {
++                return false;
++            }
++        }
++        entries.insert(entries.begin() + where.offset, { key, tokens, count, where.previous_lcp });
++        if (where.offset + 1 < entries.size()) {
++            entries[where.offset + 1].previous_lcp = where.next_lcp;
++        }
++        return true;
++    }
++
++    void erase(Key key) {
++        for (size_t i = 0; i < entries.size(); ++i) {
++            if (entries[i].key != key) { continue; }
++            if (i + 1 < entries.size()) {
++                entries[i + 1].previous_lcp = i == 0 ? 0
++                    : std::min(entries[i].previous_lcp, entries[i + 1].previous_lcp);
++            }
++            entries.erase(entries.begin() + i);
++            return;
++        }
++    }
++
++    template <typename Emit>
++    void query(const Token * tokens, size_t count, Emit emit) const {
++        if (entries.empty()) { return; }
++        const position where = locate(tokens, count);
++        const bool use_previous = where.offset == entries.size() ||
++            (where.offset > 0 && where.previous_lcp > where.next_lcp);
++        const size_t pivot = use_previous ? where.offset - 1 : where.offset;
++        const size_t pivot_lcp = use_previous ? where.previous_lcp : where.next_lcp;
++        emit(entries[pivot].key, pivot_lcp);
++        size_t lcp = pivot_lcp;
++        for (size_t i = pivot; i > 0; --i) {
++            lcp = std::min(lcp, entries[i].previous_lcp);
++            emit(entries[i - 1].key, lcp);
++        }
++        lcp = pivot_lcp;
++        for (size_t i = pivot + 1; i < entries.size(); ++i) {
++            lcp = std::min(lcp, entries[i].previous_lcp);
++            emit(entries[i].key, lcp);
++        }
++    }
++};
+diff --git a/tests/test-prompt-prefix-index.cpp b/tests/test-prompt-prefix-index.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-prompt-prefix-index.cpp
+@@ -0,0 +1,277 @@
++#include "../tools/server/server-prefix-index.h"
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string>
++
++static long fail_allocation = -1;
++
++#if defined(_MSC_VER)
++#define TEST_NOINLINE __declspec(noinline)
++#else
++#define TEST_NOINLINE __attribute__((noinline))
++#endif
++
++TEST_NOINLINE void * operator new(size_t size) {
++    if (fail_allocation >= 0 && fail_allocation-- == 0) { throw std::bad_alloc(); }
++    if (void * p = std::malloc(size ? size : 1)) { return p; }
++    throw std::bad_alloc();
++}
++TEST_NOINLINE void * operator new[](size_t size) { return ::operator new(size); }
++TEST_NOINLINE void operator delete(void * p) noexcept { std::free(p); }
++TEST_NOINLINE void operator delete[](void * p) noexcept { std::free(p); }
++TEST_NOINLINE void operator delete(void * p, size_t) noexcept { std::free(p); }
++TEST_NOINLINE void operator delete[](void * p, size_t) noexcept { std::free(p); }
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++template <typename T>
++static size_t linear_lcp(const std::vector<T> & a, const std::vector<T> & b) {
++    size_t i = 0;
++    while (i < a.size() && i < b.size() && a[i] == b[i]) { ++i; }
++    return i;
++}
++
++static void check_query(const server_prefix_index<int, size_t> & index,
++                        const std::vector<std::vector<int>> & spans,
++                        const std::vector<bool> & active, const std::vector<int> & query) {
++    std::vector<size_t> found(spans.size(), std::numeric_limits<size_t>::max());
++    fail_allocation = 0;
++    index.query(query.data(), query.size(), [&](size_t key, size_t lcp) { found[key] = lcp; });
++    require(fail_allocation == 0, "lookup allocated memory");
++    fail_allocation = -1;
++    for (size_t i = 0; i < spans.size(); ++i) {
++        const size_t expected = active[i] ? linear_lcp(spans[i], query) : std::numeric_limits<size_t>::max();
++        require(found[i] == expected, "indexed prefix differs from exact scan");
++    }
++}
++
++static void exhaustive_and_lifetimes() {
++    std::vector<std::vector<int>> spans = {{}};
++    size_t first = 0, last = 1;
++    for (int depth = 0; depth < 4; ++depth) {
++        for (size_t i = first; i < last; ++i) {
++            for (int token = 0; token < 3; ++token) {
++                auto value = spans[i];
++                value.push_back(token);
++                spans.push_back(std::move(value));
++            }
++        }
++        first = last;
++        last = spans.size();
++    }
++    // Include exact duplicates and zero/negative/max token values.
++    spans.push_back(spans[40]);
++    spans.push_back({-1, 0, std::numeric_limits<int>::max()});
++    std::vector<size_t> order(spans.size());
++    std::iota(order.begin(), order.end(), 0);
++    std::mt19937 random(87123);
++    std::shuffle(order.begin(), order.end(), random);
++    server_prefix_index<int, size_t> index;
++    std::vector<bool> active(spans.size(), false);
++    for (size_t key : order) {
++        require(index.insert(key, spans[key].data(), spans[key].size()), "insert failed");
++        active[key] = true;
++        for (const auto & query : spans) { check_query(index, spans, active, query); }
++    }
++    std::shuffle(order.begin(), order.end(), random);
++    for (size_t key : order) {
++        index.erase(key);
++        active[key] = false;
++        for (const auto & query : spans) { check_query(index, spans, active, query); }
++        // Erased spans may be destroyed immediately, even before the next query.
++        std::vector<int>().swap(spans[key]);
++    }
++    require(index.size() == 0, "erase left entries");
++}
++
++static void random_branch_updates() {
++    std::mt19937 random(829041);
++    std::vector<std::vector<int>> spans(64);
++    for (size_t i = 0; i < spans.size(); ++i) {
++        spans[i].assign(128 + random() % 128, 7);
++        for (size_t j = 0; j < 12; ++j) { spans[i].push_back(random() % 4); }
++    }
++    server_prefix_index<int, size_t> index;
++    std::vector<bool> active(spans.size(), false);
++    for (int step = 0; step < 1000; ++step) {
++        const size_t key = random() % spans.size();
++        if (active[key]) {
++            index.erase(key);
++            active[key] = false;
++        } else {
++            require(index.insert(key, spans[key].data(), spans[key].size()), "random insert failed");
++            active[key] = true;
++        }
++        auto query = spans[random() % spans.size()];
++        if (step % 3 == 0) { query.resize(random() % (query.size() + 1)); }
++        if (step % 5 == 0) { query.push_back(9); }
++        check_query(index, spans, active, query);
++    }
++}
++
++static void allocation_and_bounds() {
++    std::vector<std::vector<int>> spans = {{1, 2, 3}, {1, 2, 4}, {1, 2}, {1, 3}, {2, 2}, {9}};
++    server_prefix_index<int, size_t> index;
++    fail_allocation = 0;
++    const bool inserted = index.insert(0, spans[0].data(), spans[0].size());
++    fail_allocation = -1;
++    require(!inserted && index.size() == 0, "failed initial reserve published entry");
++    std::vector<bool> active(spans.size(), false);
++    for (size_t i = 0; i < 4; ++i) {
++        require(index.insert(i, spans[i].data(), spans[i].size()), "retry insert failed");
++        active[i] = true;
++    }
++    const size_t before_bytes = index.allocated_bytes();
++    fail_allocation = 0;
++    const bool grown = index.insert(4, spans[4].data(), spans[4].size());
++    fail_allocation = -1;
++    require(!grown && index.size() == 4 && index.allocated_bytes() == before_bytes,
++            "failed growth changed existing index");
++    for (const auto & query : spans) { check_query(index, spans, active, query); }
++    require(index.insert(4, spans[4].data(), spans[4].size()), "growth retry failed");
++    active[4] = true;
++    for (const auto & query : spans) { check_query(index, spans, active, query); }
++
++    server_prefix_index<int, size_t> bounded(3);
++    for (size_t i = 0; i < 3; ++i) {
++        require(bounded.insert(i, spans[i].data(), spans[i].size()), "bounded insert failed");
++    }
++    require(!bounded.insert(3, spans[3].data(), spans[3].size()), "entry bound exceeded");
++    bounded.erase(1);
++    require(bounded.insert(3, spans[3].data(), spans[3].size()), "freed entry capacity unavailable");
++}
++
++struct counted_token {
++    int value;
++    static size_t comparisons;
++    bool operator==(counted_token other) const { ++comparisons; return value == other.value; }
++    bool operator<(counted_token other) const { ++comparisons; return value < other.value; }
++};
++size_t counted_token::comparisons = 0;
++
++static void shared_prefix_work() {
++    constexpr size_t count = 128, prefix = 8192;
++    std::vector<std::vector<counted_token>> spans(count, std::vector<counted_token>(prefix, {1}));
++    server_prefix_index<counted_token, size_t> index;
++    for (size_t i = 0; i < count; ++i) {
++        spans[i].push_back({int(i)});
++        spans[i].push_back({19});
++        require(index.insert(i, spans[i].data(), spans[i].size()), "shared-prefix insert failed");
++    }
++    auto query = spans[67];
++    query.push_back({3});
++    counted_token::comparisons = 0;
++    std::array<size_t, count> indexed{};
++    index.query(query.data(), query.size(), [&](size_t key, size_t lcp) { indexed[key] = lcp; });
++    const size_t indexed_work = counted_token::comparisons;
++    counted_token::comparisons = 0;
++    for (size_t i = 0; i < count; ++i) {
++        require(indexed[i] == linear_lcp(spans[i], query), "shared-prefix result mismatch");
++    }
++    const size_t linear_work = counted_token::comparisons;
++    require(indexed_work < prefix + 64, "shared prefix was rescanned per cache entry");
++    require(linear_work > count * prefix, "reference did not inspect common prefixes");
++    std::printf("shared-prefix token comparisons: linear=%zu indexed=%zu entries=%zu prefix=%zu\n",
++                linear_work, indexed_work, count, prefix);
++}
++
++static void benchmark() {
++    for (size_t prefix : {size_t(16), size_t(8192)}) {
++    for (size_t count : {size_t(1), size_t(2), size_t(4), size_t(32), size_t(128)}) {
++        constexpr size_t loops = 500;
++        std::vector<std::vector<int>> spans(count, std::vector<int>(prefix, 1));
++        server_prefix_index<int, size_t> index;
++        for (size_t i = 0; i < count; ++i) {
++            spans[i].push_back(int(i));
++            spans[i].push_back(9);
++            index.insert(i, spans[i].data(), spans[i].size());
++        }
++        auto query = spans[count / 2];
++        query.push_back(7);
++        volatile size_t sum = 0;
++        for (int iteration = 0; iteration < 4; ++iteration) {
++            const bool indexed = iteration == 1 || iteration == 2;
++            const auto start = std::chrono::steady_clock::now();
++            for (size_t loop = 0; loop < loops; ++loop) {
++                if (indexed) {
++                    index.query(query.data(), query.size(), [&](size_t, size_t lcp) { sum += lcp; });
++                } else {
++                    for (const auto & span : spans) { sum += linear_lcp(span, query); }
++                }
++            }
++            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
++            std::printf("benchmark entries=%zu prefix=%zu indexed=%d loops=%zu us=%.3f index_bytes=%zu checksum=%zu\n",
++                        count, prefix, indexed, loops, us, index.allocated_bytes(), size_t(sum));
++        }
++    }
++    }
++}
++
++static void benchmark_maintenance() {
++    for (size_t prefix : {size_t(16), size_t(8192)}) {
++        for (size_t count : {size_t(1), size_t(2), size_t(4), size_t(32)}) {
++            for (int iteration = 0; iteration < 4; ++iteration) {
++                const bool indexed = iteration == 1 || iteration == 2;
++                std::vector<std::vector<int>> spans(count, std::vector<int>(prefix, 1));
++                server_prefix_index<int, size_t> index;
++                for (size_t i = 0; i < count; ++i) {
++                    spans[i].push_back(int(i));
++                    spans[i].push_back(9);
++                    if (indexed && count >= 4) { index.insert(i, spans[i].data(), spans[i].size()); }
++                }
++                std::vector<int> query(prefix, 1);
++                query.push_back(0);
++                query.push_back(0);
++                volatile size_t sum = 0;
++                const auto start = std::chrono::steady_clock::now();
++                for (size_t loop = 0; loop < 500; ++loop) {
++                    const size_t key = loop % count;
++                    query[prefix] = int(key);
++                    query.back() = int(loop + 20);
++                    // The two existing scans are containment and obsolete-prefix
++                    // checks. Replace a fixed key afterward to measure upkeep.
++                    for (int pass = 0; pass < 2; ++pass) {
++                        if (indexed && count >= 4) {
++                            index.query(query.data(), query.size(), [&](size_t, size_t lcp) { sum += lcp; });
++                        } else {
++                            for (const auto & span : spans) { sum += linear_lcp(span, query); }
++                        }
++                    }
++                    if (indexed && count >= 4) { index.erase(key); }
++                    auto replacement = query;
++                    spans[key] = std::move(replacement);
++                    if (indexed && count >= 4) { index.insert(key, spans[key].data(), spans[key].size()); }
++                }
++                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
++                std::printf("maintenance entries=%zu prefix=%zu indexed=%d us=%.3f checksum=%zu\n",
++                            count, prefix, indexed, us, size_t(sum));
++            }
++        }
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        exhaustive_and_lifetimes();
++        random_branch_updates();
++        allocation_and_bounds();
++        shared_prefix_work();
++        if (argc > 1 && std::string(argv[1]) == "--bench") { benchmark(); benchmark_maintenance(); }
++        std::puts("prompt prefix index: PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        fail_allocation = -1;
++        std::fprintf(stderr, "prompt prefix index: FAIL: %s\n", error.what());
++        return 1;
++    }
++}
+diff --git a/tests/test-server-prefix-cache.cpp b/tests/test-server-prefix-cache.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-server-prefix-cache.cpp
+@@ -0,0 +1,193 @@
++#include "server-task.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <random>
++#include <stdexcept>
++#include <string>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++static server_prompt make_prompt(const llama_tokens & tokens, bool media = false) {
++    server_prompt result;
++    result.tokens = server_tokens(tokens, media);
++    return result;
++}
++
++static server_prompt_data make_data(size_t bytes, uint8_t tag = 1) {
++    server_prompt_data result;
++    result.main.assign(bytes, tag);
++    result.drft.assign(7, tag + 1);
++    result.spec.assign(11, tag + 2);
++    return result;
++}
++
++// Independent copy of the pre-index selection rules: ordering and restore-cost
++// decisions must remain identical, including the unmeasured legacy heuristic.
++static server_prompt_cache_state * reference_best(server_prompt_cache & cache,
++        const server_prompt & live, const server_tokens & query) {
++    if (query.empty()) { return nullptr; }
++    const int baseline = live.tokens.get_common_prefix(query);
++    if (size_t(baseline) == query.size()) { return nullptr; }
++    server_prompt_cache_state * best = nullptr;
++    if (cache.prompt_us_per_token > 0 && cache.restore_us_per_byte > 0) {
++        double saving_best = 0;
++        for (auto & state : cache.states) {
++            const int lcp = state.prompt.tokens.get_common_prefix(query);
++            if (lcp <= baseline) { continue; }
++            const double saving = (lcp - baseline)*cache.prompt_us_per_token -
++                1.1*state.size()*cache.restore_us_per_byte;
++            if (saving > saving_best || (saving == saving_best && best && state.size() < best->size())) {
++                best = &state;
++                saving_best = saving;
++            }
++        }
++        return best;
++    }
++    float keep = live.tokens.size() ? float(baseline) / live.tokens.size() : -1.0f;
++    float similarity = float(baseline) / query.size();
++    for (auto & state : cache.states) {
++        const int lcp = state.prompt.tokens.get_common_prefix(query);
++        const float candidate_keep = float(lcp) / state.prompt.tokens.size();
++        const float candidate_similarity = float(lcp) / query.size();
++        if (candidate_keep >= 0.25f && keep < candidate_keep && similarity < candidate_similarity) {
++            best = &state;
++            keep = candidate_keep;
++            similarity = candidate_similarity;
++        }
++    }
++    return best;
++}
++
++static void check_selection(server_prompt_cache & cache, const server_prompt & live, const server_tokens & query) {
++    const auto expected = reference_best(cache, live, query);
++    const auto found = cache.find_best(live, query);
++    require((found == cache.states.end() ? nullptr : &*found) == expected,
++            "prefix index changed cache selection");
++}
++
++static void selection_and_mutation() {
++    server_prompt_cache cache(0, 0);
++    std::vector<llama_tokens> prompts;
++    for (int i = 0; i < 32; ++i) {
++        llama_tokens tokens(128 + i, 7);
++        tokens.push_back(100 + i);
++        tokens.insert(tokens.end(), i + 1, 5);
++        prompts.push_back(tokens);
++        auto prompt = make_prompt(tokens);
++        auto * entry = cache.alloc(prompt, make_data(32 + i, uint8_t(i)));
++        require(entry && entry->data.drft.size() == 7 && entry->data.spec.size() == 11,
++                "snapshot auxiliary state changed");
++    }
++    const auto empty = make_prompt({});
++    std::mt19937 random(78231);
++    for (int mode = 0; mode < 3; ++mode) {
++        cache.prompt_us_per_token = mode == 0 ? 0 : 10;
++        cache.restore_us_per_byte = mode == 2 ? 1e9 : 0.01;
++        for (int iteration = 0; iteration < 500; ++iteration) {
++            auto query = prompts[random() % prompts.size()];
++            if (iteration % 2 == 0) { query.resize(random() % (query.size() + 1)); }
++            if (iteration % 3 == 0) { query.push_back(77); }
++            const server_tokens incoming(query, false);
++            check_selection(cache, empty, incoming);
++            check_selection(cache, make_prompt(llama_tokens(iteration % 160, 7)), incoming);
++        }
++        cache.states.reverse(); // list order matters for the unmeasured rule
++    }
++    require(!cache.can_save(make_prompt(prompts[0]), 1), "contained prompt was saved twice");
++    auto extended = prompts[0];
++    extended.push_back(42);
++    require(cache.alloc(make_prompt(extended), make_data(80)), "extension not published");
++    require(cache.states.size() == 32, "obsolete prefix not removed");
++    check_selection(cache, empty, server_tokens(extended, false));
++
++    // Moving the owning list preserves its nodes and their immutable token spans.
++    server_prompt_cache moved = std::move(cache);
++    moved.restore_us_per_byte = 0.001;
++    check_selection(moved, empty, server_tokens(extended, false));
++    moved.limit_size = 300;
++    moved.update();
++    require(moved.size() <= moved.limit_size, "memory eviction exceeded bound");
++    check_selection(moved, empty, server_tokens(prompts[31], false));
++    moved.limit_size = 0;
++    moved.limit_tokens = 1;
++    moved.update();
++    require(moved.states.empty(), "token eviction retained snapshots");
++    for (int i = 0; i < 8; ++i) {
++        require(moved.alloc(make_prompt(prompts[i]), make_data(32)), "reinsert after eviction failed");
++    }
++    check_selection(moved, empty, server_tokens(prompts[4], false));
++}
++
++static void fallback_paths() {
++    server_prompt_cache cache(0, 0);
++    for (int i = 0; i < 8; ++i) {
++        // Media-capable token containers use their original exact comparator.
++        // Real media IDs and checkpoint serialization are not flattened by the index.
++        require(cache.alloc(make_prompt({1, 2, 3, llama_token(i + 10)}, i == 3), make_data(16)),
++                "mixed cache insertion failed");
++    }
++    const auto live = make_prompt({1});
++    for (bool media : {false, true}) {
++        for (int i = 0; i < 8; ++i) {
++            check_selection(cache, live, server_tokens({1, 2, 3, llama_token(i + 10), 22}, media));
++        }
++    }
++    require(!cache.can_save(make_prompt({1, 2, 3}), 1), "fallback containment differs");
++    const size_t before = cache.states.size();
++    require(!cache.alloc(make_prompt({99}), {}), "empty capture published");
++    require(cache.states.size() == before, "failed capture evicted snapshots");
++}
++
++static void benchmark() {
++    const auto live = make_prompt({});
++    for (size_t length : {size_t(16), size_t(8192)}) {
++        for (size_t count : {size_t(1), size_t(2), size_t(4), size_t(32)}) {
++            server_prompt_cache cache(0, 0);
++            std::vector<llama_tokens> prompts(count, llama_tokens(length, 1));
++            for (size_t i = 0; i < count; ++i) {
++                prompts[i].push_back(llama_token(i + 2));
++                require(cache.alloc(make_prompt(prompts[i]), make_data(32)), "benchmark insert failed");
++            }
++            auto next = prompts[count / 2];
++            next.push_back(99);
++            const server_tokens query(next, false);
++            cache.prompt_us_per_token = 100;
++            cache.restore_us_per_byte = 0.001;
++            volatile size_t checksum = 0;
++            for (int iteration = 0; iteration < 4; ++iteration) {
++                const bool indexed = iteration == 1 || iteration == 2;
++                const auto start = std::chrono::steady_clock::now();
++                for (int loop = 0; loop < 1000; ++loop) {
++                    if (indexed) {
++                        const auto best = cache.find_best(live, query);
++                        checksum += best == cache.states.end() ? 0 : best->size();
++                    } else {
++                        const auto best = reference_best(cache, live, query);
++                        checksum += best ? best->size() : 0;
++                    }
++                }
++                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
++                std::printf("cache selection entries=%zu prefix=%zu indexed=%d us=%.3f checksum=%zu\n",
++                            count, length, indexed, us, size_t(checksum));
++            }
++        }
++    }
++}
++
++int main(int argc, char ** argv) {
++    try {
++        selection_and_mutation();
++        fallback_paths();
++        if (argc > 1 && std::string(argv[1]) == "--bench") { benchmark(); }
++        std::puts("server prefix cache: PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "server prefix cache: FAIL: %s\n", error.what());
++        return 1;
++    }
++}

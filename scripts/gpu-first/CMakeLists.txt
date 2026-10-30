@@ -106,6 +106,17 @@ validation_target(test-server-component server-context)
 target_include_directories(test-server-component PRIVATE
     "${WILDLLAMA_NATIVE}/tools/server" "${WILDLLAMA_NATIVE}/tests")
 
+# Exact prefix lookup and bounded CPU admission use tiny offline fixtures.
+add_executable(test-prompt-prefix-index "${WILDLLAMA_NATIVE}/tests/test-prompt-prefix-index.cpp")
+target_compile_features(test-prompt-prefix-index PRIVATE cxx_std_17)
+add_test(NAME prompt-prefix-index COMMAND test-prompt-prefix-index)
+foreach(test_name IN ITEMS test-server-prefix-cache test-server-admission)
+    validation_target(${test_name} server-context)
+    target_include_directories(${test_name} PRIVATE "${WILDLLAMA_NATIVE}/tools/server" "${WILDLLAMA_NATIVE}/tests")
+    target_link_libraries(${test_name} PRIVATE Threads::Threads)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+
 # Offline dense calibration is explicit; its policy tests never initialize CUDA.
 add_executable(test-cuda-tuning-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cuda-tuning-policy.cpp")
 target_compile_features(test-cuda-tuning-policy PRIVATE cxx_std_17)
@@ -192,6 +203,17 @@ validation_target(test-sampler-output-view llama-common)
 add_dependencies(test-sampler-output-view ggml-cpu)
 target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
 add_test(NAME sampler-output-view COMMAND test-sampler-output-view)
+add_executable(test-sampling-probability "${WILDLLAMA_NATIVE}/tests/test-sampling-probability.cpp")
+target_compile_features(test-sampling-probability PRIVATE cxx_std_17)
+target_include_directories(test-sampling-probability PRIVATE
+    "${WILDLLAMA_NATIVE}/common" "${WILDLLAMA_NATIVE}/include" "${WILDLLAMA_NATIVE}/ggml/include")
+add_test(NAME sampling-probability COMMAND test-sampling-probability)
+if(TARGET ggml-cuda)
+    add_dependencies(test-sampler-output-view ggml-cuda)
+    target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
+    add_test(NAME sampler-output-view-cuda COMMAND test-sampler-output-view --cuda)
+    set_tests_properties(sampler-output-view-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
 
 # Eligibility policy runs on CPU; the separate CUDA fixture has a 64 MiB quota.
 add_executable(test-cuda-graph-reuse-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cuda-graph-reuse-policy.cpp")
