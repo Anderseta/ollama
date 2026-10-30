@@ -1,0 +1,711 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,7 @@
+ #include "ggml-cuda.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
++#include "llama-graph-variant-policy.h"
+ #include "llama-impl.h"
+ #include "llama-batch.h"
+ #include "llama-io.h"
+@@ -396,6 +397,10 @@
+         if (graph_reuse_disable) {
+             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+         }
++        // Disabled by default: retained compute arenas trade memory for fewer
++        // graph rebuilds. This budget is separate from, and charged within,
++        // the native backend allocation quota.
++        graph_variant_budget = llama_graph_variant_policy::parse_budget(getenv("WILDLLAMA_GRAPH_VARIANTS_MIB"));
+     }
+ 
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+@@ -672,6 +677,7 @@
+ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
++    graph_variants_clear();
+ 
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+@@ -824,6 +830,7 @@
+ }
+ 
+ void llama_context::sched_new(size_t max_nodes, bool parallel) {
++    graph_variants_clear();
+     if (sched) {
+         const auto stats = ggml_backend_sched_get_gpu_stats(sched.get());
+         gpu_stats_previous.cpu_heavy_ops_submitted += stats.cpu_heavy_ops_submitted;
+@@ -848,6 +855,7 @@
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+ 
+     synchronize();
++    graph_variants_clear();
+ 
+     const int64_t t_start_us = ggml_time_us();
+ 
+@@ -1072,6 +1080,12 @@
+ 
+ ggml_backend_sched_gpu_stats llama_context::get_gpu_sched_stats() const {
+     auto stats = ggml_backend_sched_get_gpu_stats(sched.get());
++    for (const auto & variant : graph_variants) {
++        if (!variant.sched) { continue; }
++        const auto retained = ggml_backend_sched_get_gpu_stats(variant.sched.get());
++        stats.cpu_heavy_ops_submitted += retained.cpu_heavy_ops_submitted;
++        stats.gpu_heavy_ops_submitted += retained.gpu_heavy_ops_submitted;
++    }
+     stats.cpu_heavy_ops_submitted += gpu_stats_previous.cpu_heavy_ops_submitted;
+     stats.gpu_heavy_ops_submitted += gpu_stats_previous.gpu_heavy_ops_submitted;
+     return stats;
+@@ -1170,6 +1184,10 @@
+                 }
+         }
+ 
++        // Only a real update invalidates the variants. The common NO_UPDATE
++        // path must not discard the cache on every decode.
++        graph_variants_clear();
++
+         // reset the previous graph results to make sure that they won't be reused
+         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
+         for (auto & res : gf_res_prev) {
+@@ -1707,6 +1725,248 @@
+     return res;
+ }
+ 
++void llama_context::graph_variant_save() {
++    auto & dst = graph_variants[graph_variant_active];
++    GGML_ASSERT(!dst.sched);
++    dst.sched = std::move(sched);
++    dst.results = std::move(gf_res_prev);
++    dst.active = gf_res_prev_active;
++    dst.bytes = graph_variant_bytes;
++    dst.last_used = graph_variant_last_used;
++    gf_res_prev_active = nullptr;
++}
++
++void llama_context::graph_variant_restore(size_t index) {
++    auto & src = graph_variants[index];
++    GGML_ASSERT(!sched);
++    sched = std::move(src.sched);
++    gf_res_prev = std::move(src.results);
++    gf_res_prev_active = src.active;
++    graph_variant_bytes = src.bytes;
++    graph_variant_last_used = src.last_used;
++    graph_variant_active = index;
++    src.active = nullptr;
++    src.bytes = 0;
++}
++
++void llama_context::graph_variant_evict(size_t index) {
++    auto & variant = graph_variants[index];
++    GGML_ASSERT(index && index != graph_variant_active);
++    if (variant.sched) {
++        // An inactive runtime was drained before it was parked. Account its
++        // submitted work once before releasing its independent allocator.
++        const auto stats = ggml_backend_sched_get_gpu_stats(variant.sched.get());
++        gpu_stats_previous.cpu_heavy_ops_submitted += stats.cpu_heavy_ops_submitted;
++        gpu_stats_previous.gpu_heavy_ops_submitted += stats.gpu_heavy_ops_submitted;
++        variant.sched.reset();
++    }
++    variant.active = nullptr;
++    variant.bytes = 0;
++    // Keep metadata arenas in fixed slots, rather than allocating new metadata
++    // addresses (and therefore new potential CUDA graph keys) on every eviction.
++    for (auto & result : variant.results) { if (result) { result->reset(); } }
++}
++
++void llama_context::graph_variants_clear() {
++    if (graph_variant_active) {
++        ggml_backend_sched_synchronize(sched.get());
++        graph_variant_save();
++        graph_variant_restore(0);
++    }
++    for (size_t i = 1; i < graph_variants.size(); ++i) {
++        graph_variant_evict(i);
++    }
++    graph_variant_bytes = 0;
++}
++
++size_t llama_context::graph_variant_retained_bytes() const {
++    size_t bytes = graph_variant_active ? graph_variant_bytes : 0;
++    if (graph_variant_active) {
++        for (const auto & result : gf_res_prev) {
++            if (result && !llama_graph_variant_policy::add_size(bytes, result->buf_compute_meta.capacity())) {
++                return std::numeric_limits<size_t>::max();
++            }
++        }
++    }
++    for (size_t i = 1; i < graph_variants.size(); ++i) {
++        if (!llama_graph_variant_policy::add_size(bytes, graph_variants[i].bytes)) {
++            return std::numeric_limits<size_t>::max();
++        }
++        for (const auto & result : graph_variants[i].results) {
++            if (result && !llama_graph_variant_policy::add_size(bytes, result->buf_compute_meta.capacity())) {
++                return std::numeric_limits<size_t>::max();
++            }
++        }
++    }
++    return bytes;
++}
++
++llama_context::graph_variant_selection llama_context::graph_variant_select(
++        const llama_ubatch & ubatch, llama_memory_context_i * mctx, llm_graph_type gtype) {
++    // Host-provider graphs have extra model-owned bindings that are not owned
++    // by a scheduler. Keep those, training, encoder and pipeline paths on the
++    // original arena. Fully resident dense and MoE models need no name list.
++    // Backend samplers also own graph-input pointers: switching their RNG and
++    // history alone would leave their input writes bound to the newest graph.
++    const bool eligible = graph_variant_budget && !graph_reuse_disable && !cparams.training &&
++        !cparams.pipeline_parallel && !cparams.warmup && !model.hparams.no_alloc && !moe_cache &&
++        !model.ram_cache && sampling.samplers.empty() && !cparams.cb_eval && model.hparams.causal_attn &&
++        cparams.causal_attn &&
++        ubatch.token && !ubatch.embd &&
++        ubatch.n_tokens && ubatch.n_tokens <= llama_graph_variant_policy::max_tokens &&
++        gtype != LLM_GRAPH_TYPE_ENCODER;
++
++    if (eligible) {
++        for (size_t i = 0; i < graph_variants.size(); ++i) {
++            auto & variant = graph_variants[i];
++            if (!variant.sched || !variant.active) { continue; }
++            auto params = graph_params(variant.active, ubatch, mctx, gtype);
++            params.sched = variant.sched.get();
++            // This rebinds every input's memory-context pointer. No previous
++            // microbatch memory-context object is dereferenced on a cache hit.
++            if (!variant.active->can_reuse(params)) { continue; }
++            ggml_backend_sched_synchronize(sched.get());
++            graph_variant_save();
++            graph_variant_restore(i);
++            graph_variant_last_used = ++graph_variant_clock;
++            return graph_variant_selection::reused;
++        }
++    }
++
++    // Large/unsupported requests, cache misses and allocation failures always
++    // have the original worst-case compute reservation available.
++    if (graph_variant_active) {
++        ggml_backend_sched_synchronize(sched.get());
++        graph_variant_save();
++        graph_variant_restore(0);
++        auto * previous = get_gf_res_prev();
++        const auto params = graph_params(previous, ubatch, mctx, gtype);
++        if (!graph_reuse_disable && gf_res_prev_active == previous && previous->can_reuse(params)) {
++            return graph_variant_selection::reused;
++        }
++    }
++    if (!eligible) { return graph_variant_selection::none; }
++
++    // Keep the first shape in the primary reservation. Secondary arenas are
++    // useful only after a real change of shape, not during the first decode.
++    if (!gf_res_prev_active) { return graph_variant_selection::none; }
++
++    const size_t max_nodes = graph_max_nodes(llama_graph_variant_policy::max_tokens);
++    size_t metadata = ggml_graph_overhead_custom(max_nodes, false);
++    if (max_nodes > std::numeric_limits<size_t>::max()/ggml_tensor_overhead() ||
++        !llama_graph_variant_policy::add_size(metadata, max_nodes*ggml_tensor_overhead())) {
++        return graph_variant_selection::none;
++    }
++    const size_t retained_metadata = get_graph_variant_stats().metadata_bytes;
++    size_t chosen = 0;
++    for (size_t i = 1; i < graph_variants.size(); ++i) {
++        const auto & variant = graph_variants[i];
++        const auto & result = variant.results[n_outputs > 0];
++        if (!variant.sched) {
++            // Under a small budget, reuse an older initialized slot instead of
++            // repeatedly attempting a new metadata arena that cannot fit.
++            const size_t extra = result && result->get_max_nodes() >= int64_t(max_nodes) ? 0 : metadata;
++            if (llama_graph_variant_policy::fits(graph_variant_budget, retained_metadata, extra)) {
++                chosen = i; break;
++            }
++            continue;
++        }
++        if (!chosen || variant.last_used < graph_variants[chosen].last_used) { chosen = i; }
++    }
++    if (!chosen) { return graph_variant_selection::none; }
++
++    ggml_backend_sched_synchronize(sched.get());
++    graph_variant_save();
++    graph_variant_evict(chosen);
++    graph_variant_restore(chosen);
++    auto restore_primary = [&] {
++        // No candidate graph has been submitted. Failed optional allocations
++        // are released before retrying through the conventional scheduler.
++        sched.reset();
++        gf_res_prev_active = nullptr;
++        graph_variant_bytes = 0;
++        for (auto & result : gf_res_prev) { if (result) { result->reset(); } }
++        graph_variant_save();
++        graph_variant_restore(0);
++    };
++
++    try {
++        const auto & previous_result = gf_res_prev[n_outputs > 0];
++        if (!previous_result || previous_result->get_max_nodes() < int64_t(max_nodes)) {
++            if (!llama_graph_variant_policy::fits(graph_variant_budget, graph_variant_retained_bytes(), metadata)) {
++                restore_primary(); return graph_variant_selection::none;
++            }
++        }
++        auto create = [&]() -> ggml_cgraph * {
++            sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
++                    backend_ptrs.size(), max_nodes, false, cparams.op_offload));
++            if (!sched) { return nullptr; }
++            ggml_backend_sched_set_gpu_exclusive(sched.get(), model.gpu_exclusive());
++            ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++            ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
++            auto & result = gf_res_prev[n_outputs > 0];
++            if (!result || result->get_max_nodes() < int64_t(max_nodes)) {
++                result.reset(new llm_graph_result(max_nodes));
++            } else { result->reset(); }
++            auto * graph = model.build_graph(graph_params(result.get(), ubatch, mctx, gtype));
++            // Apply the same input placement during preflight and allocation
++            // as the baseline arena. Its backend is also in can_reuse's key.
++            place_nextn_input(result.get(), sched.get(), nextn_input_backend());
++            return graph;
++        };
++
++        auto * gf = create();
++        if (!gf) { restore_primary(); return graph_variant_selection::none; }
++
++        // Preflight without allocating backend compute buffers. Splitting a
++        // graph can rewrite its sources, so rebuild once after measurement.
++        std::vector<size_t> sizes(backend_ptrs.size(), 0);
++        ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
++        size_t requested = 0;
++        bool valid = !ggml_backend_sched_get_error(sched.get())[0];
++        for (size_t bytes : sizes) { valid &= llama_graph_variant_policy::add_size(requested, bytes); }
++        if (!valid || !requested || requested > graph_variant_budget) {
++            restore_primary(); return graph_variant_selection::none;
++        }
++
++        // Admission is LRU within four fixed slots. The live primary arena is
++        // the baseline allocation and is not part of this extra-cache budget.
++        while (!llama_graph_variant_policy::fits(graph_variant_budget, graph_variant_retained_bytes(), requested)) {
++            size_t victim = 0;
++            for (size_t i = 1; i < graph_variants.size(); ++i) {
++                if (!graph_variants[i].sched) { continue; }
++                if (!victim || graph_variants[i].last_used < graph_variants[victim].last_used) { victim = i; }
++            }
++            if (!victim) { restore_primary(); return graph_variant_selection::none; }
++            graph_variant_evict(victim);
++        }
++
++        gf = create();
++        if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++            restore_primary(); return graph_variant_selection::none;
++        }
++        size_t actual = 0;
++        for (auto * backend : backend_ptrs) {
++            if (!llama_graph_variant_policy::add_size(actual, ggml_backend_sched_get_buffer_size(sched.get(), backend))) {
++                restore_primary(); return graph_variant_selection::none;
++            }
++        }
++        if (!llama_graph_variant_policy::fits(graph_variant_budget, graph_variant_retained_bytes(), actual)) {
++            restore_primary(); return graph_variant_selection::none;
++        }
++        graph_variant_bytes = actual;
++        graph_variant_last_used = ++graph_variant_clock;
++        gf_res_prev_active = get_gf_res_prev();
++        LLAMA_LOG_DEBUG("%s: retained short graph in arena %zu (%zu bytes, total %zu)\n",
++                __func__, chosen, actual, graph_variant_retained_bytes());
++        return graph_variant_selection::built;
++    } catch (const std::exception & error) {
++        LLAMA_LOG_DEBUG("%s: optional graph arena unavailable: %s\n", __func__, error.what());
++        restore_primary();
++        return graph_variant_selection::none;
++    }
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1719,12 +1979,24 @@
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+-
++    auto gparams = graph_params(res, ubatch, mctx, gtype);
+     const auto state_backend = nextn_input_backend();
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res &&
+-        nextn_device_graph_backend == state_backend && res->can_reuse(gparams)) {
++    const bool reuse_current = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
++    const auto selected = reuse_current ? graph_variant_selection::none : graph_variant_select(ubatch, mctx, gtype);
++    if (selected != graph_variant_selection::none) {
++        res = get_gf_res_prev();
++        gf = res->get_gf();
++        gparams = graph_params(res, ubatch, mctx, gtype);
++    } else if (res != get_gf_res_prev()) {
++        // An unsupported request may have returned from a secondary arena to
++        // the conventional primary scheduler without finding a reusable graph.
++        res = get_gf_res_prev();
++        gf = res->get_gf();
++        gparams = graph_params(res, ubatch, mctx, gtype);
++    }
++
++    if (reuse_current || selected != graph_variant_selection::none) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1734,7 +2006,7 @@
+             ggml_backend_sched_synchronize(sched.get());
+         }
+ 
+-        n_reused++;
++        if (reuse_current || selected == graph_variant_selection::reused) { n_reused++; }
+     } else {
+         gf_res_prev_active = nullptr;
+         res->reset();
+@@ -1763,7 +2035,6 @@
+         }
+ 
+         gf_res_prev_active = res;
+-        nextn_device_graph_backend = state_backend;
+     }
+ 
+     // set the input data for the input tensors
+@@ -2891,6 +3162,7 @@
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
++    graph_variants_clear();
+     GGML_ASSERT(n_outputs >= 1);
+ 
+     if (n_tokens % n_seqs != 0) {
+@@ -2926,6 +3198,8 @@
+     res->reset();
+ 
+     auto * gf = model.build_graph(gparams);
++
++    place_nextn_input(res, sched.get(), gparams.nextn_input_backend);
+ 
+     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
+     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
+@@ -2981,6 +3255,7 @@
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.nextn_input_backend =*/ nextn_input_backend(),
+     };
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -66,6 +66,27 @@
+ 
+     ggml_backend_sched_t get_sched() const;
+     ggml_backend_sched_gpu_stats get_gpu_sched_stats() const;
++
++    struct graph_variant_stats {
++        size_t arenas = 0;
++        size_t compute_bytes = 0;
++        size_t metadata_bytes = 0;
++    };
++    // Internal diagnostic: secondary buffers and host graph metadata,
++    // excluding the primary reservation. No graph/scheduler pointers escape.
++    graph_variant_stats get_graph_variant_stats() const {
++        graph_variant_stats stats;
++        if (graph_variant_active) {
++            ++stats.arenas;
++            stats.compute_bytes += graph_variant_bytes;
++            for (const auto & result : gf_res_prev) { if (result) { stats.metadata_bytes += result->buf_compute_meta.capacity(); } }
++        }
++        for (size_t i = 1; i < graph_variants.size(); ++i) {
++            if (graph_variants[i].sched) { ++stats.arenas; stats.compute_bytes += graph_variants[i].bytes; }
++            for (const auto & result : graph_variants[i].results) { if (result) { stats.metadata_bytes += result->buf_compute_meta.capacity(); } }
++        }
++        return stats;
++    }
+     llama_moe_cache::statistics get_moe_cache_stats() const;
+     const llama_gpu_layer_diagnostics * get_layer_diagnostics() const;
+ 
+@@ -286,6 +307,17 @@
+     // create a new backend scheduler for a graph of the specified size and register the callbacks below
+     void sched_new(size_t max_nodes, bool parallel);
+ 
++    // Secondary runtimes own both their graph metadata and allocator bindings.
++    // The primary scheduler retains the conventional worst-case reservation.
++    enum class graph_variant_selection { none, built, reused };
++    graph_variant_selection graph_variant_select(
++            const llama_ubatch & ubatch, llama_memory_context_i * mctx, llm_graph_type gtype);
++    void graph_variants_clear();
++    void graph_variant_save();
++    void graph_variant_restore(size_t index);
++    void graph_variant_evict(size_t index);
++    size_t graph_variant_retained_bytes() const;
++
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+ 
+@@ -339,7 +371,6 @@
+     int nextn_device_active = -1;
+     std::vector<int32_t> nextn_device_row_ids;
+     std::vector<llama_nextn_device_row> nextn_device_inputs;
+-    ggml_backend_t nextn_device_graph_backend = nullptr;
+     bool prepare_nextn_device(size_t rows);
+     bool capture_nextn_device(ggml_backend_t backend, const ggml_tensor * tensor,
+             size_t offset, size_t rows, const llama_ubatch & ubatch);
+@@ -442,6 +473,21 @@
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+ 
++    struct graph_variant_runtime {
++        ggml_backend_sched_ptr sched;
++        std::array<llm_graph_result_ptr, 2> results;
++        llm_graph_result * active = nullptr;
++        size_t bytes = 0;
++        uint64_t last_used = 0;
++    };
++    // Index zero is the original scheduler; at most four secondary arenas.
++    std::array<graph_variant_runtime, 5> graph_variants;
++    size_t graph_variant_active = 0;
++    size_t graph_variant_budget = 0;
++    size_t graph_variant_bytes = 0;
++    uint64_t graph_variant_clock = 0;
++    uint64_t graph_variant_last_used = 0;
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+diff --git a/src/llama-graph-variant-policy.h b/src/llama-graph-variant-policy.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-graph-variant-policy.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <cstddef>
++#include <limits>
++
++namespace llama_graph_variant_policy {
++constexpr size_t max_variants = 4;
++constexpr unsigned max_tokens = 8;
++
++// An optional cache must never turn malformed input into a large allocation.
++inline size_t parse_budget(const char * text) {
++    if (!text || !*text) { return 0; }
++    size_t mib = 0;
++    for (const char * p = text; *p; ++p) {
++        if (*p < '0' || *p > '9' || mib > 1024) { return 0; }
++        mib = mib*10 + size_t(*p - '0');
++    }
++    return mib <= 1024 ? mib*size_t(1024*1024) : 0;
++}
++
++inline bool add_size(size_t & total, size_t bytes) {
++    if (bytes > std::numeric_limits<size_t>::max() - total) { return false; }
++    total += bytes;
++    return true;
++}
++
++inline bool fits(size_t budget, size_t retained, size_t requested) {
++    return budget && retained <= budget && requested <= budget - retained;
++}
++}
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -833,6 +833,10 @@
+     llm_graph_cb cb;
+ 
+     llm_graph_result * res;
++
++    // Placement of NextN inputs is part of an arena's immutable allocation
++    // contract. A graph captured with CPU staging cannot serve device inputs.
++    ggml_backend_t nextn_input_backend = nullptr;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -898,9 +902,11 @@
+         }
+ 
+         return
++            nextn_input_backend             == other.nextn_input_backend             &&
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
++            cparams.warmup                  == other.cparams.warmup                  &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+diff --git a/tests/test-graph-variants.cpp b/tests/test-graph-variants.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-graph-variants.cpp
+@@ -0,0 +1,176 @@
++#include "llama.h"
++#include "llama-context.h"
++#include "llama-graph-variant-policy.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++static void budget_environment(const char * value) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_GRAPH_VARIANTS_MIB", value) == 0, "cannot set test budget");
++#else
++    require(setenv("WILDLLAMA_GRAPH_VARIANTS_MIB", value, 1) == 0, "cannot set test budget");
++#endif
++}
++
++static void policy() {
++    using namespace llama_graph_variant_policy;
++    require(parse_budget(nullptr) == 0 && parse_budget("") == 0 && parse_budget("0") == 0, "disabled budget");
++    require(parse_budget("1") == 1024*1024 && parse_budget("1024") == size_t(1024)*1024*1024, "valid budget");
++    for (const char * invalid : {"-1", "+1", "1 ", " 1", "1MiB", "1025", "999999999999999999999999"}) {
++        require(parse_budget(invalid) == 0, "malformed budget accepted");
++    }
++    require(fits(100, 70, 30) && !fits(100, 70, 31) && !fits(100, 101, 0), "retention admission");
++    require(!fits(0, 0, 0), "zero budget enabled cache");
++    size_t sum = std::numeric_limits<size_t>::max() - 2;
++    require(add_size(sum, 2) && !add_size(sum, 1), "overflow accepted");
++    std::puts("graph-variant policy: PASS");
++}
++
++struct result {
++    std::vector<float> logits;
++    std::vector<llama_token> sampled;
++    int reused = 0;
++    size_t peak_arenas = 0;
++    size_t peak_compute_bytes = 0;
++};
++
++static result run(llama_model * model, const char * budget, bool invalidate, bool backend = false) {
++    budget_environment(budget);
++    auto params = llama_context_default_params();
++    params.n_ctx = 256;
++    params.n_batch = 64;
++    params.n_ubatch = 64;
++    params.n_threads = 2;
++    params.n_threads_batch = 2;
++    params.no_perf = false;
++    params.n_outputs_max = 64;
++    params.n_outputs_max_per_seq = 64;
++    auto * ctx = llama_init_from_model(model, params);
++    require(ctx != nullptr, "small context allocation failed");
++    llama_sampler * chain = nullptr;
++    auto batch = llama_batch_init(64, 0, 1);
++    result out;
++    try {
++        if (backend) {
++            chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++            llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
++            llama_sampler_chain_add(chain, llama_sampler_init_temp(0.7f));
++            llama_sampler_chain_add(chain, llama_sampler_init_dist(1234));
++            require(llama_set_sampler(ctx, 0, chain), "fixture cannot offload stochastic sampler");
++        }
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++        llama_pos position = 0;
++        // A B C B A -> retains B/C with stable independent bindings. Additional
++        // shapes exercise LRU eviction, while 16 uses the primary reservation.
++        const std::vector<int> sizes = {32, 1, 3, 2, 3, 1, 4, 5, 6, 7, 8, 3, 2, 16, 1, 3, 2};
++        for (size_t step = 0; step < sizes.size(); ++step) {
++            if (invalidate && step == 13) {
++                // A real parameter change must return to the primary arena and
++                // invalidate all retained bindings before reservation.
++                require(llama_set_adapter_cvec(ctx, nullptr, 0, 0, -1, -1) == 0, "parameter invalidation failed");
++            }
++            const int n = sizes[step];
++            batch.n_tokens = n;
++            for (int i = 0; i < n; ++i) {
++                batch.token[i] = 1 + (position + i) % std::max(1, n_vocab - 1);
++                batch.pos[i] = position + i;
++                batch.n_seq_id[i] = 1;
++                batch.seq_id[i][0] = 0;
++                batch.logits[i] = true;
++            }
++            require(llama_decode(ctx, batch) == 0, "shape-changing decode failed");
++            for (int i = 0; i < n; ++i) {
++                if (backend) {
++                    const auto token = llama_get_sampled_token_ith(ctx, i);
++                    require(token >= 0 && token < n_vocab, "backend sampling did not run");
++                    require(llama_sampler_sample(chain, ctx, i) == token, "backend token consumption changed");
++                    out.sampled.push_back(token);
++                    continue;
++                }
++                const float * row = llama_get_logits_ith(ctx, i);
++                require(row != nullptr, "logits missing");
++                for (int v = 0; v < n_vocab; ++v) { require(std::isfinite(row[v]), "nonfinite logits"); }
++                out.logits.insert(out.logits.end(), row, row + n_vocab);
++            }
++            const auto stats = ctx->get_graph_variant_stats();
++            require(stats.arenas <= llama_graph_variant_policy::max_variants, "unbounded graph arenas");
++            require(stats.compute_bytes <= llama_graph_variant_policy::parse_budget(budget), "compute cache exceeds budget");
++            require(stats.metadata_bytes <= llama_graph_variant_policy::parse_budget(budget) - stats.compute_bytes, "graph metadata exceeds budget");
++            out.peak_arenas = std::max(out.peak_arenas, stats.arenas);
++            out.peak_compute_bytes = std::max(out.peak_compute_bytes, stats.compute_bytes);
++            position += n;
++        }
++        out.reused = llama_perf_context(ctx).n_reused;
++    } catch (...) {
++        llama_batch_free(batch);
++        llama_free(ctx);
++        llama_sampler_free(chain);
++        throw;
++    }
++    llama_batch_free(batch);
++    llama_free(ctx);
++    llama_sampler_free(chain);
++    return out;
++}
++
++int main(int argc, char ** argv) {
++    try {
++        policy();
++        if (argc == 1) { return 0; }
++        require(argc == 2, "usage: test-graph-variants [small-local.gguf]");
++        // This test never downloads a model. The caller supplies a small local
++        // fixture; refuse larger files even when the wrong path is supplied.
++        FILE * file = std::fopen(argv[1], "rb");
++        require(file != nullptr, "fixture missing");
++        std::fseek(file, 0, SEEK_END);
++        const long length = std::ftell(file);
++        std::fclose(file);
++        require(length > 0 && length <= 64*1024*1024, "fixture exceeds 64 MiB");
++        ggml_backend_load_all();
++        llama_backend_init();
++        auto params = llama_model_default_params();
++        params.n_gpu_layers = 0;
++        auto * model = llama_model_load_from_file(argv[1], params);
++        require(model != nullptr, "fixture load failed");
++        try {
++            const auto baseline = run(model, "0", false);
++            const auto cached = run(model, "64", false);
++            const auto limited = run(model, "1", false);
++            const auto invalidated = run(model, "64", true);
++            const auto malformed = run(model, "9999999999999999999", false);
++            const auto sampler_baseline = run(model, "0", false, true);
++            const auto sampler_cached = run(model, "64", false, true);
++            require(baseline.logits == cached.logits, "retained graph changed CPU logits");
++            require(baseline.logits == limited.logits, "budget fallback changed CPU logits");
++            require(baseline.logits == invalidated.logits, "invalidation changed CPU logits");
++            require(baseline.logits == malformed.logits, "malformed budget changed baseline");
++            require(cached.peak_arenas > 0, "retained graph path was never exercised");
++            require(cached.reused > baseline.reused, "retained shapes were rebuilt rather than reused");
++            require(malformed.peak_arenas == 0, "invalid budget enabled retention");
++            require(limited.peak_arenas < cached.peak_arenas, "small budget admission was not exercised");
++            require(sampler_baseline.sampled == sampler_cached.sampled, "fallback changed stochastic RNG");
++            require(sampler_cached.peak_arenas == 0, "backend sampler graph bindings were retained");
++            std::printf("graph variants: PASS, reused %d -> %d; peak %zu arenas / %zu compute bytes\n",
++                    baseline.reused, cached.reused, cached.peak_arenas, cached.peak_compute_bytes);
++        } catch (...) { llama_model_free(model); throw; }
++        llama_model_free(model);
++        llama_backend_free();
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "graph variants: FAIL: %s\n", error.what());
++        return 1;
++    }
++}

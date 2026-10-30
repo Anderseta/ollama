@@ -1,0 +1,948 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1564,6 +1564,7 @@
+         return;
+     }
+ 
++    if (memory) { memory->invalidate_prefixes(); }
+     cparams.causal_attn = value;
+ 
+     // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
+@@ -1581,6 +1582,7 @@
+         return;
+     }
+ 
++    if (memory) { memory->invalidate_prefixes(); }
+     cparams.warmup = value;
+ 
+     // warmups are usually with small batches, so no need to reserve
+@@ -1651,6 +1653,7 @@
+         return;
+     }
+ 
++    if (memory) { memory->invalidate_prefixes(); }
+     loras.reset(new llama_adapter_loras());
+ 
+     for (size_t i = 0; i < n_adapters; i ++) {
+@@ -1696,6 +1699,7 @@
+                 int32_t   il_end) {
+     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+ 
++    if (memory) { memory->invalidate_prefixes(); }
+     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+ 
+     sched_need_reserve = true;
+@@ -4796,6 +4800,30 @@
+ // memory
+ //
+ 
++llama_memory_prefix_ptr llama_memory_prefix_retain(llama_context * ctx, llama_seq_id sequence, uint32_t max_tokens) {
++    if (!ctx || !max_tokens || ctx->get_cparams().warmup || !ctx->get_cparams().causal_attn ||
++            ctx->get_cparams().ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { return {}; }
++    try {
++        ctx->synchronize();
++        auto * memory = ctx->get_memory();
++        return memory ? memory->retain_prefix(sequence, max_tokens) : llama_memory_prefix_ptr{};
++    } catch (const std::exception & error) {
++        LLAMA_LOG_WARN("KV prefix retain skipped: %s\n", error.what());
++        return {};
++    }
++}
++
++bool llama_memory_prefix_restore(llama_context * ctx, const llama_memory_prefix_ptr & prefix, llama_seq_id destination) {
++    if (!ctx || !prefix || !prefix->valid()) { return false; }
++    try {
++        ctx->synchronize();
++        return prefix->restore(ctx->get_memory(), destination);
++    } catch (const std::exception & error) {
++        LLAMA_LOG_WARN("KV prefix restore skipped: %s\n", error.what());
++        return false;
++    }
++}
++
+ size_t llama_memory_trim_empty(llama_context * ctx) {
+     const char * enabled = std::getenv("WILDLLAMA_KV_CACHE_TRIM_EMPTY");
+     if (!ctx || !enabled || std::strcmp(enabled, "1") != 0) { return 0; }
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -8,7 +8,26 @@
+ 
+ #include <cstdint>
+ #include <map>
++#include <memory>
+ #include <vector>
++
++// Optional retained, immutable prefix references. Supported memories share
++// existing cells; no new KV tensor storage is allocated. Handles may outlive
++// their context, but become invalid when it is destroyed, shifted or reclaimed.
++// These APIs follow the context's normal single-threaded mutation contract.
++struct llama_memory_prefix {
++    virtual ~llama_memory_prefix() = default;
++    virtual bool valid() const = 0;
++    virtual size_t size() const = 0; // conservative logical KV bytes charged
++    virtual uint32_t n_tokens() const = 0;
++    virtual bool restore(llama_memory_t memory, llama_seq_id destination) = 0;
++};
++using llama_memory_prefix_ptr = std::shared_ptr<llama_memory_prefix>;
++
++LLAMA_API llama_memory_prefix_ptr llama_memory_prefix_retain(
++        llama_context * ctx, llama_seq_id sequence, uint32_t max_retained_tokens);
++LLAMA_API bool llama_memory_prefix_restore(
++        llama_context * ctx, const llama_memory_prefix_ptr & prefix, llama_seq_id destination);
+ 
+ // Internal output view for a caller that has ALREADY called llama_synchronize
+ // and does not mutate/submit work to this context before consuming the view.
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -5,6 +5,7 @@
+ #include "llama-model.h"
+ #include "llama-context.h"
+ #include "llama-kv-growth.h"
++#include "llama-ext.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -62,6 +63,135 @@
+ //
+ // llama_kv_cache
+ //
++
++struct llama_kv_prefix_owner {
++    llama_kv_cache * cache;
++};
++
++struct llama_kv_prefix_state final : llama_memory_prefix {
++    std::weak_ptr<llama_kv_prefix_owner> owner;
++    llama_seq_id alias;
++    uint32_t tokens;
++    size_t bytes;
++    bool alive = false;
++
++    llama_kv_prefix_state(const std::shared_ptr<llama_kv_prefix_owner> & owner,
++            llama_seq_id alias, uint32_t tokens, size_t bytes) :
++        owner(owner), alias(alias), tokens(tokens), bytes(bytes) {}
++
++    ~llama_kv_prefix_state() override {
++        if (auto locked = owner.lock()) { locked->cache->release_prefix(*this); }
++    }
++    bool valid() const override { return alive && !owner.expired(); }
++    size_t size() const override { return bytes; }
++    uint32_t n_tokens() const override { return tokens; }
++    bool restore(llama_memory_t memory, llama_seq_id destination) override {
++        auto locked = owner.lock();
++        if (!locked || !alive || locked->cache != memory || destination < 0 ||
++                uint32_t(destination) >= locked->cache->n_seq_max) { return false; }
++        auto & cache = *locked->cache;
++        const bool previous = cache.prefix_internal;
++        cache.prefix_internal = true;
++        try {
++            cache.seq_rm(destination, -1, -1);
++            cache.seq_cp(alias, destination, -1, -1);
++            cache.prefix_internal = previous;
++            return true;
++        } catch (...) {
++            cache.seq_rm(destination, -1, -1);
++            cache.prefix_internal = previous;
++            return false;
++        }
++    }
++};
++
++llama_kv_cache::~llama_kv_cache() {
++    invalidate_prefixes();
++    prefix_owner.reset();
++}
++
++void llama_kv_cache::release_prefix(llama_kv_prefix_state & prefix) const {
++    if (!prefix.alive) { return; }
++    prefix.alive = false;
++    GGML_ASSERT(prefix_count > 0);
++    --prefix_count;
++    // Only optional alias metadata is removed, never another sequence's cells.
++    // v_cells is a shared reference; this is also valid while writing a const
++    // state view, which must not serialize internal alias IDs.
++    auto & cells = v_cells[0];
++    // Visit only this prefix's indexed cells. A short retained prefix must not
++    // turn eviction into a scan of the complete logical context capacity.
++    // Erasing the current item does not allocate; reacquire begin after removal.
++    const auto & positions = cells.seq_pos_get(prefix.alias);
++    uint32_t released_head = cells.size();
++    while (!positions.empty()) {
++        const auto index = positions.begin()->second;
++        if (cells.seq_rm(index, prefix.alias)) { released_head = std::min(released_head, index); }
++    }
++    // Match seq_rm: retry preparation from newly freed low cells instead of
++    // needlessly wrapping around the cache and changing attention row order.
++    auto & head = v_heads[0];
++    if (released_head < head) { head = released_head; }
++}
++
++void llama_kv_cache::invalidate_prefixes() const {
++    for (auto & weak : prefixes) {
++        if (auto prefix = weak.lock()) { release_prefix(*prefix); }
++        weak.reset();
++    }
++}
++
++void llama_kv_cache::invalidate_prefix_alias(llama_seq_id alias) const {
++    if (prefix_internal || prefix_count == 0) { return; }
++    for (auto & weak : prefixes) {
++        if (auto prefix = weak.lock()) {
++            if (prefix->alias == alias) { release_prefix(*prefix); weak.reset(); }
++        }
++    }
++}
++
++std::shared_ptr<llama_memory_prefix> llama_kv_cache::retain_prefix(llama_seq_id sequence, uint32_t max_tokens) {
++    if (!max_tokens || other || growth_initial_tokens || v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
++            hparams.n_pos_per_embd() != 1 || seq_to_stream.size() != LLAMA_MAX_SEQ ||
++            sequence < 0 || uint32_t(sequence) >= n_seq_max || get_has_shift()) { return {}; }
++    auto & cells = v_cells[0];
++    const auto & positions = cells.seq_pos_get(sequence);
++    const uint32_t count = positions.size();
++    // Complete one-dimensional prefixes only. Gaps or shifted prefixes retain
++    // the existing serialized path rather than inventing missing KV state.
++    if (!count || positions.begin()->first != 0 || positions.rbegin()->first != llama_pos(count - 1)) { return {}; }
++    llama_pos expected = 0;
++    for (const auto & position : positions) { if (position.first != expected++) { return {}; } }
++    max_tokens = std::min(max_tokens, get_size() / 4);
++    uint64_t retained = count;
++    size_t slot = prefixes.size();
++    for (size_t i = 0; i < prefixes.size(); ++i) {
++        auto prefix = prefixes[i].lock();
++        if (prefix && prefix->valid()) { retained += prefix->tokens; }
++        else if (slot == prefixes.size()) { slot = i; }
++    }
++    if (slot == prefixes.size() || retained > max_tokens) { return {}; }
++    llama_seq_id alias = -1;
++    for (int candidate = LLAMA_MAX_SEQ - 1; candidate >= int(n_seq_max); --candidate) {
++        if (cells.seq_pos_get(candidate).empty()) { alias = candidate; break; }
++    }
++    if (alias < 0) { return {}; }
++    const size_t bytes_per_cell = (size_k_bytes() + size_v_bytes() + get_size() - 1) / get_size();
++    if (bytes_per_cell && count > SIZE_MAX / bytes_per_cell) { return {}; }
++    if (!prefix_owner) { prefix_owner = std::make_shared<llama_kv_prefix_owner>(llama_kv_prefix_owner{this}); }
++    auto prefix = std::make_shared<llama_kv_prefix_state>(prefix_owner, alias, count, count * bytes_per_cell);
++    const bool previous = prefix_internal;
++    prefix_internal = true;
++    // Mark before the first insertion so an allocating map failure also rolls
++    // back a partially constructed alias. seq_add publishes its index first.
++    prefix->alive = true;
++    ++prefix_count;
++    try { seq_cp(sequence, alias, -1, -1); }
++    catch (...) { release_prefix(*prefix); prefix_internal = previous; throw; }
++    prefix_internal = previous;
++    prefixes[slot] = prefix;
++    return prefix;
++}
+ 
+ llama_kv_cache::llama_kv_cache(
+         const llama_model & model,
+@@ -413,6 +543,7 @@
+ }
+ 
+ void llama_kv_cache::clear(bool data) {
++    invalidate_prefixes();
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         v_cells[s].reset();
+         v_heads[s] = 0;
+@@ -462,6 +593,10 @@
+ }
+ 
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
++    if (!prefix_internal) {
++        if (seq_id < 0) { invalidate_prefixes(); }
++        else { invalidate_prefix_alias(seq_id); }
++    }
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return true;
+@@ -531,6 +666,8 @@
+ }
+ 
+ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
++    invalidate_prefix_alias(seq_id_src);
++    invalidate_prefix_alias(seq_id_dst);
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -623,6 +760,7 @@
+ }
+ 
+ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
++    invalidate_prefixes();
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -650,6 +788,7 @@
+ }
+ 
+ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
++    if (shift) { invalidate_prefixes(); }
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -700,6 +839,7 @@
+ }
+ 
+ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
++    if (d != 1) { invalidate_prefixes(); }
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -789,6 +929,11 @@
+             llama_batch_allocr & balloc,
+             uint32_t n_ubatch,
+             bool embd_all) {
++    // Internal aliases never compete with externally supplied sequence IDs.
++    const auto & full_batch = balloc.get_batch();
++    for (int i = 0; prefix_count && i < full_batch.n_tokens; ++i) {
++        for (int j = 0; j < full_batch.n_seq_id[i]; ++j) { invalidate_prefix_alias(full_batch.seq_id[i][j]); }
++    }
+     do {
+         balloc.split_reset();
+ 
+@@ -809,6 +954,12 @@
+         }
+ 
+         auto sinfos = prepare(ubatches);
++        if (sinfos.empty() && prefix_count) {
++            // Cached references must never turn an otherwise valid active
++            // request into an out-of-context failure. Retry after reclamation.
++            invalidate_prefixes();
++            sinfos = prepare(ubatches);
++        }
+         if (sinfos.empty()) {
+             break;
+         }
+@@ -2172,6 +2323,8 @@
+ }
+ 
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
++    // A full external state must not expose private cache-reference sequence IDs.
++    if (seq_id < 0) { invalidate_prefixes(); }
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -2253,6 +2406,7 @@
+   llama_state_seq_flags   flags,
+       slot_info_vec_t *   sinfos_out,
+ const slot_info_vec_t *   sinfos_in) {
++    invalidate_prefixes();
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -6,12 +6,15 @@
+ #include "llama-memory.h"
+ 
+ #include <unordered_map>
++#include <array>
+ #include <vector>
+ 
+ struct llama_cparams;
+ struct llama_hparams;
+ struct llama_model;
+ struct llama_context;
++struct llama_kv_prefix_owner;
++struct llama_kv_prefix_state;
+ 
+ //
+ // llama_kv_cache
+@@ -116,7 +119,7 @@
+         // a model can hold more than one cache, so the tensor names have to stay unique
+                  const char *   name_tag = "");
+ 
+-    ~llama_kv_cache() = default;
++    ~llama_kv_cache();
+ 
+     //
+     // llama_memory_i
+@@ -135,6 +138,7 @@
+ 
+     void clear(bool data) override;
+     size_t trim_empty() override;
++    std::shared_ptr<llama_memory_prefix> retain_prefix(llama_seq_id sequence, uint32_t max_tokens) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+@@ -305,7 +309,9 @@
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+-    std::vector<uint32_t> v_heads;
++    // Nonserialized placement hints. Evicting optional aliases while writing a
++    // const state view can free lower cells, which must remain reusable first.
++    mutable std::vector<uint32_t> v_heads;
+ 
+     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
+     llama_kv_cache * other;
+@@ -316,6 +322,17 @@
+ 
+     // maps from a sequence id to a stream id
+     std::vector<uint32_t> seq_to_stream;
++
++    // Bounded metadata references, never separate tensor allocations. The owner
++    // is weakly observed by handles so destruction cannot dereference a context.
++    friend struct llama_kv_prefix_state;
++    std::shared_ptr<llama_kv_prefix_owner> prefix_owner;
++    mutable std::array<std::weak_ptr<llama_kv_prefix_state>, 4> prefixes;
++    mutable uint32_t prefix_count = 0;
++    bool prefix_internal = false;
++    void release_prefix(llama_kv_prefix_state & prefix) const;
++    void invalidate_prefixes() const override;
++    void invalidate_prefix_alias(llama_seq_id alias) const;
+ 
+     // pending stream copies that will be applied during the next update
+     stream_copy_info sc_info;
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -350,8 +350,10 @@
+         assert(pos[i] != -1);
+         assert(!seq[i].test(seq_id));
+ 
++        seq_pos_inc(seq_id, i);
++        // Publish the bit only after the allocating position index succeeds.
++        // A failed optional alias insertion can then be rolled back safely.
+         seq[i].set(seq_id);
+-        seq_pos_inc(seq_id, i);
+     }
+ 
+     // return the sequence id of this cell
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -8,6 +8,7 @@
+ #include <functional>
+ 
+ struct llama_ubatch;
++struct llama_memory_prefix;
+ 
+ class llama_batch_allocr;
+ 
+@@ -112,6 +113,11 @@
+     // Unsupported layouts/backends retain their storage; logical capacity stays fixed.
+     virtual size_t trim_empty() { return 0; }
+ 
++    // Optional immutable same-stream prefix sharing. Unsupported memory types
++    // retain serialized snapshot behavior. A zero budget disables retention.
++    virtual std::shared_ptr<llama_memory_prefix> retain_prefix(llama_seq_id, uint32_t) { return {}; }
++    virtual void invalidate_prefixes() const {}
++
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+diff --git a/tests/test-retained-prefix.cpp b/tests/test-retained-prefix.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-retained-prefix.cpp
+@@ -0,0 +1,325 @@
++#include "llama.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-cparams.h"
++#include "../tools/server/server-task.h"
++#include "ggml-cpp.h"
++
++#include <cmath>
++#include <cstring>
++#include <cstdio>
++#include <filesystem>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++enum class test_mode { cpu, cuda, hybrid };
++static test_mode mode = test_mode::cpu;
++
++struct backend_observation { uint64_t cpu = 0, cuda = 0; } observed;
++static bool observe_matrix_backend(ggml_tensor * tensor, bool ask, void *) {
++    if (tensor->op != GGML_OP_MUL_MAT) { return false; }
++    if (ask) { return true; }
++    auto * buffer = tensor->buffer;
++    if (!buffer) { return true; }
++    const auto device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
++    const auto registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
++    // CUDA_Host is pinned CPU memory even though its buffer-type device is a
++    // CUDA device. Do not mistake host result storage for CUDA execution.
++    if (ggml_backend_buffer_is_host(buffer)) { ++observed.cpu; }
++    else if (registry && std::strcmp(ggml_backend_reg_name(registry), "CUDA") == 0) { ++observed.cuda; }
++    return true;
++}
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static void make_fixture(const std::string & path) {
++    constexpr int dim = 64, ff = 128, layers = 2, vocab = 259;
++    gguf_context_ptr meta(gguf_init_empty());
++    gguf_set_val_str(meta.get(), "general.architecture", "llama");
++    gguf_set_val_str(meta.get(), "general.name", "retained-prefix-fixture");
++    gguf_set_val_u32(meta.get(), "llama.context_length", 256);
++    gguf_set_val_u32(meta.get(), "llama.embedding_length", dim);
++    gguf_set_val_u32(meta.get(), "llama.block_count", layers);
++    gguf_set_val_u32(meta.get(), "llama.feed_forward_length", ff);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count", 4);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count_kv", 2);
++    gguf_set_val_u32(meta.get(), "llama.rope.dimension_count", 16);
++    gguf_set_val_f32(meta.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) {
++        char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i);
++        tokens.emplace_back(name);
++    }
++    std::vector<const char *> strings;
++    for (const auto & token : tokens) { strings.push_back(token.c_str()); }
++    std::vector<float> scores(vocab, 0);
++    std::vector<int32_t> types(vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", strings.data(), strings.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.eos_token_id", 2);
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_bos_token", true);
++    ggml_context_ptr tensors(ggml_init({4 * 1024 * 1024, nullptr, false}));
++    require(tensors != nullptr, "cannot allocate tiny fixture tensors");
++    auto tensor = [&](const std::string & name, int x, int y = 1) {
++        auto * t = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, x, y);
++        ggml_set_name(t, name.c_str());
++        uint32_t salt = 2166136261u;
++        for (unsigned char c : name) { salt = (salt ^ c) * 16777619u; }
++        auto * data = static_cast<float *>(t->data);
++        for (int64_t i = 0; i < ggml_nelements(t); ++i) {
++            salt = salt * 1664525u + 1013904223u;
++            data[i] = float(int(salt >> 16) - 32768) * (0.02f / 32768);
++            if (name.find("norm.weight") != std::string::npos) { data[i] += 1.0f; }
++        }
++        gguf_add_tensor(meta.get(), t);
++    };
++    tensor("token_embd.weight", dim, vocab);
++    tensor("output_norm.weight", dim);
++    tensor("output.weight", dim, vocab);
++    for (int i = 0; i < layers; ++i) {
++        const auto p = "blk." + std::to_string(i) + ".";
++        tensor(p + "attn_norm.weight", dim);
++        tensor(p + "attn_q.weight", dim, dim);
++        tensor(p + "attn_k.weight", dim, dim / 2);
++        tensor(p + "attn_v.weight", dim, dim / 2);
++        tensor(p + "attn_output.weight", dim, dim);
++        tensor(p + "ffn_norm.weight", dim);
++        tensor(p + "ffn_gate.weight", dim, ff);
++        tensor(p + "ffn_up.weight", dim, ff);
++        tensor(p + "ffn_down.weight", ff, dim);
++    }
++    require(gguf_write_to_file(meta.get(), path.c_str(), false), "cannot write tiny fixture");
++}
++
++using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
++static context_ptr make_context(llama_model * model, bool unified = true, uint32_t context_tokens = 256) {
++    auto p = llama_context_default_params();
++    p.op_offload = mode != test_mode::cpu;
++    if (mode == test_mode::hybrid) { p.cb_eval = observe_matrix_backend; }
++    p.n_ctx = context_tokens; p.n_batch = 256; p.n_ubatch = 32; p.n_seq_max = unified ? 1 : 2;
++    p.kv_unified = unified; p.n_threads = 2; p.n_threads_batch = 2;
++    p.type_k = p.type_v = GGML_TYPE_F32;
++    context_ptr result(llama_init_from_model(model, p), llama_free);
++    require(result != nullptr, "cannot create tiny context");
++    return result;
++}
++static llama_tokens pattern(int count, int salt = 0) {
++    llama_tokens result;
++    for (int i = 0; i < count; ++i) { result.push_back(3 + ((i * 13 + salt) % 256)); }
++    return result;
++}
++static std::vector<float> decode(llama_context * ctx, const llama_tokens & tokens, int position) {
++    auto batch = llama_batch_init(tokens.size(), 0, 1);
++    batch.n_tokens = tokens.size();
++    for (int i = 0; i < batch.n_tokens; ++i) {
++        batch.token[i] = tokens[i]; batch.pos[i] = position + i;
++        batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0; batch.logits[i] = i + 1 == batch.n_tokens;
++    }
++    observed = {};
++    const int ret = llama_decode(ctx, batch);
++    llama_batch_free(batch);
++    require(ret == 0, "tiny prefix decode failed");
++    const auto * logits = llama_get_logits_ith(ctx, -1);
++    require(logits != nullptr, "missing tiny logits");
++    llama_gpu_execution_stats execution{};
++    require(llama_gpu_execution_stats_get(ctx, &execution), "missing backend execution diagnostics");
++    if (mode == test_mode::cpu) {
++        require(execution.gpu_heavy_ops_submitted == 0, "CPU fixture submitted CUDA arithmetic");
++    } else if (mode == test_mode::cuda) {
++        require(execution.gpu_heavy_ops_submitted > 0, "CUDA fixture silently used CPU-only arithmetic");
++        require(execution.cpu_heavy_ops_submitted == 0, "fully offloaded fixture fell back to CPU arithmetic");
++    } else {
++        // Ordinary-runner heavy-op counters are collected only in exclusive
++        // mode. Observe actual result buffers through the existing callback
++        // instead; this instrumentation exists only in this tiny fixture.
++        require(observed.cpu > 0 && observed.cuda > 0,
++                "hybrid fixture did not execute both CPU and CUDA arithmetic");
++    }
++    return {logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))};
++}
++static void equal_logits(const std::vector<float> & a, const std::vector<float> & b) {
++    require(a.size() == b.size(), "logit shape changed");
++    for (size_t i = 0; i < a.size(); ++i) {
++        require(std::isfinite(a[i]) && std::isfinite(b[i]) &&
++                std::abs(a[i] - b[i]) <= 1e-5f * (1 + std::abs(a[i])), "retained prefix changed logits");
++    }
++}
++static void clear(llama_context * ctx) { llama_memory_clear(llama_get_memory(ctx), true); }
++
++static void sharing_and_lifetime(llama_model * model) {
++    auto ctx = make_context(model), reference = make_context(model);
++    const auto a = pattern(12), b = pattern(5, 71);
++    equal_logits(decode(ctx.get(), a, 0), decode(reference.get(), a, 0));
++    auto prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    require(prefix && prefix->valid() && prefix->n_tokens() == a.size() && prefix->size() > 0, "retained prefix missing");
++    require(!llama_memory_prefix_retain(ctx.get(), 0, 0), "zero budget retained prefix");
++    require(!llama_memory_prefix_retain(ctx.get(), 0, 11), "oversized prefix ignored budget");
++    require(!llama_memory_prefix_restore(reference.get(), prefix, 0), "prefix crossed context ownership");
++    equal_logits(decode(ctx.get(), {77}, 12), decode(reference.get(), {77}, 12));
++    require(prefix->valid(), "append invalidated immutable prefix");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1);
++    decode(ctx.get(), b, 0);
++    require(llama_memory_prefix_restore(ctx.get(), prefix, 0), "A to B to A restore failed");
++    equal_logits(decode(ctx.get(), {77}, 12), std::vector<float>(llama_get_logits_ith(reference.get(), -1),
++            llama_get_logits_ith(reference.get(), -1) + llama_vocab_n_tokens(llama_model_get_vocab(model))));
++    require(llama_memory_prefix_restore(ctx.get(), prefix, 0), "branch restore failed");
++    clear(reference.get()); decode(reference.get(), a, 0);
++    equal_logits(decode(ctx.get(), {78}, 12), decode(reference.get(), {78}, 12));
++    prefix.reset();
++    equal_logits(decode(ctx.get(), {79}, 13), decode(reference.get(), {79}, 13));
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    ctx.reset();
++    require(prefix && !prefix->valid() && !llama_memory_prefix_restore(reference.get(), prefix, 0), "handle survived destroyed owner");
++    prefix.reset();
++}
++
++static void invalidation_and_pressure(llama_model * model) {
++    auto ctx = make_context(model), reference = make_context(model);
++    const auto a = pattern(8);
++    decode(ctx.get(), a, 0);
++    std::vector<llama_memory_prefix_ptr> refs;
++    for (int i = 0; i < 4; ++i) {
++        refs.push_back(llama_memory_prefix_retain(ctx.get(), 0, 32));
++        require(refs.back() && refs.back()->valid(), "bounded alias not retained");
++    }
++    require(!llama_memory_prefix_retain(ctx.get(), 0, 64), "alias count bound exceeded");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()), LLAMA_MAX_SEQ - 1, -1, -1);
++    require(!refs.front()->valid() && refs[1]->valid(), "external alias collision not isolated");
++    refs.front() = llama_memory_prefix_retain(ctx.get(), 0, 32);
++    require(refs.front() && refs.front()->valid(), "released alias not reusable");
++    llama_memory_seq_keep(llama_get_memory(ctx.get()), 0);
++    for (auto & p : refs) { require(!p->valid(), "seq_keep retained hidden alias"); }
++    auto prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    llama_memory_seq_add(llama_get_memory(ctx.get()), 0, 0, -1, 1);
++    require(!prefix->valid(), "position shift retained stale prefix");
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    llama_memory_seq_div(llama_get_memory(ctx.get()), 0, 0, -1, 2);
++    require(!prefix->valid(), "position division retained stale prefix");
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    (void) llama_state_get_size(ctx.get());
++    require(!prefix->valid(), "full external state kept hidden alias IDs");
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    const auto state_size = llama_state_seq_get_size_ext(ctx.get(), 0, 0);
++    std::vector<uint8_t> state(state_size);
++    require(llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, 0) == state.size(), "cannot capture tiny external state");
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0, 0) == state.size(), "cannot restore tiny external state");
++    require(!prefix->valid(), "external state read retained stale aliases");
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    llama_set_causal_attn(ctx.get(), false);
++    require(!prefix->valid() && !llama_memory_prefix_retain(ctx.get(), 0, 64), "attention mode change retained causal prefix");
++    llama_set_causal_attn(ctx.get(), true);
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    require(prefix && prefix->valid(), "warmup test prefix missing");
++    llama_set_warmup(ctx.get(), true);
++    require(!prefix->valid(), "warmup mode change retained stale prefix");
++    require(!llama_memory_prefix_retain(ctx.get(), 0, 64), "warmup state was retained");
++    llama_set_warmup(ctx.get(), false);
++    require(!prefix->valid(), "leaving warmup revived invalid prefix");
++    clear(ctx.get()); decode(ctx.get(), pattern(40), 0);
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 64);
++    require(prefix && prefix->valid(), "pressure prefix missing");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1);
++    const auto large = pattern(230, 99);
++    equal_logits(decode(ctx.get(), large, 0), decode(reference.get(), large, 0));
++    require(!prefix->valid(), "cache pressure failed to reclaim references");
++    require(llama_n_ctx(ctx.get()) == 256, "retention changed logical context capacity");
++    clear(ctx.get()); decode(ctx.get(), pattern(65), 0);
++    require(!llama_memory_prefix_retain(ctx.get(), 0, UINT32_MAX), "retained more than one quarter of cache capacity");
++    auto split = make_context(model, false);
++    decode(split.get(), a, 0);
++    require(!llama_memory_prefix_retain(split.get(), 0, 64), "unsupported split-stream layout retained aliases");
++}
++
++static void server_cache(llama_model * model) {
++    auto ctx = make_context(model), reference = make_context(model);
++    const auto a = pattern(12), b = pattern(5, 71);
++    decode(ctx.get(), a, 0); decode(reference.get(), a, 0);
++    server_prompt prompt; prompt.tokens = server_tokens(a, false);
++    server_prompt_cache cache(1, 256); cache.retain_tokens = 64;
++    require(cache.save_resident(prompt, ctx.get(), 0), "server did not retain eligible prefix");
++    require(cache.states.size() == 1 && cache.states.front().data.main.empty() && cache.size() > 0, "resident snapshot accounting failed");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1);
++    decode(ctx.get(), b, 0);
++    server_prompt live; live.tokens = server_tokens(b, false);
++    auto next = a; next.push_back(78);
++    require(cache.load(live, server_tokens(next, false), ctx.get(), nullptr, 0, nullptr), "server metadata restore failed");
++    require(cache.states.empty() && live.tokens.get_tokens() == a, "server prompt ownership not transferred");
++    equal_logits(decode(ctx.get(), {78}, 12), decode(reference.get(), {78}, 12));
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    require(cache.save_resident(prompt, ctx.get(), 0), "second server prefix missing");
++    llama_memory_seq_add(llama_get_memory(ctx.get()), 0, 0, -1, 1);
++    const auto pos_before = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0);
++    require(cache.find_best(server_prompt{}, server_tokens(next, false)) == cache.states.end() && cache.states.empty(), "invalid retained candidate won lookup");
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == pos_before, "pruning modified active sequence");
++    clear(ctx.get()); decode(ctx.get(), a, 0);
++    cache.limit_size = 1;
++    require(!cache.save_resident(prompt, ctx.get(), 0) && cache.states.empty(), "resident state ignored byte budget");
++}
++
++static void short_prefix_in_long_context(llama_model * model) {
++    // Exercise release with a context much larger than the referenced range.
++    // No fragile timing threshold: all affected metadata and subsequent logits
++    // are checked. The production release loop visits the indexed range only.
++    auto ctx = make_context(model, true, 16384), reference = make_context(model);
++    const auto a = pattern(8);
++    equal_logits(decode(ctx.get(), a, 0), decode(reference.get(), a, 0));
++    auto prefix = llama_memory_prefix_retain(ctx.get(), 0, 32);
++    require(prefix && prefix->valid(), "short prefix in long context missing");
++    prefix.reset();
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), LLAMA_MAX_SEQ - 1) == -1,
++            "released alias retained indexed cells");
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == 7,
++            "release removed another sequence's indexed cells");
++    equal_logits(decode(ctx.get(), {93}, 8), decode(reference.get(), {93}, 8));
++    prefix = llama_memory_prefix_retain(ctx.get(), 0, 32);
++    require(prefix && prefix->valid(), "second long-context prefix missing");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1);
++    prefix.reset();
++    require(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), LLAMA_MAX_SEQ - 1) == -1,
++            "last-owner release retained orphaned cells");
++    require(llama_n_ctx(ctx.get()) == 16384, "release changed logical context capacity");
++}
++
++int main(int argc, char ** argv) {
++    if (argc == 3 && std::string(argv[2]) == "--cuda") { mode = test_mode::cuda; }
++    else if (argc == 3 && std::string(argv[2]) == "--hybrid") { mode = test_mode::hybrid; }
++    else if (argc != 2) { std::fprintf(stderr, "usage: test-retained-prefix fixture-directory [--cuda|--hybrid]\n"); return 2; }
++    try {
++        ggml_backend_load_all(); llama_backend_init();
++        auto * cuda = ggml_backend_reg_by_name("CUDA");
++        if (mode != test_mode::cpu && (!cuda || !ggml_backend_reg_dev_count(cuda))) {
++            std::puts("SKIP: CUDA required"); return 77;
++        }
++        ggml_backend_dev_t devices[] = {mode == test_mode::cpu ? nullptr : ggml_backend_reg_dev_get(cuda, 0), nullptr};
++        if (mode != test_mode::cpu) {
++            require(devices[0] && ggml_backend_dev_type(devices[0]) == GGML_BACKEND_DEVICE_TYPE_GPU,
++                    "CUDA fixture selected a non-GPU device");
++        }
++        std::filesystem::create_directories(argv[1]);
++        const auto path = (std::filesystem::path(argv[1]) / "retained-prefix.gguf").string();
++        make_fixture(path);
++        require(std::filesystem::file_size(path) < 4 * 1024 * 1024, "fixture exceeded small-model bound");
++        auto p = llama_model_default_params();
++        p.devices = devices;
++        p.n_gpu_layers = mode == test_mode::cuda ? 99 : mode == test_mode::hybrid ? 1 : 0;
++        p.gpu_exclusive = mode == test_mode::cuda;
++        std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path.c_str(), p), llama_model_free);
++        require(model != nullptr, "cannot load tiny prefix fixture");
++        sharing_and_lifetime(model.get()); invalidation_and_pressure(model.get()); server_cache(model.get());
++        short_prefix_in_long_context(model.get());
++        model.reset(); llama_backend_free();
++        std::printf("PASS retained prefix branches, ownership, bounds, pressure, shifts, serialization and server cache (%s)\n",
++                mode == test_mode::cpu ? "CPU" : mode == test_mode::cuda ? "CUDA" : "hybrid CPU/CUDA layers");
++    } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -348,6 +348,9 @@
+         if (prompt.tokens.size() == 0) {
+             return false;
+         }
++        // Retention is an optional capability of plain KV memories. Draft,
++        // recurrent and multimodal state still uses the complete transaction.
++        if (!ctx_dft && !spec && prompt_cache.save_resident(prompt, ctx_tgt, id)) { return true; }
+         const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+         if (!size_tgt || (ctx_dft && !size_dft)) {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1764,6 +1764,26 @@
+     states.erase(state);
+ }
+ 
++void server_prompt_cache::prune_invalid() {
++    if (!has_resident_entries) { return; }
++    bool any_resident = false;
++    for (auto it = states.begin(); it != states.end();) {
++        if (it->resident && !it->resident->valid()) { const auto expired = it++; erase_state(expired); }
++        else { any_resident |= bool(it->resident); ++it; }
++    }
++    has_resident_entries = any_resident;
++    if (states.size() < 4) { prefix_index.clear(); }
++}
++
++bool server_prompt_cache::save_resident(const server_prompt & prompt, llama_context * ctx, llama_seq_id sequence) {
++    if (!retain_tokens || prompt.tokens.has_mtmd || !prompt.checkpoints.empty()) { return false; }
++    prune_invalid();
++    if (!can_save(prompt, 0)) { return false; }
++    auto resident = llama_memory_prefix_retain(ctx, sequence, retain_tokens);
++    if (!resident || resident->n_tokens() != prompt.tokens.size()) { return false; }
++    return alloc(prompt, {}, std::move(resident)) != nullptr;
++}
++
+ bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size) const {
+     const bool indexed = prepare_prefix_lengths(prompt.tokens);
+     for (const auto & state : states) {
+@@ -1781,14 +1801,16 @@
+     return true;
+ }
+ 
+-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, server_prompt_data data) {
+-    if (data.main.empty() || !can_save(prompt, data.size())) { return nullptr; }
+-    size_t state_size_new = data.size();
++server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, server_prompt_data data, llama_memory_prefix_ptr resident) {
++    if (resident && (!resident->valid() || !data.main.empty())) { return nullptr; }
++    const size_t charged_bytes = data.size() + (resident ? resident->size() : 0);
++    if ((!resident && data.main.empty()) || !can_save(prompt, charged_bytes)) { return nullptr; }
++    size_t state_size_new = charged_bytes;
+     for (const auto & ckpt : prompt.checkpoints) { state_size_new += ckpt.size(); }
+ 
+     std::list<server_prompt_cache_state> pending;
+     try {
+-        pending.push_back({ prompt.clone(), std::move(data) });
++        pending.push_back({ prompt.clone(), std::move(data), std::move(resident) });
+     } catch (const std::bad_alloc & e) {
+         SRV_WRN("failed to stage prompt cache entry; existing cache retained: %s\n", e.what());
+         return nullptr;
+@@ -1823,6 +1845,7 @@
+     // allocations and the target/draft/spec capture have succeeded.
+     states.splice(states.end(), pending);
+     auto & published = states.back();
++    has_resident_entries |= bool(published.resident);
+     if (states.size() < 4) {
+         // Do not pay index maintenance for caches that use the linear path.
+         prefix_index.clear();
+@@ -1853,6 +1876,7 @@
+ }
+ 
+ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_best(const server_prompt & prompt, const server_tokens & tokens_new) {
++    prune_invalid();
+     if (tokens_new.empty()) {
+         return states.end();
+     }
+@@ -1914,6 +1938,16 @@
+ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
+     auto it_best = find_best(prompt, tokens_new);
+     if (it_best != states.end()) {
++        if (it_best->resident) {
++            if (ctx_dft || spec || !llama_memory_prefix_restore(ctx_tgt, it_best->resident, id_slot)) {
++                erase_state(it_best);
++                return false;
++            }
++            prefix_index.erase(&*it_best);
++            prompt = std::move(it_best->prompt);
++            states.erase(it_best); // active sequence now owns the shared cells
++            return true;
++        }
+         const size_t restore_bytes = it_best->data.size();
+         const int64_t restore_start = ggml_time_us();
+ 
+@@ -1949,6 +1983,7 @@
+ }
+ 
+ void server_prompt_cache::update() {
++    prune_invalid();
+     if (limit_size > 0) {
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -2,10 +2,12 @@
+ 
+ #include "common.h"
+ #include "llama.h"
++#include "../../src/llama-ext.h"
+ #include "state-transaction.h"
+ #include "server-prefix-index.h"
+ 
+ #include <string>
++#include <cstdlib>
+ #include <unordered_set>
+ #include <list>
+ #include <map>
+@@ -682,11 +684,12 @@
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
++    llama_memory_prefix_ptr resident;
+     // Scratch for a query on the inference thread; not part of serialized state.
+     mutable size_t indexed_lcp = 0;
+ 
+     size_t size() const {
+-        size_t res = data.size();
++        size_t res = data.size() + (resident ? resident->size() : 0);
+ 
+         for (const auto & ckpt : prompt.checkpoints) {
+             res += ckpt.size();
+@@ -700,6 +703,12 @@
+     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+         this->limit_tokens = limit_tokens;
++        const char * value = std::getenv("WILDLLAMA_PREFIX_RETAIN_TOKENS");
++        if (value && value[0] >= '0' && value[0] <= '9') {
++            char * end = nullptr;
++            const auto parsed = std::strtoull(value, &end, 10);
++            if (end && *end == '\0' && parsed <= UINT32_MAX) { retain_tokens = uint32_t(parsed); }
++        }
+     }
+ 
+     std::list<server_prompt_cache_state> states;
+@@ -709,6 +718,7 @@
+ 
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
++    uint32_t retain_tokens = 0; // explicit shared-cell budget, default disabled
+ 
+     size_t size() const;
+ 
+@@ -722,7 +732,9 @@
+ 
+     bool can_save(const server_prompt & prompt, size_t state_size) const;
+ 
+-    server_prompt_cache_state * alloc(const server_prompt & prompt, server_prompt_data data);
++    server_prompt_cache_state * alloc(const server_prompt & prompt, server_prompt_data data,
++            llama_memory_prefix_ptr resident = {});
++    bool save_resident(const server_prompt & prompt, llama_context * ctx, llama_seq_id sequence);
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec);
+ 
+@@ -732,8 +744,10 @@
+     // Only immutable text snapshots enter this optional index. Multimodal keys
+     // retain server_tokens' exact media-ID and position-aware comparison.
+     server_prefix_index<llama_token, server_prompt_cache_state *> prefix_index;
++    bool has_resident_entries = false;
+     bool prepare_prefix_lengths(const server_tokens & tokens) const;
+     void erase_state(std::list<server_prompt_cache_state>::iterator state);
++    void prune_invalid();
+ };
+ 
+ // used exclusively by router mode

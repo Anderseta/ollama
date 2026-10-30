@@ -1,0 +1,1258 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,5 +1,7 @@
+ #include "speculative.h"
+ #include "mtp-state.h"
++#include "mtp-device-state.h"
++#include <cstdlib>
+ 
+ #include "common.h"
+ #include "ggml.h"
+@@ -1518,6 +1520,44 @@
+     // The last h-row of one process() call needs the first token of the NEXT
+     // call to pair with, so it's stashed here until that next call fires.
+     std::vector<common_mtp_state> state; // positional carryover and verification history
++    bool device_state_enabled = false;
++    std::vector<common_mtp_device_state> device_state;
++    std::vector<llama_nextn_device_row> device_inputs;
++
++    bool disable_device_state() {
++        if (!device_state_enabled) { return true; }
++        for (size_t i = 0; i < state.size(); ++i) {
++            common_mtp_state host;
++            if (!device_state[i].materialize(host, uint32_t(n_embd), llama_n_batch(params.ctx_tgt))) { return false; }
++            state[i] = std::move(host);
++        }
++        device_state_enabled = false;
++        device_inputs.clear();
++        device_state.clear();
++        llama_set_nextn_device(params.ctx_tgt, false);
++        llama_set_nextn_device(params.ctx_dft, false);
++        return true;
++    }
++
++    bool state_can_resume(llama_seq_id seq, int64_t position) const {
++        return device_state_enabled ? device_state[size_t(seq)].can_resume(position) : state[size_t(seq)].can_resume(position);
++    }
++
++    void set_hidden(int32_t index, const float * host, llama_nextn_device_row row = {}) {
++        batch.set_embd_state(index, {row || !host ? zero_h.data() : host, 1, size_t(n_embd)});
++        if (row || !device_inputs.empty()) {
++            device_inputs.resize(size_t(index) + 1);
++            device_inputs[size_t(index)] = std::move(row);
++        }
++    }
++
++    int process_draft_batch() {
++        auto * input = batch.get();
++        if (device_inputs.empty()) { return llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, input); }
++        device_inputs.resize(size_t(batch.size()));
++        return llama_process_with_nextn_rows(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, input, device_inputs);
++    }
++
+     std::vector<float> zero_h; // immutable start row, allocated once
+     std::vector<bool> position_tracking;
+     std::vector<bool> start_zero;
+@@ -1606,6 +1646,24 @@
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
+ 
++        const char * device_option = std::getenv("WILDLLAMA_MTP_DEVICE_STATE");
++        // Fewer transfers do not guarantee faster decode. Keep device transport
++        // opt-in until representative trained-model benchmarks establish a gain.
++        const bool requested = device_option && std::strcmp(device_option, "1") == 0;
++        // The transport is model-independent. Multi-head, shared-memory and
++        // multi-sequence state layouts keep their existing verified path.
++        if (requested && n_seq == 1 && !chain_heads && !is_mem_shared &&
++            llama_model_n_devices(llama_get_model(ctx_tgt)) == 1 &&
++            llama_model_n_devices(llama_get_model(ctx_dft)) == 1 &&
++            llama_model_get_device(llama_get_model(ctx_tgt), 0) == llama_model_get_device(llama_get_model(ctx_dft), 0)) {
++            // Reserve optional metadata before changing either context. Failure
++            // leaves the original MTP initialization and output mode intact.
++            try { device_state.resize(n_seq); } catch (const std::bad_alloc &) { return; }
++            if (llama_set_nextn_device(ctx_tgt, true)) {
++                if (llama_set_nextn_device(ctx_dft, true)) { device_state_enabled = true; }
++                else { llama_set_nextn_device(ctx_tgt, false); }
++            }
++        }
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1620,6 +1678,12 @@
+             llama_sampler_free(backend_chains[seq_id]);
+         }
+         backend_chains.clear();
++        // Restore normal output transport before the speculative implementation
++        // releases its references; contexts can remain alive after this object.
++        if (device_state_enabled) {
++            llama_set_nextn_device(this->params.ctx_tgt, false);
++            llama_set_nextn_device(this->params.ctx_dft, false);
++        }
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+@@ -1653,6 +1717,24 @@
+         }
+ 
+         const int32_t n_tokens = batch_in.size();
++
++        std::vector<llama_nextn_device_row> target_rows;
++        if (device_state_enabled) {
++            bool eligible = true;
++            const int64_t first = batch_in.tokens[0].pos[0];
++            for (int i = 0; i < n_tokens; ++i) {
++                const auto & token = batch_in.tokens[i];
++                eligible = eligible && token.id != LLAMA_TOKEN_NULL && !token.embd.data && token.seq_id == 0 &&
++                    token.seq_ids_extra.empty() && int64_t(token.pos[0]) == first + i;
++                auto row = llama_get_nextn_device_row(params.ctx_tgt, i);
++                eligible = eligible && bool(row);
++                target_rows.push_back(std::move(row));
++            }
++            if (!eligible) {
++                if (!disable_device_state()) { return false; }
++                target_rows.clear();
++            }
++        }
+ 
+         // remember the first and last batch index for each sequence
+         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+@@ -1677,9 +1759,13 @@
+             const int first = i_batch_beg[seq_id], last = i_batch_end[seq_id];
+             const llama_pos first_pos = batch_in.tokens[first].pos[0];
+             start_zero[seq_id] = first_pos == 0 &&
+-                (state[seq_id].pending_pos < 0 || (!is_mem_shared &&
++                ((device_state_enabled ? device_state[seq_id].pending_pos : state[seq_id].pending_pos) < 0 || (!is_mem_shared &&
+                  llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) < 0));
+-            if (start_zero[seq_id]) { state[seq_id].clear(); position_tracking[seq_id] = true; }
++            if (start_zero[seq_id]) {
++                state[seq_id].clear();
++                if (device_state_enabled) { device_state[seq_id].clear(); }
++                position_tracking[seq_id] = true;
++            }
+             bool unitary = first_pos >= 0;
+             for (int i = first; i <= last && unitary; ++i) {
+                 unitary = int64_t(batch_in.tokens[i].pos[0]) == int64_t(first_pos) + i - first;
+@@ -1688,14 +1774,14 @@
+             // existing catch-up path, but do not advertise a position-keyed
+             // reusable prefix whose h provenance cannot be established.
+             position_tracking[seq_id] = position_tracking[seq_id] && unitary &&
+-                (start_zero[seq_id] || (first_pos > 0 && state[seq_id].can_resume(first_pos)));
++                (start_zero[seq_id] || (first_pos > 0 && state_can_resume(seq_id, first_pos)));
+         }
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         // The constructor configures unmasked nextn output: all raw target
+         // rows are dense. Synchronize/reorder once, then keep this target-owned
+         // host view while the separate draft context performs catch-up.
+-        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-        if (!h_tgt || uint64_t(n_tokens) > llama_n_batch(ctx_tgt)) {
++        const float * h_tgt = device_state_enabled ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
++        if ((!device_state_enabled && !h_tgt) || uint64_t(n_tokens) > llama_n_batch(ctx_tgt)) {
+             SPC_ERR("invalid target nextn rows for MTP catch-up: %d\n", n_tokens);
+             return false;
+         }
+@@ -1703,6 +1789,7 @@
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+         if (!is_mem_shared) {
+             batch.clear();
++            device_inputs.clear();
+ 
+             // pair each token with the tgt embedding shifted right by one position, and
+             // the first token of each sequence with the pending embedding from a previous run
+@@ -1720,12 +1807,19 @@
+                     ? batch.add(t.id, t.pos[0], seq_id, false)
+                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+ 
+-                const float * h_row = k == i_batch_beg[seq_id]
+-                    ? (start_zero[seq_id] ? zero_h.data() :
+-                       position_tracking[seq_id] ? state[seq_id].at(int64_t(t.pos[0]) - 1) : state[seq_id].pending.data())
+-                    : h_tgt + (size_t) (k - 1) * n_embd;
+-
+-                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
++                if (device_state_enabled) {
++                    auto row = k == i_batch_beg[seq_id]
++                        ? (start_zero[seq_id] ? llama_nextn_device_row{} : device_state[seq_id].at(int64_t(t.pos[0]) - 1))
++                        : target_rows[size_t(k - 1)];
++                    if (k == i_batch_beg[seq_id] && !start_zero[seq_id] && !row) { return false; }
++                    set_hidden(idx, nullptr, std::move(row));
++                } else {
++                    const float * h_row = k == i_batch_beg[seq_id]
++                        ? (start_zero[seq_id] ? zero_h.data() :
++                           position_tracking[seq_id] ? state[seq_id].at(int64_t(t.pos[0]) - 1) : state[seq_id].pending.data())
++                        : h_tgt + (size_t) (k - 1) * n_embd;
++                    set_hidden(idx, h_row);
++                }
+             }
+ 
+             auto * mem_dft = llama_get_memory(ctx_dft);
+@@ -1743,7 +1837,7 @@
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
+-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++                const int32_t rc = process_draft_batch();
+                 if (rc != 0) {
+                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+@@ -1766,6 +1860,10 @@
+             }
+ 
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
++            if (device_state_enabled) {
++                if (!device_state[seq_id].record(batch_in.tokens[i_batch_beg[seq_id]].pos[0], target_rows)) { return false; }
++                continue;
++            }
+             auto & saved = state[seq_id];
+             if (position_tracking[seq_id]) {
+                 if (!saved.begin_record(batch_in.tokens[i_batch_beg[seq_id]].pos[0], size_t(n_rows))) { return false; }
+@@ -1789,6 +1887,7 @@
+         auto & ctx_dft = params.ctx_dft;
+ 
+         batch.clear();
++        device_inputs.clear();
+ 
+         // keep track of which sequences are still drafting
+         int n_drafting = 0;
+@@ -1819,7 +1918,8 @@
+             }
+ 
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+-            batch.set_embd_state(idx, { state[seq_id].pending.data(), 1, (size_t) n_embd });
++            if (device_state_enabled) { set_hidden(idx, nullptr, device_state[seq_id].pending); }
++            else { set_hidden(idx, state[seq_id].pending.data()); }
+ 
+             i_last[seq_id] = idx;
+ 
+@@ -1847,7 +1947,7 @@
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+             }
+ 
+-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++            int ret = process_draft_batch();
+             if (ret != 0) {
+                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                 break;
+@@ -1857,6 +1957,7 @@
+             // new token (the KV already holds the prefix), while chained heads re-add the
+             // whole prefix at the next head. dropped sequences are simply not re-added.
+             batch.clear();
++            device_inputs.clear();
+ 
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 if (!drafting[seq_id]) {
+@@ -1905,7 +2006,8 @@
+                 }
+ 
+                 // Final proposals need no state download: the verifier supplies the accepted state.
+-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
++                auto device_row = device_state_enabled ? llama_get_nextn_device_row(ctx_dft, i_last[seq_id]) : llama_nextn_device_row{};
++                const float * h_row = device_row ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+@@ -1921,11 +2023,11 @@
+                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+                     const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
+-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
++                    set_hidden(idx, h_row, device_row);
+                     i_last[seq_id] = idx;
+                 } else {
+                     const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
+-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
++                    set_hidden(idx, h_row, device_row);
+                     i_last[seq_id] = idx;
+                 }
+             }
+@@ -1958,6 +2060,11 @@
+             return;
+         }
+ 
++        if (device_state_enabled) {
++            const size_t count = device_state[seq_id].positions.size();
++            if (count) { device_state[seq_id].accept(std::min<size_t>(n_accepted, count - 1)); }
++            return;
++        }
+         const int32_t n_rows = int32_t(state[seq_id].positions.size());
+         if (n_rows <= 0) {
+             return;
+@@ -1968,12 +2075,29 @@
+     }
+ 
+     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+-        return seq_id >= 0 && seq_id < (llama_seq_id) n_seq && position_tracking[seq_id] &&
+-               state[seq_id].save(data, llama_n_batch(params.ctx_tgt));
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !position_tracking[seq_id]) { return false; }
++        if (device_state_enabled) {
++            common_mtp_state host;
++            return device_state[seq_id].materialize(host, uint32_t(n_embd), llama_n_batch(params.ctx_tgt)) &&
++                   host.save(data, llama_n_batch(params.ctx_tgt));
++        }
++        return state[seq_id].save(data, llama_n_batch(params.ctx_tgt));
+     }
+     bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
+-            !state[seq_id].load(data, uint32_t(n_embd), llama_n_batch(params.ctx_tgt))) { return false; }
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return false; }
++        if (device_state_enabled) {
++            common_mtp_state host{uint32_t(n_embd)};
++            if (!host.load(data, uint32_t(n_embd), llama_n_batch(params.ctx_tgt))) { return false; }
++            bool uploaded = false;
++            try { uploaded = device_state[seq_id].upload(host, llama_get_nextn_device_owner(params.ctx_tgt), llama_n_batch(params.ctx_tgt)); }
++            catch (const std::bad_alloc &) { /* use the original host state below */ }
++            if (!uploaded) {
++                // Optional device storage cannot turn a valid checkpoint into
++                // a failed restore. Materialize the previous state first.
++                if (!disable_device_state()) { return false; }
++                state[seq_id] = std::move(host);
++            }
++        } else if (!state[seq_id].load(data, uint32_t(n_embd), llama_n_batch(params.ctx_tgt))) { return false; }
+         position_tracking[seq_id] = true;
+         start_zero[seq_id] = false;
+         i_last[seq_id] = -1;
+@@ -1985,7 +2109,7 @@
+     }
+     bool can_resume(llama_seq_id seq_id, llama_pos next_position) const override {
+         return seq_id >= 0 && seq_id < (llama_seq_id) n_seq &&
+-               (next_position == 0 || (position_tracking[seq_id] && state[seq_id].can_resume(next_position)));
++               (next_position == 0 || (position_tracking[seq_id] && state_can_resume(seq_id, next_position)));
+     }
+ };
+ 
+diff --git a/common/mtp-device-state.h b/common/mtp-device-state.h
+new file mode 100644
+--- /dev/null
++++ b/common/mtp-device-state.h
+@@ -0,0 +1,102 @@
++#pragma once
++
++#include "mtp-state.h"
++#include "../src/llama-nextn-device.h"
++
++// Positional provenance and rejection boundaries match common_mtp_state. Float
++// rows stay in immutable owned device buffers until an explicit snapshot asks
++// for host bytes. A rejected suffix is never addressable through at().
++struct common_mtp_device_state {
++    int64_t pending_pos = -1;
++    int64_t boundary_pos = -1;
++    llama_nextn_device_row pending;
++    llama_nextn_device_row boundary;
++    std::vector<llama_nextn_device_row> verify;
++    std::vector<int64_t> positions;
++
++    void clear() { pending_pos = boundary_pos = -1; pending = {}; boundary = {}; verify.clear(); positions.clear(); }
++
++    llama_nextn_device_row at(int64_t position) const {
++        if (position < 0 || position > pending_pos) { return {}; }
++        if (position == pending_pos) { return pending; }
++        auto it = std::lower_bound(positions.begin(), positions.end(), position);
++        if (it != positions.end() && *it == position) { return verify[size_t(it - positions.begin())]; }
++        return boundary_pos == position ? boundary : llama_nextn_device_row{};
++    }
++
++    bool can_resume(int64_t next) const { return next == 0 || (next > 0 && bool(at(next - 1))); }
++
++    bool record(int64_t first, const std::vector<llama_nextn_device_row> & rows) {
++        if (first < 0 || first > INT32_MAX || rows.empty() || rows.size() > uint64_t(INT32_MAX) - uint64_t(first) + 1 ||
++            std::any_of(rows.begin(), rows.end(), [](const auto & r) { return !r; })) { return false; }
++        auto predecessor = first ? at(first - 1) : llama_nextn_device_row{};
++        if (first && !predecessor) { return false; }
++        // All allocations precede publication, so a failed optional allocation
++        // retains the old state and the original cache-restore contract.
++        verify.reserve(rows.size());
++        positions.reserve(rows.size());
++        verify.assign(rows.begin(), rows.end());
++        positions.resize(rows.size());
++        for (size_t i = 0; i < rows.size(); ++i) { positions[i] = first + int64_t(i); }
++        boundary = std::move(predecessor);
++        boundary_pos = first - 1;
++        pending = verify.back();
++        pending_pos = positions.back();
++        return true;
++    }
++
++    bool accept(size_t row) {
++        if (row >= verify.size()) { return false; }
++        pending = verify[row]; pending_pos = positions[row];
++        verify.resize(row + 1); positions.resize(row + 1);
++        return true;
++    }
++
++    bool materialize(common_mtp_state & host, uint32_t width, size_t max_rows) const {
++        if (!width || positions.size() > max_rows || positions.size() != verify.size() || positions.size() > SIZE_MAX/width) { return false; }
++        common_mtp_state next(width);
++        if (positions.empty()) {
++            if (pending_pos != -1 || boundary_pos != -1 || pending.rows || boundary.rows) { return false; }
++            host = std::move(next);
++            return true;
++        }
++        const auto valid_width = [width](const auto & row) { return row && row.rows->tensor->ne[0] == int64_t(width); };
++        if (!valid_width(pending) || (boundary_pos >= 0 && !valid_width(boundary)) ||
++            std::any_of(verify.begin(), verify.end(), [&](const auto & row) { return !valid_width(row); })) { return false; }
++        next.pending_pos = pending_pos; next.boundary_pos = boundary_pos;
++        next.positions = positions;
++        next.verify.resize(verify.size()*size_t(width));
++        if (boundary && !llama_nextn_device_read(boundary, next.boundary.data())) { return false; }
++        for (size_t i = 0; i < verify.size();) {
++            size_t count = 1;
++            while (i + count < verify.size() && verify[i + count].rows == verify[i].rows &&
++                   verify[i + count].index == verify[i].index + count) { ++count; }
++            if (!llama_nextn_device_read(verify[i], next.verify.data() + i*width, count)) { return false; }
++            i += count;
++        }
++        std::copy_n(next.verify.data() + (verify.size() - 1)*width, width, next.pending.begin());
++        if (!next.valid(width, max_rows)) { return false; }
++        host = std::move(next);
++        return true;
++    }
++
++    bool upload(const common_mtp_state & host, const std::shared_ptr<llama_nextn_device_owner> & owner, size_t max_rows) {
++        if (!host.valid(host.width, max_rows)) { return false; }
++        if (host.positions.empty()) { clear(); return true; }
++        auto storage = llama_nextn_device_allocate(owner, host.width, host.positions.size() + 2);
++        if (!storage) { return false; }
++        const size_t stride = host.width*sizeof(float);
++        ggml_backend_tensor_set(storage->tensor, host.pending.data(), 0, stride);
++        ggml_backend_tensor_set(storage->tensor, host.boundary.data(), stride, stride);
++        ggml_backend_tensor_set(storage->tensor, host.verify.data(), 2*stride, host.verify.size()*sizeof(float));
++        common_mtp_device_state next;
++        next.pending_pos = host.pending_pos; next.boundary_pos = host.boundary_pos;
++        next.pending = {storage, 0};
++        next.boundary = {storage, 1};
++        next.positions = host.positions;
++        next.verify.reserve(host.positions.size());
++        for (size_t i = 0; i < host.positions.size(); ++i) { next.verify.push_back({storage, i + 2}); }
++        *this = std::move(next);
++        return true;
++    }
++};
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -4,6 +4,7 @@
+ 
+ #include "llama-arch.h"
+ #include "llama-cparams.h"
++#include "llama-nextn-device.h"
+ 
+ #include <array>
+ #include <vector>
+@@ -80,6 +81,11 @@
+ 
+     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+     std::shared_ptr<data_t> data;
++
++    // A scoped decode override, indexed in this ubatch's original token order.
++    // It changes input transport only, never graph topology or model semantics.
++    const struct llama_nextn_device_row * embd_state_device = nullptr;
++    ggml_backend_t embd_state_backend = nullptr;
+ };
+ 
+ // crash if a mixed ubatch reaches code that expects only tokens or only embd
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1306,12 +1306,14 @@
+ 
+ float * llama_context::get_embeddings_nextn() {
+     output_reorder();
++    materialize_nextn_device();
+ 
+     return embd_nextn.data;
+ }
+ 
+ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+     output_reorder();
++    materialize_nextn_device();
+ 
+     try {
+         if (embd_nextn.data == nullptr) {
+@@ -1534,6 +1536,8 @@
+     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+ 
+     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
++        // Materialize using the old row layout before changing maskedness.
++        if (nextn_device_enabled) { set_nextn_device(false); }
+         // these flags change the graph shape
+         sched_need_reserve = true;
+     }
+@@ -1717,7 +1721,10 @@
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    const auto state_backend = nextn_input_backend();
++
++    if (!graph_reuse_disable && gf_res_prev_active == res &&
++        nextn_device_graph_backend == state_backend && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1747,6 +1754,8 @@
+             return nullptr;
+         }
+ 
++        place_nextn_input(res, sched.get(), state_backend);
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+@@ -1754,6 +1763,7 @@
+         }
+ 
+         gf_res_prev_active = res;
++        nextn_device_graph_backend = state_backend;
+     }
+ 
+     // set the input data for the input tensors
+@@ -1761,7 +1771,29 @@
+         //const auto t_start_us = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+-        res->set_inputs(&ubatch);
++        llama_ubatch input = ubatch;
++        std::vector<llama_nextn_device_row> input_rows;
++        if (!nextn_device_inputs.empty()) {
++            if (!ubatch.data || ubatch.data->batch_idxs.size() != ubatch.n_tokens) {
++                throw std::runtime_error("device NextN input requires original batch indices");
++            }
++            input_rows.reserve(ubatch.n_tokens);
++            for (auto index : ubatch.data->batch_idxs) {
++                if (index < 0 || size_t(index) >= nextn_device_inputs.size()) {
++                    throw std::runtime_error("device NextN batch index out of range");
++                }
++                input_rows.push_back(nextn_device_inputs[size_t(index)]);
++            }
++            input.embd_state_device = input_rows.data();
++            for (const auto & graph_input : res->inputs) {
++                auto * hidden = dynamic_cast<llm_graph_input_embd_h *>(graph_input.get());
++                if (hidden && hidden->h) {
++                    input.embd_state_backend = ggml_backend_sched_get_tensor_backend(sched.get(), hidden->h);
++                    break;
++                }
++            }
++        }
++        res->set_inputs(&input);
+ 
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+@@ -2082,6 +2114,20 @@
+ 
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
++
++    nextn_device_host_stale = false;
++    bool device_ready = !nextn_device_enabled;
++    try {
++        nextn_device_row_ids.assign(nextn_device_enabled ? n_tokens_all : 0, -1);
++        const size_t required_rows = cparams.embeddings_nextn_masked ? n_outputs_all : n_tokens_all;
++        if (nextn_device_enabled && required_rows == 0) { nextn_device_active = -1; }
++        device_ready = !nextn_device_enabled || required_rows == 0 || prepare_nextn_device(required_rows);
++    } catch (const std::bad_alloc &) { device_ready = false; }
++    if (!device_ready) {
++        nextn_device_enabled = false;
++        nextn_device_active = -1;
++        nextn_device_row_ids.clear();
++    }
+ 
+     if (output_all) {
+         // require that all tokens are output
+@@ -2337,7 +2383,16 @@
+                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+ 
+                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                if (nextn_device_enabled && capture_nextn_device(backend_h, t_h_nextn, offset, size_t(n_rows), ubatch)) {
++                    nextn_device_host_stale = true;
++                } else {
++                    // Mid-batch incompatibility materializes already captured
++                    // rows before switching back to the original host path.
++                    if (nextn_device_host_stale) { materialize_nextn_device(false); }
++                    nextn_device_enabled = false;
++                    nextn_device_active = -1;
++                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                }
+                 extract_all_idxs = extract_all_idxs || !masked;
+             }
+         }
+@@ -2639,7 +2694,7 @@
+             }
+         }
+ 
+-        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
++        if (!nextn_device_host_stale && embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
+             for (uint64_t k = 0; k < n_embd_out; k++) {
+                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
+             }
+@@ -2681,7 +2736,7 @@
+         while (embd_batch_idxs[i] != (int32_t) i) {
+             const int32_t j = embd_batch_idxs[i];
+             GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+-            if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
++            if (!nextn_device_host_stale && embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+                 for (size_t k = 0; k < n_embd_out; ++k) {
+                     std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                 }
+@@ -4640,6 +4695,148 @@
+     return ctx->get_embeddings_seq(seq_id);
+ }
+ 
++ggml_backend_t llama_context::nextn_input_backend() const {
++    ggml_backend_dev_t device = nextn_device_enabled && nextn_device_owner
++        ? ggml_backend_get_device(nextn_device_owner->backend.get()) : nullptr;
++    if (!device) {
++        for (const auto & row : nextn_device_inputs) {
++            if (row) { device = ggml_backend_get_device(row.rows->owner->backend.get()); break; }
++        }
++    }
++    if (device && llama_nextn_cuda_device(device)) {
++        for (const auto & backend : backends) {
++            if (ggml_backend_get_device(backend.get()) == device) { return backend.get(); }
++        }
++    }
++    return nullptr;
++}
++
++void llama_context::place_nextn_input(llm_graph_result * result, ggml_backend_sched_t scheduler, ggml_backend_t backend) const {
++    if (!result || !scheduler || !backend) { return; }
++    // Graph inputs normally start in CPU staging even for a fully offloaded
++    // model. All graph arenas must use the same explicit placement, and include
++    // this backend in their reuse eligibility/identity.
++    for (const auto & input : result->inputs) {
++        auto * hidden = dynamic_cast<llm_graph_input_embd_h *>(input.get());
++        if (hidden && hidden->h) { ggml_backend_sched_set_tensor_backend(scheduler, hidden->h, backend); }
++    }
++}
++
++bool llama_context::set_nextn_device(bool enable) {
++    if (!enable) {
++        synchronize();
++        output_reorder();
++        materialize_nextn_device();
++        nextn_device_enabled = false;
++        nextn_device_active = -1;
++        nextn_device_pool.clear();
++        nextn_device_row_ids.clear();
++        return true;
++    }
++    if (model.devices.size() != 1 || !llama_nextn_cuda_device(model.devices[0].dev) ||
++        !cparams.embeddings_nextn || cparams.pipeline_parallel || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) { return false; }
++    if (!nextn_device_owner) {
++        try {
++            auto owner = std::make_shared<llama_nextn_device_owner>();
++            owner->backend.reset(ggml_backend_dev_init(model.devices[0].dev, nullptr));
++            if (!owner->backend) { return false; }
++            nextn_device_owner = std::move(owner);
++        } catch (const std::bad_alloc &) { return false; }
++    }
++    nextn_device_enabled = true;
++    return true;
++}
++
++bool llama_context::prepare_nextn_device(size_t rows) {
++    if (!nextn_device_owner || !rows) { return false; }
++    const size_t width = model.hparams.n_embd_out();
++    if (!width || rows > llama_nextn_device_owner::max_bytes/sizeof(float)/width) { return false; }
++    for (size_t i = 0; i < nextn_device_pool.size(); ++i) {
++        auto & bank = nextn_device_pool[i];
++        if (bank.use_count() == 1 && bank->tensor->ne[0] == int64_t(width) && size_t(bank->tensor->ne[1]) >= rows) {
++            nextn_device_active = int(i);
++            return true;
++        }
++    }
++    // Reclaim unused shapes before allocating. Referenced history rows remain
++    // immutable; at most three live generation banks are retained by this pool.
++    nextn_device_pool.erase(std::remove_if(nextn_device_pool.begin(), nextn_device_pool.end(),
++            [](const auto & bank) { return bank.use_count() == 1; }), nextn_device_pool.end());
++    if (nextn_device_pool.size() >= 3) { return false; }
++    try {
++        auto bank = llama_nextn_device_allocate(nextn_device_owner, width, rows);
++        if (!bank) { return false; }
++        nextn_device_pool.push_back(std::move(bank));
++        nextn_device_active = int(nextn_device_pool.size()) - 1;
++        return true;
++    } catch (const std::bad_alloc &) { return false; }
++}
++
++bool llama_context::capture_nextn_device(ggml_backend_t backend, const ggml_tensor * tensor,
++        size_t offset, size_t rows, const llama_ubatch & ubatch) {
++    if (nextn_device_active < 0 || !ubatch.data || ubatch.data->batch_idxs.size() != ubatch.n_tokens) { return false; }
++    auto & bank = nextn_device_pool[size_t(nextn_device_active)];
++    if (!llama_nextn_device_copy(backend, tensor, 0, bank, offset, rows)) { return false; }
++    size_t ordinal = 0;
++    for (size_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (cparams.embeddings_nextn_masked && !ubatch.output[i]) { continue; }
++        const int32_t raw = ubatch.data->batch_idxs[i];
++        if (raw < 0 || size_t(raw) >= nextn_device_row_ids.size() || ordinal >= rows) { return false; }
++        nextn_device_row_ids[size_t(raw)] = int32_t(offset + ordinal++);
++    }
++    return ordinal == rows;
++}
++
++llama_nextn_device_row llama_context::get_nextn_device_row(int32_t raw_index) const {
++    if (!nextn_device_enabled || nextn_device_active < 0 || raw_index < 0 || size_t(raw_index) >= nextn_device_row_ids.size()) { return {}; }
++    const auto index = nextn_device_row_ids[size_t(raw_index)];
++    return index < 0 ? llama_nextn_device_row{} : llama_nextn_device_row{nextn_device_pool[size_t(nextn_device_active)], size_t(index)};
++}
++
++void llama_context::materialize_nextn_device(bool logical_order) {
++    if (!nextn_device_host_stale || nextn_device_active < 0) { return; }
++    const auto & bank = nextn_device_pool[size_t(nextn_device_active)];
++    const size_t width = model.hparams.n_embd_out();
++    std::vector<float> host(size_t(bank->tensor->ne[1])*width);
++    if (!llama_nextn_device_read({bank, 0}, host.data(), size_t(bank->tensor->ne[1]))) {
++        throw std::runtime_error("cannot materialize device NextN output");
++    }
++    if (!logical_order) {
++        size_t captured = 0;
++        for (auto index : nextn_device_row_ids) { if (index >= 0) { captured = std::max(captured, size_t(index) + 1); } }
++        if (captured*width > embd_nextn.size) { throw std::runtime_error("partial device NextN host output overflow"); }
++        std::memcpy(embd_nextn.data, host.data(), captured*width*sizeof(float));
++        nextn_device_host_stale = false;
++        return;
++    }
++    for (size_t raw = 0; raw < nextn_device_row_ids.size(); ++raw) {
++        const int32_t source = nextn_device_row_ids[raw];
++        if (source < 0) { continue; }
++        const size_t destination = cparams.embeddings_nextn_masked ? size_t(output_resolve_row(int32_t(raw))) : raw;
++        if ((destination + 1)*width > embd_nextn.size) { throw std::runtime_error("device NextN host output overflow"); }
++        std::memcpy(embd_nextn.data + destination*width, host.data() + size_t(source)*width, width*sizeof(float));
++    }
++    nextn_device_host_stale = false;
++}
++
++int llama_context::decode_nextn_rows(const llama_batch_ext & batch, const std::vector<llama_nextn_device_row> & rows) {
++    if (!nextn_device_inputs.empty() || rows.size() != batch.tokens.size()) { return -1; }
++    for (const auto & row : rows) {
++        if (row.rows && (!row || size_t(row.rows->tensor->ne[0]) != batch.n_embd_state)) { return -1; }
++    }
++    nextn_device_inputs = rows;
++    struct cleanup { std::vector<llama_nextn_device_row> & rows; ~cleanup() { rows.clear(); } } clear{nextn_device_inputs};
++    return decode(batch);
++}
++
++bool llama_set_nextn_device(llama_context * ctx, bool enable) { return ctx && ctx->set_nextn_device(enable); }
++std::shared_ptr<llama_nextn_device_owner> llama_get_nextn_device_owner(llama_context * ctx) { return ctx ? ctx->get_nextn_device_owner() : nullptr; }
++llama_nextn_device_row llama_get_nextn_device_row(llama_context * ctx, int32_t raw_index) { return ctx ? ctx->get_nextn_device_row(raw_index) : llama_nextn_device_row{}; }
++int32_t llama_process_with_nextn_rows(llama_context * ctx, enum llama_process_type type,
++        const llama_batch_ext * batch, const std::vector<llama_nextn_device_row> & rows) {
++    return ctx && batch && type == LLAMA_PROCESS_TYPE_DECODE ? ctx->decode_nextn_rows(*batch, rows) : -1;
++}
++
+ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -94,6 +94,12 @@
+ 
+     float * get_embeddings_nextn();
+     float * get_embeddings_nextn_ith(int32_t i);
++    bool set_nextn_device(bool enable);
++    std::shared_ptr<llama_nextn_device_owner> get_nextn_device_owner() const { return nextn_device_owner; }
++    llama_nextn_device_row get_nextn_device_row(int32_t raw_index) const;
++    int decode_nextn_rows(const llama_batch_ext & batch, const std::vector<llama_nextn_device_row> & rows);
++    ggml_backend_t nextn_input_backend() const;
++    void place_nextn_input(llm_graph_result * result, ggml_backend_sched_t scheduler, ggml_backend_t backend) const;
+ 
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
+@@ -326,6 +332,19 @@
+     // sets llm_graph_result::t_h_nextn
+     buffer_view<float> embd_nextn = {nullptr, 0};
+ 
++    bool nextn_device_enabled = false;
++    bool nextn_device_host_stale = false;
++    std::shared_ptr<llama_nextn_device_owner> nextn_device_owner;
++    std::vector<std::shared_ptr<llama_nextn_device_rows>> nextn_device_pool;
++    int nextn_device_active = -1;
++    std::vector<int32_t> nextn_device_row_ids;
++    std::vector<llama_nextn_device_row> nextn_device_inputs;
++    ggml_backend_t nextn_device_graph_backend = nullptr;
++    bool prepare_nextn_device(size_t rows);
++    bool capture_nextn_device(ggml_backend_t backend, const ggml_tensor * tensor,
++            size_t offset, size_t rows, const llama_ubatch & ubatch);
++    void materialize_nextn_device(bool logical_order = true);
++
+     // host buffers for output layer input embeddings, per layer
+     // populated when cparams.output_layer_inp[il] is true
+     std::vector<buffer_view<float>> embd_layer_inp;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -5,6 +5,7 @@
+ // try as much as possible to not include this header in the rest of the codebase
+ 
+ #include "llama.h"
++#include "llama-nextn-device.h"
+ 
+ #include <cstdint>
+ #include <map>
+@@ -138,6 +139,16 @@
+ // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+ 
++// Optional same-device NextN transport. CUDA eligibility is checked at runtime;
++// CPU, split-device and unsupported placements retain the original host path.
++LLAMA_API bool llama_set_nextn_device(struct llama_context * ctx, bool enable);
++LLAMA_API std::shared_ptr<llama_nextn_device_owner> llama_get_nextn_device_owner(struct llama_context * ctx);
++LLAMA_API llama_nextn_device_row llama_get_nextn_device_row(struct llama_context * ctx, int32_t raw_index);
++LLAMA_API int32_t llama_process_with_nextn_rows(struct llama_context * ctx,
++        enum llama_process_type type, const struct llama_batch_ext * batch,
++        const std::vector<llama_nextn_device_row> & rows);
++
++
+ // Set whether the context outputs the input embeddings of a specific layer
+ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -156,7 +156,28 @@
+     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
+     GGML_ASSERT(n_embd_state == h->ne[0]);
+ 
+-    ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
++    if (ubatch->embd_state_device) {
++        // Upload only genuine host rows (e.g. the initial zero boundary). Device
++        // rows are copied with cross-stream event ordering by the backend.
++        for (int64_t i = 0; i < n_tokens;) {
++            const auto & row = ubatch->embd_state_device[i];
++            int64_t count = 1;
++            if (row) {
++                while (i + count < n_tokens && ubatch->embd_state_device[i + count].rows == row.rows &&
++                       ubatch->embd_state_device[i + count].index == row.index + size_t(count)) { ++count; }
++                if (!llama_nextn_device_input(row, ubatch->embd_state_backend, h, size_t(i), size_t(count))) {
++                    throw std::runtime_error("invalid device NextN input");
++                }
++            } else {
++                while (i + count < n_tokens && !ubatch->embd_state_device[i + count]) { ++count; }
++                ggml_backend_tensor_set(h, ubatch->embd_state + i*n_embd_state,
++                        i*h->nb[1], count*h->nb[1]);
++            }
++            i += count;
++        }
++    } else {
++        ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
++    }
+ }
+ 
+ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+diff --git a/src/llama-nextn-device.h b/src/llama-nextn-device.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-nextn-device.h
+@@ -0,0 +1,153 @@
++#pragma once
++
++#include "ggml-cpp.h"
++
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <vector>
++
++// Own the transport backend as well as its buffers: a saved row cannot borrow
++// a stream or graph allocation that a context reset/unload may destroy.
++struct llama_nextn_device_owner {
++    ggml_backend_ptr backend;
++    size_t bytes = 0;
++    static constexpr size_t max_bytes = 32u*1024u*1024u;
++    uint64_t captured_bytes = 0;
++    uint64_t device_input_rows = 0;
++    uint64_t host_input_rows = 0;
++    uint64_t materialized_bytes = 0;
++    uint64_t device_input_ranges = 0;
++};
++
++struct llama_nextn_device_rows {
++    std::shared_ptr<llama_nextn_device_owner> owner;
++    ggml_context_ptr ctx;
++    ggml_backend_buffer_ptr buffer;
++    ggml_backend_event_ptr reuse_event;
++    ggml_backend_event_ptr input_event;
++    ggml_tensor * tensor = nullptr;
++    size_t bytes = 0;
++
++    ~llama_nextn_device_rows() {
++        if (owner && owner->backend) {
++            // Copies are submitted on the source stream. A last reference can
++            // be released immediately after a draft submission, so drain that
++            // stream before releasing/reusing its source allocation.
++            ggml_backend_synchronize(owner->backend.get());
++        }
++        if (owner) { owner->bytes -= bytes; }
++    }
++};
++
++struct llama_nextn_device_row {
++    std::shared_ptr<llama_nextn_device_rows> rows;
++    size_t index = 0;
++
++    explicit operator bool() const {
++        return rows && rows->tensor && rows->buffer && rows->owner && rows->owner->backend &&
++            rows->tensor->type == GGML_TYPE_F32 && rows->tensor->ne[0] > 0 &&
++            rows->tensor->ne[1] > 0 && index < size_t(rows->tensor->ne[1]);
++    }
++};
++
++inline bool llama_nextn_cuda_device(ggml_backend_dev_t device) {
++    if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) { return false; }
++    const auto reg = ggml_backend_dev_backend_reg(device);
++    return reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
++}
++
++inline std::shared_ptr<llama_nextn_device_rows> llama_nextn_device_allocate(
++        const std::shared_ptr<llama_nextn_device_owner> & owner, size_t width, size_t count) {
++    if (!owner || !owner->backend || !width || !count || owner->bytes > owner->max_bytes ||
++        count > SIZE_MAX/sizeof(float)/width) { return {}; }
++    const size_t bytes = width*count*sizeof(float);
++    if (bytes > owner->max_bytes || bytes > owner->max_bytes - owner->bytes) { return {}; }
++    auto result = std::make_shared<llama_nextn_device_rows>();
++    result->owner = owner;
++    result->ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
++    if (!result->ctx) { return {}; }
++    result->tensor = ggml_new_tensor_2d(result->ctx.get(), GGML_TYPE_F32, int64_t(width), int64_t(count));
++    result->buffer.reset(ggml_backend_alloc_ctx_tensors(result->ctx.get(), owner->backend.get()));
++    if (!result->buffer || ggml_backend_buffer_is_host(result->buffer.get())) { return {}; }
++    const auto device = ggml_backend_get_device(owner->backend.get());
++    result->reuse_event.reset(ggml_backend_event_new(device));
++    result->input_event.reset(ggml_backend_event_new(device));
++    if (!result->reuse_event || !result->input_event) { return {}; }
++    const size_t allocation = ggml_backend_buffer_get_size(result->buffer.get());
++    if (allocation > owner->max_bytes - owner->bytes) { return {}; }
++    result->bytes = allocation;
++    owner->bytes += allocation;
++    return result;
++}
++
++// Stack descriptors only; the copy API consumes the descriptors synchronously
++// and queues the data transfer with backend event ordering.
++inline ggml_tensor llama_nextn_device_view(const ggml_tensor * tensor, size_t first, size_t count) {
++    ggml_tensor view = *tensor;
++    view.ne[1] = int64_t(count);
++    view.ne[2] = view.ne[3] = 1;
++    view.nb[2] = view.nb[1]*count;
++    view.nb[3] = view.nb[2];
++    view.data = static_cast<char *>(tensor->data) + first*tensor->nb[1];
++    view.view_src = nullptr;
++    view.view_offs = 0;
++    return view;
++}
++
++inline bool llama_nextn_device_copy(
++        ggml_backend_t source_backend, const ggml_tensor * source, size_t source_first,
++        const std::shared_ptr<llama_nextn_device_rows> & destination, size_t destination_first, size_t count) {
++    if (!source_backend || !source || !destination || !destination->tensor || !count ||
++        source->type != GGML_TYPE_F32 || !ggml_is_contiguous(source) || source->ne[0] != destination->tensor->ne[0] ||
++        source_first > size_t(source->ne[1]) || count > size_t(source->ne[1]) - source_first ||
++        destination_first > size_t(destination->tensor->ne[1]) || count > size_t(destination->tensor->ne[1]) - destination_first ||
++        ggml_backend_get_device(source_backend) != ggml_backend_get_device(destination->owner->backend.get()) ||
++        ggml_backend_buffer_is_host(source->buffer)) { return false; }
++    auto src = llama_nextn_device_view(source, source_first, count);
++    auto dst = llama_nextn_device_view(destination->tensor, destination_first, count);
++    // A released input reference can leave an asynchronous source read in
++    // flight. Protect pool reuse on-device without a host synchronization.
++    ggml_backend_event_record(destination->reuse_event.get(), destination->owner->backend.get());
++    ggml_backend_event_wait(source_backend, destination->reuse_event.get());
++    ggml_backend_tensor_copy_async(source_backend, destination->owner->backend.get(), &src, &dst);
++    destination->owner->captured_bytes += count*source->nb[1];
++    return true;
++}
++
++inline bool llama_nextn_device_read(const llama_nextn_device_row & row, float * destination, size_t count = 1) {
++    if (!row || !destination || !count || count > size_t(row.rows->tensor->ne[1]) - row.index) { return false; }
++    ggml_backend_synchronize(row.rows->owner->backend.get());
++    ggml_backend_tensor_get(row.rows->tensor, destination, row.index*row.rows->tensor->nb[1], count*row.rows->tensor->nb[1]);
++    row.rows->owner->materialized_bytes += count*row.rows->tensor->nb[1];
++    return true;
++}
++
++inline bool llama_nextn_device_input(const llama_nextn_device_row & row, ggml_backend_t destination_backend,
++        ggml_tensor * destination, size_t destination_index, size_t count = 1) {
++    if (!row || !destination_backend || !destination || destination->type != GGML_TYPE_F32 ||
++        destination->ne[0] != row.rows->tensor->ne[0] || destination_index >= size_t(destination->ne[1]) ||
++        !count || count > size_t(row.rows->tensor->ne[1]) - row.index ||
++        count > size_t(destination->ne[1]) - destination_index || !ggml_is_contiguous(destination)) { return false; }
++    auto src = llama_nextn_device_view(row.rows->tensor, row.index, count);
++    auto dst = llama_nextn_device_view(destination, destination_index, count);
++    const auto device = ggml_backend_get_device(destination_backend);
++    if (device == ggml_backend_get_device(row.rows->owner->backend.get()) &&
++        !ggml_backend_buffer_is_host(destination->buffer)) {
++        // The destination graph may still be reading its previous input.
++        ggml_backend_event_record(row.rows->input_event.get(), destination_backend);
++        ggml_backend_event_wait(row.rows->owner->backend.get(), row.rows->input_event.get());
++        ggml_backend_tensor_copy_async(row.rows->owner->backend.get(), destination_backend, &src, &dst);
++        row.rows->owner->device_input_rows += count;
++        ++row.rows->owner->device_input_ranges;
++        return true;
++    }
++    // An unsupported placement keeps the original computation through a real
++    // host transfer. No zero-copy claim is made for this explicit fallback.
++    std::vector<float> host(size_t(src.ne[0])*count);
++    if (!llama_nextn_device_read(row, host.data(), count)) { return false; }
++    ggml_backend_tensor_set(destination, host.data(), destination_index*destination->nb[1], count*destination->nb[1]);
++    row.rows->owner->host_input_rows += count;
++    return true;
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -456,6 +456,15 @@
+ llama_build_and_test(test-mtp-state.cpp LABEL "main behavior" LINK llama-common)
+ add_dependencies(test-mtp-state ggml-cpu)
+ target_compile_definitions(test-mtp-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++llama_build_and_test(test-mtp-device-state.cpp LABEL "main behavior" LINK llama-common)
++add_dependencies(test-mtp-device-state ggml-cpu)
++target_compile_definitions(test-mtp-device-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++if(TARGET ggml-cuda)
++    add_dependencies(test-mtp-device-state ggml-cuda)
++    target_compile_definitions(test-mtp-device-state PRIVATE GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
++    llama_test(test-mtp-device-state NAME test-mtp-device-state-cuda ARGS --cuda LABEL "backend cuda")
++    set_tests_properties(test-mtp-device-state-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
++endif()
+ add_executable(test-mtp-carry-state test-mtp-carry-state.cpp)
+ target_compile_features(test-mtp-carry-state PRIVATE cxx_std_17)
+ llama_test(test-mtp-carry-state LABEL "main behavior")
+diff --git a/tests/test-mtp-state.cpp b/tests/test-mtp-state.cpp
+--- a/tests/test-mtp-state.cpp
++++ b/tests/test-mtp-state.cpp
+@@ -13,8 +13,8 @@
+ 
+ static void require(bool condition, const char * message) { if (!condition) { throw std::runtime_error(message); } }
+ static void step(const char * message) { std::fprintf(stderr, "mtp-state STEP %s\n", message); std::fflush(stderr); }
+-static llama_model_ptr tiny_model() {
+-    const int dim=32, vocab=64;
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32) {
++    const int dim=embedding_width, vocab=64;
+     gguf_context_ptr metadata(gguf_init_empty());
+     gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
+     gguf_set_val_str(metadata.get(), "general.name", "mtp-rollback-diagnostic-fixture");
+@@ -54,8 +54,8 @@
+         ggml_backend_tensor_set(tensor,values.data(),0,values.size()*sizeof(float));
+     };
+     auto params=llama_model_default_params();
+-    ggml_backend_dev_t devices[]={nullptr};
+-    params.devices=devices; params.n_gpu_layers=0; params.load_mode=LLAMA_LOAD_MODE_NONE;
++    ggml_backend_dev_t devices[]={gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    params.devices=devices; params.n_gpu_layers=gpu ? 99 : 0; params.load_mode=LLAMA_LOAD_MODE_NONE;
+     params.use_extra_bufts=false; params.no_host=true; params.load_mtp=true;
+     llama_model_ptr model(llama_model_init_from_user(metadata.get(),initialize,nullptr,params));
+     require(bool(model),"cannot initialize nonzero tiny recurrent fixture");
+diff --git a/tests/test-mtp-device-state.cpp b/tests/test-mtp-device-state.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-mtp-device-state.cpp
+@@ -0,0 +1,210 @@
++// Reuse the nonzero in-memory <4 MiB model and checkpoint helpers. The existing
++// CPU regression remains a separate executable with its original entry point.
++#define main mtp_existing_cpu_regression
++#include "test-mtp-state.cpp"
++#undef main
++
++#include "mtp-device-state.h"
++#include <cstdlib>
++
++static void option(bool enabled) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_MTP_DEVICE_STATE", enabled ? "1" : "0");
++#else
++    setenv("WILDLLAMA_MTP_DEVICE_STATE", enabled ? "1" : "0", 1);
++#endif
++}
++
++static void bound_model_buffers(const session & s) {
++    // User-created models have no GGUF file size; inspect allocated weights
++    // rather than accepting llama_model_size()==0 as a resource bound.
++    size_t bytes = 0;
++    for (const auto & entry : llama_get_memory_breakdown(s.target.get())) { bytes += entry.second.model; }
++    require(bytes > 0 && bytes < 4u*1024u*1024u, "device fixture model buffers exceed 4 MiB or are unmeasured");
++    std::printf("MTP fixture allocated model buffers: %zu bytes\n", bytes);
++}
++
++static void process_without_host_hidden(session & s, llama_token token, llama_pos position) {
++    require(common_speculative_can_resume(s.spec.get(), 0, position), "device resume guard rejected valid predecessor");
++    common_batch input(s.target.get()); input.add(token, position, 0, true);
++    const int target_rc=llama_process(s.target.get(), LLAMA_PROCESS_TYPE_DECODE, input.get());
++    const bool catch_up=target_rc==0 && common_speculative_process(s.spec.get(), input);
++    if(target_rc || !catch_up) { std::fprintf(stderr,"process diagnostic token=%d pos=%d rc=%d catchup=%d owner=%d row=%d\n",token,position,target_rc,catch_up,
++            bool(llama_get_nextn_device_owner(s.target.get())),bool(llama_get_nextn_device_row(s.target.get(),0))); }
++    require(target_rc == 0 && catch_up, "device target/catch-up failed");
++}
++
++static llama_tokens proposals(session & s, llama_pos position) {
++    llama_tokens result, history = {3,4,5,6};
++    auto & dp = common_speculative_get_draft_params(s.spec.get(), 0);
++    dp.drafting = true; dp.n_max = 2; dp.pos0 = position; dp.id_last = 7;
++    dp.prompt = &history; dp.result = &result;
++    common_speculative_draft(s.spec.get());
++    require(result.size() == 2, "device fixture did not produce two draft tokens");
++    return result;
++}
++
++static void verify(session & s, const llama_tokens & draft, uint16_t accept) {
++    require(llama_memory_seq_rm(llama_get_memory(s.draft.get()), 0, 4, -1), "device draft trim failed");
++    common_batch input(s.target.get()); input.add(7,4,0,true);
++    input.add(draft[0],5,0,true); input.add(draft[1],6,0,true);
++    require(llama_process(s.target.get(), LLAMA_PROCESS_TYPE_DECODE, input.get()) == 0 &&
++            common_speculative_process(s.spec.get(),input), "device verification failed");
++    common_speculative_accept(s.spec.get(),0,accept);
++}
++
++int main(int argc, char ** argv) {
++    try {
++        const bool cuda = argc > 1 && std::string(argv[1]) == "--cuda";
++#ifdef GGML_TEST_CPU_BACKEND_PATH
++        require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "CPU backend unavailable");
++#else
++        ggml_backend_load_all();
++#endif
++        if (cuda) {
++#ifdef GGML_TEST_CUDA_BACKEND_PATH
++            require(ggml_backend_load(GGML_TEST_CUDA_BACKEND_PATH), "CUDA backend unavailable");
++#else
++            std::puts("SKIP: CUDA backend not configured"); return 77;
++#endif
++            require(llama_nextn_cuda_device(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)), "CUDA device unavailable");
++        }
++        llama_backend_init();
++        auto model = tiny_model(cuda);
++        {
++            common_mtp_device_state malformed;
++            malformed.pending_pos = 4;
++            common_mtp_state sentinel(32); sentinel.pending[0] = 42.f;
++            require(!malformed.materialize(sentinel,32,64) && sentinel.pending[0] == 42.f,
++                    "malformed empty device state published a host replacement");
++        }
++        option(false); session host(model.get());
++        bound_model_buffers(host);
++        require(!llama_get_nextn_device_owner(host.target.get()) && !llama_get_nextn_device_owner(host.draft.get()),
++                "disabled reference unexpectedly enabled device transport");
++        option(true); session device(model.get());
++        auto owner = llama_get_nextn_device_owner(device.target.get());
++        auto draft_owner = llama_get_nextn_device_owner(device.draft.get());
++        require(bool(owner) == cuda && bool(draft_owner) == cuda, "device eligibility was silently ignored");
++        const llama_tokens a={3,4,5,6}, b={17,18,19,20};
++        for (size_t i=0;i<a.size();++i) { process_without_host_hidden(host,a[i],llama_pos(i)); process_without_host_hidden(device,a[i],llama_pos(i)); }
++        require(host.logits() == device.logits(), "device prefill changed target logits");
++        if (cuda) {
++            std::fprintf(stderr,"device target captured=%llu input=%llu host=%llu bytes=%zu current=%d; draft captured=%llu input=%llu host=%llu bytes=%zu\n",
++                    (unsigned long long)owner->captured_bytes,(unsigned long long)owner->device_input_rows,
++                    (unsigned long long)owner->materialized_bytes,owner->bytes,bool(llama_get_nextn_device_row(device.target.get(),0)),
++                    (unsigned long long)draft_owner->captured_bytes,(unsigned long long)draft_owner->device_input_rows,
++                    (unsigned long long)draft_owner->materialized_bytes,draft_owner->bytes);
++            require(owner->captured_bytes && owner->device_input_rows, "device target transfer path did not execute");
++            require(owner->materialized_bytes == 0 && draft_owner->materialized_bytes == 0 &&
++                    owner->host_input_rows == 0 && draft_owner->host_input_rows == 0,
++                    "steady MTP unexpectedly transferred hidden rows through the host");
++            require(draft_owner->bytes == 0,"catch-up without hidden outputs allocated a draft output bank");
++        }
++        const auto saved_host = host.save(), saved_device = device.save();
++        step("device initial snapshots");
++        equal(saved_host,saved_device,"device checkpoint changed target/draft/aux bytes");
++        if (cuda) { require(owner->materialized_bytes > 0,"explicit snapshot did not materialize device state"); }
++        const auto host_draft = proposals(host,4), device_draft = proposals(device,4);
++        step("device proposals");
++        require(host_draft == device_draft,"device draft proposals changed");
++        if(cuda) {
++            require(draft_owner->captured_bytes && draft_owner->device_input_rows &&
++                    draft_owner->materialized_bytes == 0 && draft_owner->host_input_rows == 0,
++                    "intermediate draft hidden rows used the host");
++        }
++        for (uint16_t accepted=0;accepted<=2;++accepted) {
++            std::fprintf(stderr,"device accepted test %u\n",unsigned(accepted));
++            require(host.restore(saved_host) && device.restore(saved_device),"device restore failed");
++            const auto hd = proposals(host,4), dd=proposals(device,4);
++            verify(host,hd,accepted); verify(device,dd,accepted);
++            equal(host.save(),device.save(),"device accepted/rejected boundary differed");
++            require(common_speculative_can_resume(device.spec.get(),0,5+accepted),"accepted boundary not reusable");
++            require(!common_speculative_can_resume(device.spec.get(),0,6+accepted),"rejected suffix exposed as carry");
++        }
++        require(host.restore(saved_host) && device.restore(saved_device),"A restore failed");
++        step("device A/B/A");
++        for (session * s : {&host,&device}) {
++            s->clear(); for(size_t i=0;i<b.size();++i) { process_without_host_hidden(*s,b[i],llama_pos(i)); }
++        }
++        require(host.restore(saved_host) && device.restore(saved_device),"A/B/A restoration failed");
++        process_without_host_hidden(host,7,4); process_without_host_hidden(device,7,4);
++        equal(host.save(),device.save(),"A/B/A device carry contaminated another conversation");
++        auto broken = saved_device; broken.spec.resize(broken.spec.size()-1);
++        step("device failed restore");
++        require(!device.restore(broken),"truncated device snapshot was accepted");
++        require(device.restore(saved_device),"device state did not recover after failure");
++        // Force the explicit bounded-allocation fallback on the next capture.
++        if (cuda) {
++            const auto real_bytes = owner->bytes;
++            owner->bytes = owner->max_bytes + 1;
++            require(!llama_nextn_device_allocate(owner,32,1),"over-budget owner counter underflowed");
++            owner->bytes = owner->max_bytes;
++            common_batch large(device.target.get());
++            for (int i=0;i<64;++i) { large.add(7+i%5,4+i,0,true); }
++            require(llama_process(device.target.get(),LLAMA_PROCESS_TYPE_DECODE,large.get()) == 0 &&
++                    common_speculative_process(device.spec.get(),large),"bounded allocation fallback failed");
++            // Subtract the artificial reservation, preserving real changes.
++            owner->bytes -= owner->max_bytes - real_bytes;
++            require(!llama_get_nextn_device_row(device.target.get(),0),"forced byte budget did not fall back");
++            require(host.restore(saved_host),"host reference reset failed");
++            common_batch reference(host.target.get());
++            for(int i=0;i<64;++i) { reference.add(7+i%5,4+i,0,true); }
++            require(llama_process(host.target.get(),LLAMA_PROCESS_TYPE_DECODE,reference.get()) == 0 &&
++                    common_speculative_process(host.spec.get(),reference),"host fallback reference failed");
++            equal(host.save(),device.save(),"device allocation fallback changed state");
++        }
++        // Exercise pool reuse without reading any hidden row back to the CPU.
++        option(false); session repeated_host(model.get());
++        option(true); session repeated_device(model.get());
++        for (int i=0;i<40;++i) {
++            process_without_host_hidden(repeated_host,3+i%9,i);
++            process_without_host_hidden(repeated_device,3+i%9,i);
++        }
++        equal(repeated_host.save(),repeated_device.save(),"device source/input reuse raced across streams");
++        // A second embedding width checks transport dispatch without matching a
++        // model name or the installed model's matrix dimensions.
++        auto other_model=tiny_model(cuda,64);
++        option(false); session other_host(other_model.get());
++        bound_model_buffers(other_host);
++        option(true); session other_device(other_model.get());
++        for(size_t i=0;i<a.size();++i) {
++            process_without_host_hidden(other_host,a[i],llama_pos(i));
++            process_without_host_hidden(other_device,a[i],llama_pos(i));
++        }
++        equal(other_host.save(),other_device.save(),"device transport changed another embedding width");
++        if(cuda) {
++            require(!llama_get_nextn_device_row(other_device.target.get(),-1) &&
++                    !llama_get_nextn_device_row(other_device.target.get(),64),"invalid row index accepted");
++            common_batch invalid(other_device.draft.get()); invalid.add(7,4,0,true);
++            std::vector<float> zero(64); invalid.set_embd_state(0,{zero.data(),1,zero.size()});
++            auto row=llama_get_nextn_device_row(other_device.target.get(),0);
++            row.index=SIZE_MAX;
++            require(llama_process_with_nextn_rows(other_device.draft.get(),LLAMA_PROCESS_TYPE_DECODE,invalid.get(),{row}) == -1,
++                    "malformed device row silently became a zero row");
++            row=llama_get_nextn_device_row(other_device.target.get(),0);
++            common_mtp_device_state guarded;
++            require(guarded.record(0,{row}) && !guarded.record(INT64_MAX,{row}) && guarded.pending_pos == 0,
++                    "out-of-range device history position overflowed or mutated old state");
++            option(false); session coalesced_host(model.get());
++            option(true); session coalesced(model.get());
++            process_without_host_hidden(coalesced,3,0);
++            process_without_host_hidden(coalesced_host,3,0);
++            auto coalesced_owner=llama_get_nextn_device_owner(coalesced.target.get());
++            const auto ranges=coalesced_owner->device_input_ranges;
++            common_batch prefix(coalesced.target.get());
++            for(int i=1;i<64;++i) { prefix.add(3+i%9,i,0,true); }
++            require(llama_process(coalesced.target.get(),LLAMA_PROCESS_TYPE_DECODE,prefix.get()) == 0 &&
++                    common_speculative_process(coalesced.spec.get(),prefix),"coalesced device prefill failed");
++            require(coalesced_owner->device_input_ranges-ranges <= 2 && coalesced_owner->device_input_rows == 63 &&
++                    coalesced_owner->materialized_bytes == 0,"contiguous device rows were not coalesced or used host copies");
++            common_batch host_prefix(coalesced_host.target.get());
++            for(int i=1;i<64;++i) { host_prefix.add(3+i%9,i,0,true); }
++            require(llama_process(coalesced_host.target.get(),LLAMA_PROCESS_TYPE_DECODE,host_prefix.get()) == 0 &&
++                    common_speculative_process(coalesced_host.spec.get(),host_prefix),"coalesced host reference failed");
++            equal(coalesced_host.save(),coalesced.save(),"coalesced ranges changed full target/draft/carry state");
++        }
++        std::puts("PASS: bounded model-independent NextN device transport, no steady hidden D2H, exact MTP proposals, snapshots, every rejection boundary, A/B/A and allocation fallback");
++        return 0;
++    } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }
++}

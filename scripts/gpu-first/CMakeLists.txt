@@ -117,6 +117,25 @@ foreach(test_name IN ITEMS test-server-prefix-cache test-server-admission)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# Bounded resident caches use only small local/generated fixtures.
+validation_target(test-retained-prefix server-context)
+target_include_directories(test-retained-prefix PRIVATE
+    "${WILDLLAMA_NATIVE}/src" "${WILDLLAMA_NATIVE}/tools/server")
+add_test(NAME retained-prefix
+    COMMAND test-retained-prefix "${CMAKE_BINARY_DIR}/retained-prefix-fixtures")
+if(TARGET ggml-cuda)
+    add_dependencies(test-retained-prefix ggml-cuda)
+    add_test(NAME retained-prefix-cuda
+        COMMAND test-retained-prefix "${CMAKE_BINARY_DIR}/retained-prefix-cuda-fixtures" --cuda)
+    add_test(NAME retained-prefix-hybrid
+        COMMAND test-retained-prefix "${CMAKE_BINARY_DIR}/retained-prefix-hybrid-fixtures" --hybrid)
+    set_tests_properties(retained-prefix-cuda retained-prefix-hybrid
+        PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
+validation_target(test-graph-variants llama)
+target_include_directories(test-graph-variants PRIVATE "${WILDLLAMA_NATIVE}/src")
+add_test(NAME graph-variants-policy COMMAND test-graph-variants)
+
 # Offline dense calibration is explicit; its policy tests never initialize CUDA.
 add_executable(test-cuda-tuning-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cuda-tuning-policy.cpp")
 target_compile_features(test-cuda-tuning-policy PRIVATE cxx_std_17)
@@ -194,6 +213,18 @@ validation_target(test-mtp-state llama-common)
 add_dependencies(test-mtp-state ggml-cpu)
 target_compile_definitions(test-mtp-state PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
 add_test(NAME mtp-state COMMAND test-mtp-state)
+validation_target(test-mtp-device-state llama-common)
+add_dependencies(test-mtp-device-state ggml-cpu)
+target_compile_definitions(test-mtp-device-state PRIVATE
+    GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
+add_test(NAME mtp-device-state COMMAND test-mtp-device-state)
+if(TARGET ggml-cuda)
+    add_dependencies(test-mtp-device-state ggml-cuda)
+    target_compile_definitions(test-mtp-device-state PRIVATE
+        GGML_TEST_CUDA_BACKEND_PATH="$<TARGET_FILE:ggml-cuda>")
+    add_test(NAME mtp-device-state-cuda COMMAND test-mtp-device-state --cuda)
+    set_tests_properties(mtp-device-state-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
 add_executable(test-mtp-carry-state "${WILDLLAMA_NATIVE}/tests/test-mtp-carry-state.cpp")
 target_compile_features(test-mtp-carry-state PRIVATE cxx_std_17)
 add_test(NAME mtp-carry-state COMMAND test-mtp-carry-state)
