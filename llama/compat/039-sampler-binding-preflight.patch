@@ -1,0 +1,189 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3302,6 +3302,7 @@
+         /*.res         =*/ res,
+         /*.nextn_input_backend =*/ nextn_input_backend(),
+         /*.sampler_bindings    =*/ res != gf_res_reserve.get() && graph_sampler_bindings_enabled(),
++        /*.sampler_bindings_limit =*/ graph_variant_budget,
+     };
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -29,6 +29,7 @@
+ #include <sstream>
+ #include <string>
+ #include <unordered_set>
++#include <limits>
+ 
+ // dedup helpers
+ 
+@@ -1387,6 +1388,18 @@
+ }
+ 
+ bool llm_graph_input_sampling::capture_bindings(binding_factory capture) {
++    return capture_bindings(capture,std::numeric_limits<size_t>::max());
++}
++
++bool llm_graph_input_sampling::capture_bindings(binding_factory capture,size_t budget) {
++    bindings.clear();
++    size_t requested=0;
++    for(const auto & entry:samplers) {
++        const size_t bound=llama_sampler_backend_binding_size_bound(entry.second);
++        const size_t node=sizeof(decltype(bindings)::value_type)+4*sizeof(void *);
++        if(requested>budget || node>budget-requested || bound>budget-requested-node) {return false;}
++        requested+=node+bound;
++    }
+     try {
+         for (const auto & entry : samplers) {
+             auto binding = capture(entry.second);
+@@ -4622,7 +4635,7 @@
+     }
+ 
+     if (res->wants_sampler_bindings()) {
+-        res->sampler_bindings_owned = sampling_input->capture_bindings();
++        res->sampler_bindings_owned = sampling_input->capture_bindings(llama_sampler_backend_capture_bindings,res->sampler_binding_limit());
+         res->sampler_bindings_bytes = sampling_input->binding_bytes();
+     }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -775,6 +775,7 @@
+     bool capture_bindings();
+     using binding_factory = std::unique_ptr<llama_sampler_graph_binding> (*)(llama_sampler *);
+     LLAMA_API bool capture_bindings(binding_factory capture);
++    LLAMA_API bool capture_bindings(binding_factory capture,size_t budget);
+     LLAMA_API size_t binding_bytes() const;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+@@ -849,6 +850,7 @@
+     // Input pointers are owned by this graph, not by the most recently built
+     // graph attached to a logical sampler. Part of the reuse contract.
+     bool sampler_bindings = false;
++    size_t sampler_bindings_limit = 0;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -915,6 +917,7 @@
+ 
+         return
+             sampler_bindings               == other.sampler_bindings               &&
++            sampler_bindings_limit         == other.sampler_bindings_limit         &&
+             nextn_input_backend             == other.nextn_input_backend             &&
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+@@ -980,6 +983,7 @@
+     void set_params(const llm_graph_params & params);
+ 
+     bool wants_sampler_bindings() const { return params.sampler_bindings; }
++    size_t sampler_binding_limit() const { return params.sampler_bindings_limit; }
+     bool sampler_bindings_ready() const { return !params.sampler_bindings || sampler_bindings_owned; }
+     void disable_sampler_bindings();
+     size_t metadata_bytes() const { return buf_compute_meta.capacity() + sampler_bindings_bytes; }
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -21,6 +21,7 @@
+ #include <random>
+ #include <unordered_map>
+ #include <stdexcept>
++#include <limits>
+ 
+ // the ring buffer works similarly to std::deque, but with a fixed capacity
+ template<typename T>
+@@ -4747,6 +4748,27 @@
+     };
+     std::vector<entry> entries;
+ 
++    struct footprint {size_t nodes=1,payload=0;bool valid=true;};
++    static footprint measure(const llama_sampler * sampler) noexcept {
++        footprint result;
++        const size_t limit=std::numeric_limits<size_t>::max();
++        auto add=[&](size_t & value,size_t extra){if(extra>limit-value){result.valid=false;}else{value+=extra;}};
++        auto vector_bytes=[&](size_t count,size_t element){if(count>limit/element){result.valid=false;return size_t(0);}return count*element;};
++        if(sampler->iface==&llama_sampler_chain_i) {
++            for(const auto & child:static_cast<const llama_sampler_chain *>(sampler->ctx)->samplers) {
++                const auto next=measure(child.ptr);result.valid&=next.valid;
++                add(result.nodes,next.nodes);add(result.payload,next.payload);
++            }
++        } else if(sampler->iface==&llama_sampler_dist_i) {
++            result.payload=vector_bytes(static_cast<const llama_sampler_dist *>(sampler->ctx)->inp_uniforms.size(),sizeof(ggml_tensor *));
++        } else if(sampler->iface==&llama_sampler_penalties_i) {
++            const auto & ctx=*static_cast<const llama_sampler_penalties *>(sampler->ctx);
++            add(result.payload,vector_bytes(ctx.host_token_ids.size(),sizeof(int32_t)));
++            add(result.payload,vector_bytes(ctx.host_counts.size(),sizeof(int32_t)));
++        }
++        return result;
++    }
++
+     void capture(llama_sampler * sampler) {
+         entry e;
+         e.identity = sampler; e.iface = sampler->iface; e.context = sampler->ctx;
+@@ -4796,7 +4818,22 @@
+         return true;
+     }
+ public:
+-    explicit sampler_graph_binding(llama_sampler * sampler) { capture(sampler); }
++    explicit sampler_graph_binding(llama_sampler * sampler) {
++        // One metadata allocation, rather than repeatedly growing/moving the
++        // snapshot vector while potentially large penalty scratch is present.
++        entries.reserve(measure(sampler).nodes);
++        capture(sampler);
++    }
++
++    static size_t size_bound(const llama_sampler * sampler) noexcept {
++        const auto size=measure(sampler);
++        const size_t limit=std::numeric_limits<size_t>::max();
++        if(!size.valid || size.nodes>limit/(3*sizeof(entry)) || size.payload>limit/2) {return limit;}
++        size_t bound=sizeof(sampler_graph_binding);
++        const size_t metadata=3*size.nodes*sizeof(entry),payload=2*size.payload;
++        if(metadata>limit-bound) {return limit;}bound+=metadata;
++        if(payload>limit-bound) {return limit;}return bound+payload;
++    }
+ 
+     bool matches(const llama_sampler * sampler) const noexcept override {
+         size_t index = 0;
+@@ -4855,6 +4892,10 @@
+     return std::unique_ptr<llama_sampler_graph_binding>(new sampler_graph_binding(sampler));
+ }
+ 
++size_t llama_sampler_backend_binding_size_bound(const llama_sampler * sampler) {
++    return llama_sampler_backend_can_bind_graph(sampler) ? sampler_graph_binding::size_bound(sampler) : std::numeric_limits<size_t>::max();
++}
++
+ // perf
+ 
+ struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -69,6 +69,9 @@
+ };
+ LLAMA_API bool llama_sampler_backend_can_bind_graph(const llama_sampler * sampler);
+ LLAMA_API std::unique_ptr<llama_sampler_graph_binding> llama_sampler_backend_capture_bindings(llama_sampler * sampler);
++// Conservative allocation-free bound, including temporary snapshot storage.
++// SIZE_MAX means unsupported/overflow; query before copying large scratch.
++LLAMA_API size_t llama_sampler_backend_binding_size_bound(const llama_sampler * sampler);
+ 
+ // An owned allow-mask, applied before probability/selection stages. State
+ // copies/clone own their words; graph bindings never borrow caller memory.
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -1016,8 +1016,13 @@
+         binding_capture_calls=0;
+         require(!failed.capture_bindings(binding_capture_failure) && failed.bindings.empty() && failed.binding_bytes()==0,
+                 "partial snapshot allocation failure retained borrowed bindings");
++        llm_graph_input_sampling too_large({{0,b[0].get()},{1,b[1].get()}});
++        binding_capture_calls=0;
++        require(!too_large.capture_bindings(binding_capture_failure,1) && binding_capture_calls==0 && too_large.bindings.empty(),
++                "snapshot memory preflight copied scratch before rejecting its budget");
+         auto binding=llama_sampler_backend_capture_bindings(b[0].get());
+         require(binding && binding->matches(b[0].get()),"live graph binding not matched");
++        require(llama_sampler_backend_binding_size_bound(b[0].get())>=binding->memory_size(),"binding preflight underestimated retained bytes");
+         auto * terminal=llama_sampler_chain_remove(b[0].get(),llama_sampler_chain_n(b[0].get())-1);
+         require(!binding->matches(b[0].get()),"removed stage kept graph binding valid");
+         llama_sampler_chain_add(b[0].get(),terminal);

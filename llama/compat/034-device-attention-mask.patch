@@ -1,0 +1,889 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -602,6 +602,8 @@
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_ATTN_MASK, // compact causal positions/sequence memberships -> exact dense mask
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1762,6 +1764,16 @@
+         struct ggml_tensor      * a);
+ 
+     // set elements above the diagonal to -INF
++    // keys: I32 [n_kv, 2, n_stream], queries: I32 [n_query, 2, n_stream].
++    // Plane 0 contains positions; plane 1 contains uint32 sequence-membership bits.
++    // Keep iff memberships intersect and key position <= query position. Output
++    // is F16/F32 [n_kv, n_query, 1, n_stream], with exact +0 and -infinity.
++    GGML_API struct ggml_tensor * ggml_attn_mask(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * keys,
++            struct ggml_tensor  * queries,
++            enum ggml_type        type);
++
+     GGML_API struct ggml_tensor * ggml_diag_mask_inf(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2109,6 +2109,10 @@
+             {
+                 ggml_compute_forward_top_k_mask(params, tensor);
+             } break;
++        case GGML_OP_ATTN_MASK:
++            {
++                ggml_compute_forward_attn_mask(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2286,6 +2290,7 @@
+             {
+                 n_tasks = 1;
+             } break;
++        case GGML_OP_ATTN_MASK:
+         case GGML_OP_COUNT_EQUAL:
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_GATED_DELTA_NET:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12609,3 +12609,26 @@
+         }
+     }
+ }
++
++// Expand compact causal visibility metadata without doing floating-point math.
++void ggml_compute_forward_attn_mask(const ggml_compute_params * params, ggml_tensor * dst) {
++    const auto * keys = static_cast<const int32_t *>(dst->src[0]->data);
++    const auto * queries = static_cast<const int32_t *>(dst->src[1]->data);
++    const int64_t nk = dst->ne[0], nq = dst->ne[1];
++    const int64_t rows = nq * dst->ne[3];
++    const ggml_fp16_t drop16 = ggml_fp32_to_fp16(-INFINITY);
++    for (int64_t row = params->ith; row < rows; row += params->nth) {
++        const int64_t stream = row / nq, q = row % nq;
++        const int32_t * kp = keys + stream * 2 * nk;
++        const int32_t * qp = queries + stream * 2 * nq;
++        for (int64_t k = 0; k < nk; ++k) {
++            const bool keep = (uint32_t(kp[nk+k]) & uint32_t(qp[nq+q])) != 0 && kp[k] <= qp[q];
++            const int64_t i = row * nk + k;
++            if (dst->type == GGML_TYPE_F16) {
++                static_cast<ggml_fp16_t *>(dst->data)[i] = keep ? ggml_fp16_t(0) : drop16;
++            } else {
++                static_cast<float *>(dst->data)[i] = keep ? 0.0f : -INFINITY;
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -119,6 +119,7 @@
+ void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_attn_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cuda/diagmask.cu b/ggml/src/ggml-cuda/diagmask.cu
+--- a/ggml/src/ggml-cuda/diagmask.cu
++++ b/ggml/src/ggml-cuda/diagmask.cu
+@@ -38,3 +38,35 @@
+ 
+     diag_mask_inf_f32_cuda(src0_d, dst_d, ne00, nrows0, ne01, n_past, stream);
+ }
++
++// The output is exactly the existing 0/-inf mask. Only compact integer
++// metadata is staged from the host; the dense mask stays on the device.
++template<typename T>
++static __global__ void attn_mask_expand(const int32_t * keys, const int32_t * queries,
++        T * dst, int64_t nk, int64_t nq) {
++    const int64_t k = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (k >= nk) {
++        return;
++    }
++    const int64_t row = blockIdx.y, q = row % nq, stream = row / nq;
++    const int64_t i = row * nk + k;
++    const int32_t * kp = keys + stream * 2 * nk;
++    const int32_t * qp = queries + stream * 2 * nq;
++    const bool keep = (uint32_t(kp[nk+k]) & uint32_t(qp[nq+q])) != 0 && kp[k] <= qp[q];
++    dst[i] = T(keep ? 0.0f : -INFINITY);
++}
++
++void ggml_cuda_op_attn_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_I32 && dst->src[1]->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(dst->src[0]) && ggml_is_contiguous(dst->src[1]));
++    GGML_ASSERT(dst->ne[1] * dst->ne[3] <= 65535);
++    const dim3 blocks((unsigned) ((dst->ne[0] + 255) / 256), (unsigned) (dst->ne[1] * dst->ne[3]));
++    const auto * keys = static_cast<const int32_t *>(dst->src[0]->data);
++    const auto * queries = static_cast<const int32_t *>(dst->src[1]->data);
++    if (dst->type == GGML_TYPE_F16) {
++        attn_mask_expand<<<blocks, 256, 0, ctx.stream()>>>(keys, queries, static_cast<half *>(dst->data), dst->ne[0], dst->ne[1]);
++    } else {
++        GGML_ASSERT(dst->type == GGML_TYPE_F32);
++        attn_mask_expand<<<blocks, 256, 0, ctx.stream()>>>(keys, queries, static_cast<float *>(dst->data), dst->ne[0], dst->ne[1]);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/diagmask.cuh b/ggml/src/ggml-cuda/diagmask.cuh
+--- a/ggml/src/ggml-cuda/diagmask.cuh
++++ b/ggml/src/ggml-cuda/diagmask.cuh
+@@ -3,3 +3,5 @@
+ #define CUDA_DIAG_MASK_INF_BLOCK_SIZE 32
+ 
+ void ggml_cuda_op_diag_mask_inf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_attn_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3080,6 +3080,9 @@
+         case GGML_OP_DIAG:
+             ggml_cuda_op_diag(ctx, dst);
+             break;
++        case GGML_OP_ATTN_MASK:
++            ggml_cuda_op_attn_mask(ctx, dst);
++            break;
+         case GGML_OP_DIAG_MASK_INF:
+             ggml_cuda_op_diag_mask_inf(ctx, dst);
+             break;
+@@ -6957,6 +6960,11 @@
+         }
+         case GGML_OP_CONT:
+             return true;
++        case GGML_OP_ATTN_MASK:
++            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
++                op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
++                op->ne[1]*op->ne[3] <= 65535 &&
++                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+         case GGML_OP_DIAG_MASK_INF:
+             return true;
+         case GGML_OP_SOFT_MAX:
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1108,9 +1108,10 @@
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++    "ATTN_MASK",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1224,9 +1225,10 @@
+     "sgd(x)",
+ 
+     "glu(x)",
++    "causal_mask(k,q)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4058,6 +4060,26 @@
+     result->op     = GGML_OP_DIAG;
+     result->src[0] = a;
+ 
++    return result;
++}
++
++// ggml_attn_mask
++
++struct ggml_tensor * ggml_attn_mask(
++        struct ggml_context * ctx,
++        struct ggml_tensor * keys,
++        struct ggml_tensor * queries,
++        enum ggml_type type) {
++    GGML_ASSERT(keys->type == GGML_TYPE_I32 && queries->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_contiguous(keys) && ggml_is_contiguous(queries));
++    GGML_ASSERT(keys->ne[0] > 0 && queries->ne[0] > 0);
++    GGML_ASSERT(keys->ne[1] == 2 && queries->ne[1] == 2);
++    GGML_ASSERT(keys->ne[2] == queries->ne[2] && keys->ne[3] == 1 && queries->ne[3] == 1);
++    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, keys->ne[0], queries->ne[0], 1, keys->ne[2]);
++    result->op = GGML_OP_ATTN_MASK;
++    result->src[0] = keys;
++    result->src[1] = queries;
+     return result;
+ }
+ 
+diff --git a/src/llama-device-mask.h b/src/llama-device-mask.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-device-mask.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// Admission is independent of backend/model names. Semantic capability and a
++// CUDA backend are checked separately before graph construction.
++struct llama_device_mask_plan {
++    uint64_t metadata_bytes = 0;
++    uint64_t dense_bytes = 0;
++    bool eligible = false;
++};
++
++inline llama_device_mask_plan llama_device_mask_admit(uint32_t n_kv, uint32_t n_tokens,
++        uint32_t n_stream, uint32_t n_sequences, bool f16) {
++    llama_device_mask_plan p;
++    if (!n_kv || !n_stream || !n_tokens || n_tokens % n_stream ||
++            !n_sequences || n_sequences > 32 || n_tokens > 65535) {
++        return p;
++    }
++    p.metadata_bytes = 2*sizeof(int32_t)*(uint64_t(n_kv)*n_stream + n_tokens);
++    p.dense_bytes = uint64_t(f16 ? 2 : 4)*n_kv*n_tokens;
++    p.eligible = n_tokens/n_stream >= 32 && p.dense_bytes >= 256*1024 &&
++        p.metadata_bytes <= 8*1024*1024 &&
++        p.metadata_bytes <= p.dense_bytes/4;
++    return p;
++}
++
++inline bool llama_device_mask_supported(bool causal, bool alibi, bool swa,
++        uint32_t n_pos, bool tokens, bool mixed, uint32_t n_sequences) {
++    return causal && !alibi && !swa && n_pos == 1 && tokens && !mixed &&
++        n_sequences > 0 && n_sequences <= 32;
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-sampler.h"
+ 
+ #include "llama-kv-cache.h"
++#include "llama-device-mask.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-kv-cache-dsa-iswa.h"
+@@ -21,6 +22,7 @@
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
++#include <cstdlib>
+ #include <numeric>
+ #include <sstream>
+ #include <string>
+@@ -474,7 +476,7 @@
+     };
+ 
+     LLAMA_LOG_DEBUG("%s: n_swa : %d, n_kv: %d, swa_type: %s\n", __func__, (int)n_swa, (int)n_kv, swa_type_str);
+-    LLAMA_LOG_DEBUG("%s: '0' = can attend, '∞' = masked\n", __func__);
++    LLAMA_LOG_DEBUG("%s: '0' = can attend, 'âˆž' = masked\n", __func__);
+     LLAMA_LOG_DEBUG("%s: Rows = query tokens, Columns = key/value tokens\n\n", __func__);
+ 
+     LLAMA_LOG_DEBUG("    ");
+@@ -488,7 +490,7 @@
+         for (int j = 0; j < std::min((int64_t)20, n_kv); ++j) {
+             float val = llama_cast<float>(data[i * n_kv + j]);
+             if (val == -INFINITY) {
+-                LLAMA_LOG_DEBUG(" ∞");
++                LLAMA_LOG_DEBUG(" âˆž");
+             } else {
+                 LLAMA_LOG_DEBUG(" 0");
+             }
+@@ -569,7 +571,9 @@
+ 
+     // the mask is left unallocated when the graph only stores K/V without attending
+     // (e.g. DFlash's KV-injection pass)
+-    if (self_kq_mask && self_kq_mask->buffer) {
++    if (self_mask_keys && self_mask_keys->buffer && self_mask_queries->buffer) {
++        mctx->set_input_mask_metadata(self_mask_keys, self_mask_queries, *ubatch);
++    } else if (self_kq_mask && self_kq_mask->buffer) {
+         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+     }
+ 
+@@ -593,6 +597,10 @@
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    if (self_mask_keys) {
++        const uint32_t ns = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
++        res &= mctx->can_use_device_mask(params.ubatch, params.cparams.causal_attn, ns);
++    }
+ 
+     return res;
+ }
+@@ -3365,7 +3373,8 @@
+      const llama_ubatch & ubatch,
+     const llama_hparams & hparams,
+     const llama_cparams & cparams,
+-    const llama_kv_cache_context * mctx_cur) {
++    const llama_kv_cache_context * mctx_cur,
++    ggml_backend_sched_t sched = nullptr) {
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+ 
+@@ -3375,7 +3384,39 @@
+         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        const char * enabled = std::getenv("WILDLLAMA_DEVICE_MASK");
++        const uint32_t ns = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
++        const uint32_t nq = ns ? ubatch.n_tokens/ns : 0;
++        const uint64_t nk = mctx_cur->get_n_kv();
++        const auto plan = llama_device_mask_admit(nk, ubatch.n_tokens, ns, ubatch.n_seqs_unq, cparams.flash_attn);
++        // Wide prefill only: do not add a kernel or larger upload to single-token decode.
++        const bool eligible = enabled && std::strcmp(enabled, "1") == 0 && sched &&
++            cparams.offload_kqv && !cparams.training && plan.eligible &&
++            mctx_cur->can_use_device_mask(ubatch, cparams.causal_attn, ns);
++        if (eligible) {
++            auto * keys = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, nk, 2, ns);
++            auto * queries = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, nq, 2, ns);
++            auto * mask = ggml_attn_mask(ctx0, keys, queries, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
++            for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched); ++bi) {
++                const auto backend = ggml_backend_sched_get_backend(sched, bi);
++                // Only CUDA currently implements the device expansion kernel.
++                if (std::strncmp(ggml_backend_name(backend), "CUDA", 4) == 0 && ggml_backend_supports_op(backend, mask)) {
++                    ggml_set_input(keys);
++                    ggml_set_input(queries);
++                    ggml_set_name(keys, "attn_inp_mask_keys");
++                    ggml_set_name(queries, "attn_inp_mask_queries");
++                    ggml_set_name(mask, "attn_inp_kq_mask_device");
++                    ggml_backend_sched_set_tensor_backend(sched, mask, backend);
++                    inp->self_mask_keys = keys;
++                    inp->self_mask_queries = queries;
++                    inp->self_kq_mask = mask;
++                    break;
++                }
++            }
++        }
++        if (!inp->self_kq_mask) {
++            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        }
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -3388,7 +3429,7 @@
+ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+ 
+-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
++    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
+ 
+     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+ }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -361,6 +361,8 @@
+     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+ 
++    ggml_tensor * self_mask_keys = nullptr;    // I32 [n_kv, 2, n_stream]
++    ggml_tensor * self_mask_queries = nullptr; // I32 [n_query, 2, n_stream]
+     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-kv-cache.h"
++#include "llama-device-mask.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-io.h"
+@@ -2009,6 +2010,66 @@
+     }
+ }
+ 
++bool llama_kv_cache::can_use_device_mask(const llama_ubatch & ubatch, bool causal_attn, uint32_t n_stream) const {
++    if (!llama_device_mask_supported(causal_attn, hparams.use_alibi,
++            n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE, ubatch.n_pos,
++            ubatch.token != nullptr, ubatch.is_mixed(), ubatch.n_seqs_unq) ||
++            n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
++        return false;
++    }
++    const uint32_t nq = ubatch.n_tokens / n_stream;
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        const auto stream = seq_to_stream[ubatch.seq_id[s*nq][0]];
++        for (uint32_t q = 0; q < nq; ++q) {
++            if (seq_to_stream[ubatch.seq_id[s*nq+q][0]] != stream) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++void llama_kv_cache::set_input_mask_metadata(ggml_tensor * keys, ggml_tensor * queries, const llama_ubatch & ubatch) const {
++    GGML_ASSERT(ggml_backend_buffer_is_host(keys->buffer) && ggml_backend_buffer_is_host(queries->buffer));
++    const int64_t nk = keys->ne[0], nq = queries->ne[0], ns = keys->ne[2];
++    GGML_ASSERT(can_use_device_mask(ubatch, true, ns));
++    auto * kd = static_cast<int32_t *>(keys->data);
++    auto * qd = static_cast<int32_t *>(queries->data);
++    for (int64_t s = 0; s < ns; ++s) {
++        const auto stream = seq_to_stream[ubatch.seq_id[s*nq][0]];
++        const auto & cells = v_cells.at(stream);
++        auto * kp = kd + s * 2 * nk;
++        auto * qp = qd + s * 2 * nq;
++        for (int64_t k = 0; k < nk; ++k) {
++            uint32_t bits = 0;
++            if (!cells.is_empty(k)) {
++                for (uint32_t u = 0; u < ubatch.n_seqs_unq; ++u) {
++                    if (cells.seq_has(k, ubatch.seq_id_unq[u])) {
++                        bits |= uint32_t(1) << u;
++                    }
++                }
++                kp[k] = cells.pos_get(k);
++            } else {
++                kp[k] = 0; // membership=0 makes empty/padded rows invisible at every position
++            }
++            memcpy(kp + nk + k, &bits, sizeof(bits));
++        }
++        for (int64_t q = 0; q < nq; ++q) {
++            const int64_t i = s*nq + q;
++            qp[q] = ubatch.pos[i];
++            uint32_t bit = 0;
++            for (uint32_t u = 0; u < ubatch.n_seqs_unq; ++u) {
++                if (ubatch.seq_id_unq[u] == ubatch.seq_id[i][0]) {
++                    bit = uint32_t(1) << u;
++                    break;
++                }
++            }
++            GGML_ASSERT(bit != 0);
++            memcpy(qp + nq + q, &bit, sizeof(bit));
++        }
++    }
++}
++
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+@@ -3202,6 +3263,14 @@
+     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+ }
+ 
++bool llama_kv_cache_context::can_use_device_mask(const llama_ubatch & ubatch, bool causal_attn, uint32_t n_stream) const {
++    return kv->can_use_device_mask(ubatch, causal_attn, n_stream);
++}
++
++void llama_kv_cache_context::set_input_mask_metadata(ggml_tensor * keys, ggml_tensor * queries, const llama_ubatch & ubatch) const {
++    kv->set_input_mask_metadata(keys, queries, ubatch);
++}
++
+ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -239,6 +239,8 @@
+ 
+     void set_input_k_shift(ggml_tensor * dst) const;
+ 
++    bool can_use_device_mask(const llama_ubatch & ubatch, bool causal_attn, uint32_t n_stream) const;
++    void set_input_mask_metadata(ggml_tensor * keys, ggml_tensor * queries, const llama_ubatch & ubatch) const;
+     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+@@ -451,6 +453,8 @@
+     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+     void set_input_k_shift   (ggml_tensor * dst) const;
++    bool can_use_device_mask(const llama_ubatch & ubatch, bool causal_attn, uint32_t n_stream) const;
++    void set_input_mask_metadata(ggml_tensor * keys, ggml_tensor * queries, const llama_ubatch & ubatch) const;
+     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -472,3 +472,12 @@
+ llama_build_and_test(test-sampler-output-view.cpp LABEL "main behavior" LINK llama-common)
+ add_dependencies(test-sampler-output-view ggml-cpu)
+ target_compile_definitions(test-sampler-output-view PRIVATE GGML_TEST_CPU_BACKEND_PATH="$<TARGET_FILE:ggml-cpu>")
++
++llama_build(test-device-attn-mask.cpp LINK llama ggml)
++llama_test(test-device-attn-mask ARGS ${CMAKE_CURRENT_BINARY_DIR} LABEL "main behavior")
++add_dependencies(test-device-attn-mask ggml-cpu)
++if (TARGET ggml-cuda)
++    add_dependencies(test-device-attn-mask ggml-cuda)
++    llama_test(test-device-attn-mask NAME test-device-attn-mask-cuda ARGS --cuda ${CMAKE_CURRENT_BINARY_DIR} LABEL "backend cuda")
++    set_tests_properties(test-device-attn-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
++endif()
+diff --git a/tests/test-device-attn-mask.cpp b/tests/test-device-attn-mask.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-device-attn-mask.cpp
+@@ -0,0 +1,368 @@
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "ggml-cpu.h"
++#include "../src/llama-device-mask.h"
++
++#include <algorithm>
++#include <climits>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++static void enabled(bool value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_DEVICE_MASK", value ? "1" : "0");
++#else
++    setenv("WILDLLAMA_DEVICE_MASK", value ? "1" : "0", 1);
++#endif
++}
++static void admission() {
++    const auto wide = llama_device_mask_admit(4096, 512, 1, 2, true);
++    require(wide.eligible && wide.metadata_bytes == 36864 && wide.dense_bytes == 4194304, "incorrect compact admission/accounting");
++    require(!llama_device_mask_admit(256, 32, 1, 1, true).eligible,"small staging must keep faster old path");
++    require(!llama_device_mask_admit(4096, 1, 1, 1, true).eligible, "single-token decode must retain old path");
++    require(!llama_device_mask_admit(1, 32, 1, 1, true).eligible, "metadata larger than mask admitted");
++    require(!llama_device_mask_admit(4096, 512, 1, 33, true).eligible, "sequence bit budget ignored");
++    require(!llama_device_mask_admit(1024*1024, 512, 1, 1, true).eligible, "metadata byte budget ignored");
++    require(!llama_device_mask_admit(4096, 65, 2, 2, true).eligible, "uneven stream layout admitted");
++    require(!llama_device_mask_admit(4096, 65536, 1, 1, true).eligible, "CUDA row-grid budget ignored");
++    require(llama_device_mask_supported(true,false,false,1,true,false,32),"supported causal layout rejected");
++    require(!llama_device_mask_supported(false,false,false,1,true,false,1),"noncausal admitted");
++    require(!llama_device_mask_supported(true,true,false,1,true,false,1),"ALiBi admitted");
++    require(!llama_device_mask_supported(true,false,true,1,true,false,1),"SWA admitted");
++    require(!llama_device_mask_supported(true,false,false,3,true,false,1),"M-RoPE admitted");
++    require(!llama_device_mask_supported(true,false,false,1,false,false,1),"media/embedding input admitted");
++    require(!llama_device_mask_supported(true,false,false,1,true,true,1),"mixed input admitted");
++    std::printf("ADMISSION host_upload=%llu dense_upload=%llu reduction=%.3fx budget_fallbacks=7 semantic_fallbacks=6 PASS\n",
++        (unsigned long long)wide.metadata_bytes, (unsigned long long)wide.dense_bytes,
++        double(wide.dense_bytes)/wide.metadata_bytes);
++}
++
++// Byte-exact output over unsorted positions, holes, shared sequence cells,
++// sign-bit sequence membership, INT32 position boundaries, and changed inputs
++// through repeated executions of the same graph (including CUDA graph replay).
++static size_t mask_case(ggml_backend_t backend, int nk, int nq, int ns, ggml_type type) {
++    ggml_context_ptr ctx(ggml_init({32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false), nullptr, true}));
++    auto * keys = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I32, nk, 2, ns);
++    auto * queries = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I32, nq, 2, ns);
++    auto * out = ggml_attn_mask(ctx.get(), keys, queries, type);
++    require(ggml_backend_supports_op(backend,out), "backend rejects compact attention mask");
++    auto * graph = ggml_new_graph_custom(ctx.get(),32,false);
++    ggml_build_forward_expand(graph,out);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend));
++    require(buffer != nullptr, "cannot allocate tiny attention mask tensors");
++    const size_t element = type == GGML_TYPE_F16 ? 2 : 4;
++    std::vector<int32_t> k(2*nk*ns), q(2*nq*ns);
++    std::vector<unsigned char> expected(ggml_nbytes(out)), actual(expected.size());
++    const uint16_t inf16 = ggml_fp32_to_fp16(-INFINITY);
++    size_t checks = 0;
++    for (int change = 0; change < 6; ++change) {
++        for (int s = 0; s < ns; ++s) {
++            for (int i = 0; i < nk; ++i) {
++                const int at = s*2*nk+i;
++                k[at] = i%17 == 0 ? INT32_MIN : i%19 == 0 ? INT32_MAX : ((i*73+change*17+s*3)%nk)-4;
++                uint32_t bits = i%7 == 0 ? 0 : (uint32_t(1) << ((i+change+s)%32));
++                if (i%11 == 0) { bits |= 0x80000001u; }
++                std::memcpy(&k[at+nk],&bits,4);
++            }
++            for (int i = 0; i < nq; ++i) {
++                const int at = s*2*nq+i;
++                q[at] = i%13 == 0 ? INT32_MIN : i%23 == 0 ? INT32_MAX : (i*59+change*7+s)%nk;
++                const uint32_t bits = uint32_t(1) << ((i+3*change+s)%32);
++                std::memcpy(&q[at+nq],&bits,4);
++                for (int j = 0; j < nk; ++j) {
++                    const bool keep = (uint32_t(k[s*2*nk+nk+j]) & bits) != 0 && k[s*2*nk+j] <= q[at];
++                    const size_t dst = ((size_t(s)*nq+i)*nk+j)*element;
++                    if (type == GGML_TYPE_F16) {
++                        const uint16_t v = keep ? 0 : inf16;
++                        std::memcpy(expected.data()+dst,&v,2);
++                    } else {
++                        const float v = keep ? 0.0f : -INFINITY;
++                        std::memcpy(expected.data()+dst,&v,4);
++                    }
++                }
++            }
++        }
++        ggml_backend_tensor_set(keys,k.data(),0,k.size()*4);
++        ggml_backend_tensor_set(queries,q.data(),0,q.size()*4);
++        require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"attention mask compute failed");
++        ggml_backend_tensor_get(out,actual.data(),0,actual.size());
++        require(expected == actual,"compact visibility differs from exact reference");
++        checks += ggml_nelements(out);
++    }
++    std::printf("MASK nk=%d nq=%d streams=%d type=%s changed_inputs=6 exact_elements=%zu PASS\n",
++        nk,nq,ns,type==GGML_TYPE_F16 ? "F16" : "F32",checks);
++    return checks;
++}
++
++
++// Component benchmark only: exact upstream-style first-row scan + row copies
++// and causal fringe updates, versus integer metadata upload + device expansion.
++// This does not claim an end-to-end model speedup. CUDA graph warmup is included
++// before timings; each measured iteration changes query positions.
++static void benchmark_staging(ggml_backend_t backend, int nk, int nq) {
++    ggml_context_ptr ctx(ggml_init({32*ggml_tensor_overhead()+ggml_graph_overhead_custom(32,false),nullptr,true}));
++    auto * keys=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,nk,2,1);
++    auto * queries=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,nq,2,1);
++    auto * out=ggml_attn_mask(ctx.get(),keys,queries,GGML_TYPE_F16);
++    auto * old=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,nk,nq);
++    auto * graph=ggml_new_graph_custom(ctx.get(),32,false);
++    ggml_build_forward_expand(graph,out);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend));
++    require(buffer!=nullptr,"cannot allocate bounded mask staging benchmark");
++    std::vector<int32_t> k(2*nk),q(2*nq);
++    std::vector<ggml_fp16_t> dense(size_t(nk)*nq),actual(dense.size());
++    const auto drop=ggml_fp32_to_fp16(-INFINITY);
++    auto fill=[&](int change) {
++        for(int j=0;j<nk;++j){k[j]=j;k[nk+j]=j%97 ? 1 : 0;}
++        for(int i=0;i<nq;++i){q[i]=nk-nq+i-(change&1);q[nq+i]=1;}
++    };
++    auto host_mask=[&] {
++        for(int j=0;j<nk;++j){dense[j]=(k[nk+j] && k[j]<=q[0]) ? ggml_fp16_t(0) : drop;}
++        const int fringe=std::max(0,q[0]-32);
++        for(int i=1;i<nq;++i){
++            auto * row=dense.data()+size_t(i)*nk;
++            std::memcpy(row,dense.data(),nk*sizeof(ggml_fp16_t));
++            for(int j=fringe;j<nk;++j){row[j]=(k[nk+j] && k[j]<=q[i]) ? ggml_fp16_t(0) : drop;}
++        }
++    };
++    std::vector<double> dense_times,compact_times;
++    for(int repeat=-8;repeat<24;++repeat){
++        // Alternate ordering to reduce one-sided thermal/background bias.
++        auto run=[&](bool compact){
++            const auto begin=std::chrono::steady_clock::now();
++            fill(repeat);
++            if(compact){
++                ggml_backend_tensor_set(keys,k.data(),0,k.size()*sizeof(int32_t));
++                ggml_backend_tensor_set(queries,q.data(),0,q.size()*sizeof(int32_t));
++                require(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS,"mask staging benchmark compute failed");
++            } else {
++                host_mask();
++                ggml_backend_tensor_set(old,dense.data(),0,dense.size()*sizeof(ggml_fp16_t));
++                ggml_backend_synchronize(backend);
++            }
++            const double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
++            if(repeat>=0){(compact ? compact_times : dense_times).push_back(us);}
++        };
++        run((repeat&1)!=0);run((repeat&1)==0);
++    }
++    fill(23);host_mask();
++    ggml_backend_tensor_get(out,actual.data(),0,actual.size()*sizeof(ggml_fp16_t));
++    require(actual==dense,"staging benchmark mask differs from optimized host reference");
++    std::sort(dense_times.begin(),dense_times.end());std::sort(compact_times.begin(),compact_times.end());
++    const double before=dense_times[dense_times.size()/2],after=compact_times[compact_times.size()/2];
++    std::printf("STAGING_COMPONENT nk=%d nq=%d repeats=24 dense_median_us=%.3f compact_median_us=%.3f speedup=%.3fx dense_upload=%zu compact_upload=%zu device_mask_bytes=%zu\n",
++        nk,nq,before,after,before/after,ggml_nbytes(old),(k.size()+q.size())*sizeof(int32_t),ggml_nbytes(out));
++}
++
++struct mask_observation { size_t ops=0, device_ops=0, input_bytes=0, output_bytes=0; } observed;
++static bool observe_mask(ggml_tensor * t, bool ask, void *) {
++    if (t->op != GGML_OP_ATTN_MASK) { return false; }
++    if (ask) { return true; }
++    ++observed.ops;
++    if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) { ++observed.device_ops; }
++    observed.input_bytes += ggml_nbytes(t->src[0])+ggml_nbytes(t->src[1]);
++    observed.output_bytes += ggml_nbytes(t);
++    return true;
++}
++
++static void make_fixture(const std::string & path) {
++    constexpr int dim = 64, ff = 128, layers = 2, vocab = 259;
++    gguf_context_ptr meta(gguf_init_empty());
++    gguf_set_val_str(meta.get(), "general.architecture", "llama");
++    gguf_set_val_str(meta.get(), "general.name", "retained-prefix-fixture");
++    gguf_set_val_u32(meta.get(), "llama.context_length", 256);
++    gguf_set_val_u32(meta.get(), "llama.embedding_length", dim);
++    gguf_set_val_u32(meta.get(), "llama.block_count", layers);
++    gguf_set_val_u32(meta.get(), "llama.feed_forward_length", ff);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count", 4);
++    gguf_set_val_u32(meta.get(), "llama.attention.head_count_kv", 2);
++    gguf_set_val_u32(meta.get(), "llama.rope.dimension_count", 16);
++    gguf_set_val_f32(meta.get(), "llama.attention.layer_norm_rms_epsilon", 1e-6f);
++    gguf_set_val_str(meta.get(), "tokenizer.ggml.model", "llama");
++    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
++    for (int i = 0; i < 256; ++i) {
++        char name[16]; std::snprintf(name, sizeof(name), "<0x%02X>", i);
++        tokens.emplace_back(name);
++    }
++    std::vector<const char *> strings;
++    for (const auto & token : tokens) { strings.push_back(token.c_str()); }
++    std::vector<float> scores(vocab, 0);
++    std::vector<int32_t> types(vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", strings.data(), strings.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
++    gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.unknown_token_id", 0);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.bos_token_id", 1);
++    gguf_set_val_u32(meta.get(), "tokenizer.ggml.eos_token_id", 2);
++    gguf_set_val_bool(meta.get(), "tokenizer.ggml.add_bos_token", true);
++    ggml_context_ptr tensors(ggml_init({4 * 1024 * 1024, nullptr, false}));
++    require(tensors != nullptr, "cannot allocate tiny fixture tensors");
++    auto tensor = [&](const std::string & name, int x, int y = 1) {
++        auto * t = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, x, y);
++        ggml_set_name(t, name.c_str());
++        uint32_t salt = 2166136261u;
++        for (unsigned char c : name) { salt = (salt ^ c) * 16777619u; }
++        auto * data = static_cast<float *>(t->data);
++        for (int64_t i = 0; i < ggml_nelements(t); ++i) {
++            salt = salt * 1664525u + 1013904223u;
++            data[i] = float(int(salt >> 16) - 32768) * (0.02f / 32768);
++            if (name.find("norm.weight") != std::string::npos) { data[i] += 1.0f; }
++        }
++        gguf_add_tensor(meta.get(), t);
++    };
++    tensor("token_embd.weight", dim, vocab);
++    tensor("output_norm.weight", dim);
++    tensor("output.weight", dim, vocab);
++    for (int i = 0; i < layers; ++i) {
++        const auto p = "blk." + std::to_string(i) + ".";
++        tensor(p + "attn_norm.weight", dim);
++        tensor(p + "attn_q.weight", dim, dim);
++        tensor(p + "attn_k.weight", dim, dim / 2);
++        tensor(p + "attn_v.weight", dim, dim / 2);
++        tensor(p + "attn_output.weight", dim, dim);
++        tensor(p + "ffn_norm.weight", dim);
++        tensor(p + "ffn_gate.weight", dim, ff);
++        tensor(p + "ffn_up.weight", dim, ff);
++        tensor(p + "ffn_down.weight", ff, dim);
++    }
++    require(gguf_write_to_file(meta.get(), path.c_str(), false), "cannot write tiny fixture");
++}
++
++
++using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
++static context_ptr context(llama_model * model, bool cuda, bool fa) {
++    auto p = llama_context_default_params();
++    p.n_ctx=2048; p.n_batch=512; p.n_ubatch=512; p.n_seq_max=2;
++    p.kv_unified=true; p.n_threads=2; p.n_threads_batch=2;
++    p.op_offload=cuda; p.offload_kqv=cuda;
++    p.flash_attn_type=fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    p.cb_eval=observe_mask;
++    context_ptr ctx(llama_init_from_model(model,p),llama_free);
++    require(ctx != nullptr,"cannot initialize tiny mask model context");
++    return ctx;
++}
++static std::vector<float> decode(llama_context * ctx, int count, int pos, int nseq, int salt,
++        bool compact, bool expect_device) {
++    enabled(compact);
++    auto batch=llama_batch_init(count,0,1);
++    batch.n_tokens=count;
++    for (int i=0;i<count;++i) {
++        batch.token[i]=3+(i*13+salt)%256;
++        batch.pos[i]=pos+i/nseq;
++        batch.n_seq_id[i]=1; batch.seq_id[i][0]=i%nseq;
++        batch.logits[i]=1;
++    }
++    observed={};
++    const int rc=llama_decode(ctx,batch);
++    llama_batch_free(batch);
++    require(rc==0,"tiny mask model decode failed");
++    const bool require_op=compact && expect_device;
++    require(require_op ? observed.ops>0 && observed.device_ops==observed.ops : observed.ops==0,
++        "compact-mask execution/fallback assertion failed");
++    if (require_op) {
++        require(observed.input_bytes*4<=observed.output_bytes,"compact mask did not reduce staging by configured bound");
++        std::printf("MODEL_MASK ops=%zu cuda_ops=%zu compact_bytes=%zu dense_bytes=%zu\n",
++            observed.ops,observed.device_ops,observed.input_bytes,observed.output_bytes);
++    }
++    const int vocab=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    const float * logits=llama_get_logits(ctx);
++    require(logits != nullptr,"missing tiny mask logits");
++    return {logits,logits+count*vocab};
++}
++static void equal_logits(const std::vector<float> & a,const std::vector<float> & b,const char * tag) {
++    require(a.size()==b.size(),"mask logits shape changed");
++    float max_scaled=0;
++    for (size_t i=0;i<a.size();++i) {
++        require(std::isfinite(a[i]) && std::isfinite(b[i]),"nonfinite compact-mask logits");
++        max_scaled=std::max(max_scaled,std::abs(a[i]-b[i])/(1+std::abs(a[i])));
++    }
++    std::printf("LOGITS stage=%s elements=%zu max_scaled=%.9g\n",tag,a.size(),max_scaled);
++    require(max_scaled<=1e-5f,"compact-mask logits changed beyond native bound");
++}
++static void integrated(const std::string & dir,bool cuda) {
++    std::filesystem::create_directories(dir);
++    const auto path=(std::filesystem::path(dir)/"device-mask-tiny.gguf").string();
++    make_fixture(path);
++    auto p=llama_model_default_params();
++    ggml_backend_dev_t devices[2]={nullptr,nullptr};
++    if (cuda) { devices[0]=ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU); }
++    p.devices=devices; p.n_gpu_layers=cuda ? 99 : 0;
++    std::unique_ptr<llama_model,decltype(&llama_model_free)> model(llama_model_load_from_file(path.c_str(),p),llama_model_free);
++    require(model != nullptr,"cannot load tiny mask fixture");
++    for (const bool fa : {false,true}) {
++        auto candidate=context(model.get(),cuda,fa), reference=context(model.get(),cuda,fa);
++        auto pair=[&](int count,int pos,int nseq,int salt,bool eligible,const char * stage) {
++            auto a=decode(reference.get(),count,pos,nseq,salt,false,false);
++            auto b=decode(candidate.get(),count,pos,nseq,salt,true,cuda && eligible);
++            equal_logits(a,b,stage);
++        };
++        pair(512,0,1,1,true,"prefill");
++        // Shared KV prefix membership and two interleaved query sequences.
++        for (auto * ctx : {candidate.get(),reference.get()}) {
++            llama_memory_seq_cp(llama_get_memory(ctx),0,1,0,512);
++        }
++        pair(512,512,2,7,true,"shared-two-sequences");
++        // Remove only one sequence's memberships. Physical cells still shared
++        // by the other sequence must remain visible only to that other query.
++        for (auto * ctx : {candidate.get(),reference.get()}) {
++            require(llama_memory_seq_rm(llama_get_memory(ctx),0,12,20),"cannot make sparse membership hole");
++        }
++        pair(512,768,2,11,true,"sparse-memberships");
++        pair(1,1024,1,15,false,"decode-fallback");
++        for (auto * ctx : {candidate.get(),reference.get()}) {
++            llama_memory_clear(llama_get_memory(ctx),true);
++            llama_set_causal_attn(ctx,false);
++        }
++        pair(512,0,1,19,false,"noncausal-fallback");
++    }
++    enabled(false);
++    std::printf("INTEGRATED backend=%s flash_on_off PASS\n",cuda ? "CUDA" : "CPU-fallback");
++}
++int main(int argc,char ** argv) {
++    try {
++        std::setvbuf(stdout,nullptr,_IONBF,0);
++        const bool cuda=argc>1 && std::strcmp(argv[1],"--cuda")==0;
++        const std::string dir=argc>(cuda ? 2 : 1) ? argv[cuda ? 2 : 1] : ".";
++        ggml_backend_load_all();
++        auto * dev=ggml_backend_dev_by_type(cuda ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU);
++        if (!dev) { return cuda ? 77 : 1; }
++        if (cuda) {
++            const auto * name=ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
++            if (std::strcmp(name,"CUDA")!=0) { return 77; }
++        }
++        std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_dev_init(dev,nullptr),ggml_backend_free);
++        require(backend!=nullptr,"cannot initialize mask fixture backend");
++        admission();
++        size_t total=0;
++        for (const auto type : {GGML_TYPE_F16,GGML_TYPE_F32}) {
++            for (const int nk : {1,31,256,4096}) {
++                for (const int nq : {1,32,65}) {
++                    for (const int ns : {1,2}) { total+=mask_case(backend.get(),nk,nq,ns,type); }
++                }
++            }
++        }
++        std::printf("VISIBILITY backend=%s exact_elements=%zu PASS\n",ggml_backend_name(backend.get()),total);
++        if (cuda) {
++            benchmark_staging(backend.get(),256,32);
++            benchmark_staging(backend.get(),4096,32);
++            benchmark_staging(backend.get(),4096,128);
++            benchmark_staging(backend.get(),4096,512);
++        }
++        backend.reset();
++        integrated(dir,cuda);
++        return 0;
++    } catch (const std::exception & e) {
++        std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1;
++    }
++}

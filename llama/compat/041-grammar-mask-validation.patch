@@ -1,0 +1,816 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -452,6 +452,7 @@
+     }
+ 
+     llama_sampler * token_mask = nullptr;
++    static_cast<llama_sampler_chain *>(chain->ctx)->guard_finite_sampling=grmr && params.grammar_first;
+     if (grmr && params.backend_sampling && params.grammar_first) {
+         llama_sampler_ptr mask(llama_sampler_init_token_mask(llama_vocab_n_tokens(vocab)));
+         if (llama_sampler_set_grammar_token_mask(mask.get(),grmr.get())) {
+@@ -671,12 +672,23 @@
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+         llama_sampler_output * deferred_backend = nullptr) {
+     grammar_first=grammar_first || gsmpl->params.grammar_first;
++    auto & chain_state=*static_cast<llama_sampler_chain *>(gsmpl->chain->ctx);
++    struct finite_guard_scope {
++        llama_sampler_chain & chain;bool previous;
++        finite_guard_scope(llama_sampler_chain & c,bool enabled):chain(c),previous(c.guard_finite_sampling) {
++            chain.guard_finite_sampling|=enabled;
++        }
++        ~finite_guard_scope(){chain.guard_finite_sampling=previous;}
++    } guard_scope(chain_state,grammar_first && grammar_should_apply(gsmpl));
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
+     // Borrow after the existing fence/timer boundary: output reordering remains
+     // included in sampler CPU time while GPU waits remain excluded.
+     const auto output = llama_get_sampler_output_ith_synchronized(ctx, idx);
++    if(output.sampled_token==LLAMA_TOKEN_NULL && llama_sampler_backend_masked_ready(gsmpl->chain)) {
++        throw common_sampler_constraint_error("Constrained sampling has no valid finite token; check grammar and logit biases");
++    }
+     auto flush_backend = [&] {
+         if (deferred_backend && deferred_backend->sampled_token != LLAMA_TOKEN_NULL) {
+             gsmpl->set_backend_logits(ctx, *deferred_backend);
+@@ -730,7 +742,7 @@
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+ 
+-    if (grammar_first && grammar_should_apply(gsmpl)) {
++    if (grammar_first && grammar_should_apply(gsmpl) && !gsmpl->token_mask) {
+         llama_sampler_apply(grmr, &cur_p);
+     }
+ 
+@@ -1020,7 +1032,10 @@
+     for (int i = 0; i < llama_sampler_chain_n(gsmpl->chain); i++) {
+         const auto * smpl = llama_sampler_chain_get(gsmpl->chain, i);
+         result += std::string("-> ");
+-        result += std::string(llama_sampler_name(smpl)) + " ";
++        std::string name=llama_sampler_name(smpl);
++        const auto & state=*static_cast<const llama_sampler_chain *>(gsmpl->chain->ctx);
++        if(state.is_init && state.guard_finite_sampling && !state.samplers[i].is_backend && !name.empty() && name.front()=='+') {name.front()='-';}
++        result += name + " ";
+     }
+ 
+     return result;
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama.h"
++#include "llama-cpp.h"
+ 
+ #include "common.h"
+ 
+@@ -33,6 +34,7 @@
+ //
+ 
+ struct common_sampler;
++using common_sampler_constraint_error = llama_sampler_constraint_error;
+ 
+ // llama_sampler API overloads
+ 
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1815,6 +1815,18 @@
+             struct ggml_tensor  * allowed,
+             struct ggml_tensor  * candidates,
+             int32_t               n_vocab);
++    // Validate a selected vocabulary ID against the mask and final sampler
++    // support. Returns the ID, or -1 for rejected/nonfinite/zero-mass output.
++    // candidates/probs are optional final filtered vectors matching logits.
++    GGML_API struct ggml_tensor * ggml_token_mask_validate(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * allowed,
++            struct ggml_tensor  * selected,
++            struct ggml_tensor  * candidates,
++            struct ggml_tensor  * probs,
++            struct ggml_tensor  * pre_filter_logits,
++            int32_t               n_vocab);
+ 
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1738,6 +1738,32 @@
+ /////////////////////////////////
+ 
+ static void ggml_compute_forward_token_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
++    if(ggml_get_op_params_i32(dst,1)==1) {
++        if(params->ith!=0) {return;}
++        const int32_t id=*(const int32_t *)dst->src[2]->data;
++        const int32_t vocab=ggml_get_op_params_i32(dst,0);
++        const uint32_t * words=(const uint32_t *)dst->src[1]->data;
++        const float * logits=(const float *)dst->src[0]->data;
++        const float * probs=dst->src[4] ? (const float *)dst->src[4]->data : NULL;
++        const int32_t * ids=dst->src[3] ? (const int32_t *)dst->src[3]->data : NULL;
++        const int64_t n=ggml_nelements(dst->src[0]);
++        bool valid=false;
++        for(int source=0;source<=5;source+=5) {
++            if(!dst->src[source]) {continue;}
++            const float * scores=(const float *)dst->src[source]->data;
++            for(int64_t i=0;i<ggml_nelements(dst->src[source]);++i) {
++                if(isnan(scores[i]) || scores[i]==INFINITY) {*(int32_t *)dst->data=-1;return;}
++            }
++        }
++        if(id>=0 && id<vocab && (words[id/32]&(UINT32_C(1)<<(id%32)))) {
++            for(int64_t i=ids ? 0 : id;i<n;++i) {
++                if((!ids || ids[i]==id) && isfinite(logits[i]) && (!probs || (isfinite(probs[i]) && probs[i]>0))) {valid=true;break;}
++                if(!ids) {break;}
++            }
++        }
++        *(int32_t *)dst->data=valid ? id : -1;
++        return;
++    }
+     const int64_t n = ggml_nelements(dst);
+     const int64_t chunk = (n + params->nth - 1)/params->nth;
+     const int64_t first = chunk*params->ith, last = MIN(n, first + chunk);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6923,7 +6923,7 @@
+         case GGML_OP_CLAMP:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_TOKEN_MASK:
+-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++            return (op->type == GGML_TYPE_F32 || (op->type==GGML_TYPE_I32 && ggml_get_op_params_i32(op,1)==1)) && op->src[0]->type == GGML_TYPE_F32 &&
+                 op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                 (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2])));
+         case GGML_OP_ADD:
+diff --git a/ggml/src/ggml-cuda/token-mask.cu b/ggml/src/ggml-cuda/token-mask.cu
+--- a/ggml/src/ggml-cuda/token-mask.cu
++++ b/ggml/src/ggml-cuda/token-mask.cu
+@@ -9,7 +9,37 @@
+     output[i] = allowed ? logits[i] : -INFINITY;
+ }
+ 
++static __global__ void token_mask_validate_kernel(const float * logits,const uint32_t * words,
++        const int32_t * selected,const int32_t * ids,const float * probs,const float * pre_filter,
++        int32_t * output,int64_t n,int64_t pre_filter_n,int32_t vocab) {
++    __shared__ int valid,invalid;
++    if(threadIdx.x==0) {valid=0;invalid=0;}
++    __syncthreads();
++    for(int64_t i=threadIdx.x;i<n;i+=blockDim.x) {if(isnan(logits[i]) || logits[i]==INFINITY) {atomicExch(&invalid,1);}}
++    for(int64_t i=threadIdx.x;i<pre_filter_n;i+=blockDim.x) {if(isnan(pre_filter[i]) || pre_filter[i]==INFINITY) {atomicExch(&invalid,1);}}
++    const int32_t id=*selected;
++    if(id>=0 && id<vocab && (words[id/32]&(uint32_t(1)<<(id%32)))) {
++        if(ids) {
++            for(int64_t i=threadIdx.x;i<n;i+=blockDim.x) {
++                if(ids[i]==id && isfinite(logits[i]) && (!probs || (isfinite(probs[i]) && probs[i]>0))) {atomicExch(&valid,1);}
++            }
++        } else if(threadIdx.x==0 && id<n && isfinite(logits[id]) && (!probs || (isfinite(probs[id]) && probs[id]>0))) {valid=1;}
++    }
++    __syncthreads();
++    if(threadIdx.x==0) {*output=valid && !invalid ? id : -1;}
++}
++
+ void ggml_cuda_op_token_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if(ggml_get_op_params_i32(dst,1)==1) {
++        GGML_ASSERT(dst->type==GGML_TYPE_I32);
++        token_mask_validate_kernel<<<1,256,0,ctx.stream()>>>((const float *)dst->src[0]->data,
++            (const uint32_t *)dst->src[1]->data,(const int32_t *)dst->src[2]->data,
++            dst->src[3] ? (const int32_t *)dst->src[3]->data : nullptr,
++            dst->src[4] ? (const float *)dst->src[4]->data : nullptr,
++            dst->src[5] ? (const float *)dst->src[5]->data : nullptr,(int32_t *)dst->data,
++            ggml_nelements(dst->src[0]),dst->src[5] ? ggml_nelements(dst->src[5]) : 0,ggml_get_op_params_i32(dst,0));
++        return;
++    }
+     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+     const int64_t n = ggml_nelements(dst);
+     const int32_t n_vocab = ggml_get_op_params_i32(dst, 0);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -4185,14 +4185,35 @@
+     GGML_ASSERT(n_vocab > 0 && ggml_is_vector(logits) && logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+     GGML_ASSERT(allowed->type == GGML_TYPE_I32 && ggml_is_vector(allowed) && ggml_is_contiguous(allowed));
+     GGML_ASSERT(allowed->ne[0] == ((int64_t) n_vocab + 31)/32);
+-    GGML_ASSERT(!candidates || (candidates->type == GGML_TYPE_I32 && ggml_is_vector(candidates) &&
+-                ggml_is_contiguous(candidates) && candidates->ne[0] == logits->ne[0]));
++    GGML_ASSERT(!candidates || (candidates->type == GGML_TYPE_I32 &&
++                ggml_is_contiguous(candidates) && ggml_nelements(candidates) == ggml_nelements(logits)));
+     struct ggml_tensor * result = ggml_dup_tensor(ctx, logits);
+     result->op = GGML_OP_TOKEN_MASK;
+     result->src[0] = logits;
+     result->src[1] = allowed;
+     result->src[2] = candidates;
+     ggml_set_op_params_i32(result, 0, n_vocab);
++    return result;
++}
++
++struct ggml_tensor * ggml_token_mask_validate(
++        struct ggml_context * ctx, struct ggml_tensor * logits,
++        struct ggml_tensor * allowed, struct ggml_tensor * selected,
++        struct ggml_tensor * candidates, struct ggml_tensor * probs,
++        struct ggml_tensor * pre_filter_logits, int32_t n_vocab) {
++    GGML_ASSERT(n_vocab>0 && logits->type==GGML_TYPE_F32 && ggml_is_vector(logits) && ggml_is_contiguous(logits));
++    GGML_ASSERT(allowed->type==GGML_TYPE_I32 && ggml_is_vector(allowed) && ggml_is_contiguous(allowed));
++    GGML_ASSERT(allowed->ne[0]==((int64_t)n_vocab+31)/32);
++    GGML_ASSERT(selected->type==GGML_TYPE_I32 && ggml_is_scalar(selected));
++    GGML_ASSERT(!candidates || (candidates->type==GGML_TYPE_I32 && ggml_is_contiguous(candidates) && ggml_nelements(candidates)==ggml_nelements(logits)));
++    GGML_ASSERT(!probs || (probs->type==GGML_TYPE_F32 && ggml_is_contiguous(probs) && ggml_nelements(probs)==ggml_nelements(logits)));
++    GGML_ASSERT(!pre_filter_logits || (pre_filter_logits->type==GGML_TYPE_F32 && ggml_is_vector(pre_filter_logits) && ggml_is_contiguous(pre_filter_logits)));
++    struct ggml_tensor * result=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,1);
++    result->op=GGML_OP_TOKEN_MASK;
++    result->src[0]=logits;result->src[1]=allowed;result->src[2]=selected;
++    result->src[3]=candidates;result->src[4]=probs;
++    result->src[5]=pre_filter_logits==logits ? NULL : pre_filter_logits;
++    ggml_set_op_params_i32(result,0,n_vocab);ggml_set_op_params_i32(result,1,1);
+     return result;
+ }
+ 
+diff --git a/include/llama-cpp.h b/include/llama-cpp.h
+--- a/include/llama-cpp.h
++++ b/include/llama-cpp.h
+@@ -5,8 +5,18 @@
+ #endif
+ 
+ #include <memory>
++#include <stdexcept>
++#include <string>
+ 
+ #include "llama.h"
++
++// A request-local constraint failure, distinct from a device/runtime failure.
++class LLAMA_API llama_sampler_constraint_error : public std::runtime_error {
++public:
++    explicit llama_sampler_constraint_error(const char * message);
++    explicit llama_sampler_constraint_error(const std::string & message);
++    ~llama_sampler_constraint_error() noexcept override;
++};
+ 
+ struct llama_model_deleter {
+     void operator()(llama_model * model) { llama_model_free(model); }
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1519,7 +1519,11 @@
+ #else
+     LLAMA_API void                   llama_sampler_accept(      struct llama_sampler * smpl, llama_token token);
+ #endif
++#ifdef __cplusplus
++    LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p) noexcept(false);
++#else
+     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
++#endif
+     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
+     // C++ clone callbacks may throw; retain caller cleanup with MSVC /EHsc.
+ #ifdef __cplusplus
+@@ -1731,7 +1735,11 @@
+     //    llama_sampler_accept(smpl, token);
+     //    return token;
+     // Returns the sampled token
++#ifdef __cplusplus
++    LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) noexcept(false);
++#else
+     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
++#endif
+ 
+     // TODO: extend in the future
+     //LLAMA_API void llama_decode_with_sampler(struct llama_context * ctx, struct llama_sampler * smpl, struct llama_batch batch, ...);
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -23,6 +23,10 @@
+ #include <stdexcept>
+ #include <limits>
+ 
++llama_sampler_constraint_error::llama_sampler_constraint_error(const char * message) : std::runtime_error(message) { }
++llama_sampler_constraint_error::llama_sampler_constraint_error(const std::string & message) : std::runtime_error(message) { }
++llama_sampler_constraint_error::~llama_sampler_constraint_error() noexcept = default;
++
+ // the ring buffer works similarly to std::deque, but with a fixed capacity
+ template<typename T>
+ struct ring_buffer {
+@@ -381,7 +385,7 @@
+     }
+ }
+ 
+-void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) {
++void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) noexcept(false) {
+     if (!smpl) {
+         return;
+     }
+@@ -665,6 +669,15 @@
+ 
+ // sampler chain
+ 
++static bool llama_sampler_has_mask_guard(const llama_sampler * sampler);
++static bool llama_sampler_is_chain(const llama_sampler * sampler);
++static void llama_sampler_disable_backend_prefix(llama_sampler_chain * chain);
++static bool llama_sampler_is_shrinking_filter(const llama_sampler * sampler);
++static bool llama_sampler_mask_guard_before(const llama_sampler * sampler,const llama_token_data_array * cur,bool include_filters);
++static void llama_sampler_mask_guard_result(const llama_token_data_array * cur);
++static void llama_sampler_mask_transactional_backend(llama_sampler_chain * chain);
++static void llama_sampler_mask_validate_backend(llama_sampler_chain * chain,ggml_context * ctx,ggml_cgraph * gf,llama_sampler_data * data,ggml_tensor * pre_filter);
++
+ static const char * llama_sampler_chain_name(const struct llama_sampler * /*smpl*/) {
+     return "chain";
+ }
+@@ -687,6 +700,7 @@
+     time_meas tm(chain->t_sample_us, chain->params.no_perf);
+ 
+     bool is_backend = chain->is_init;
++    bool guard_checked=false;
+ 
+     for (auto & smpl : chain->samplers) {
+         if (is_backend && smpl.is_backend) {
+@@ -699,8 +713,10 @@
+             continue;
+         }
+ 
++        if(chain->guard_finite_sampling) {guard_checked|=llama_sampler_mask_guard_before(smpl.ptr,cur_p,!guard_checked);}
+         llama_sampler_apply(smpl.ptr, cur_p);
+     }
++    if(chain->guard_finite_sampling) {llama_sampler_mask_guard_result(cur_p);}
+ }
+ 
+ static void llama_sampler_chain_reset(struct llama_sampler * smpl) {
+@@ -717,6 +733,7 @@
+     llama_sampler_ptr result(llama_sampler_chain_init(chain_src->params));
+     auto * chain_dst = (llama_sampler_chain *) result->ctx;
+     chain_dst->selected_only = chain_src->selected_only;
++    chain_dst->guard_finite_sampling = chain_src->guard_finite_sampling;
+     chain_dst->samplers.reserve(chain_src->samplers.size());
+     for (const auto & smpl : chain_src->samplers) {
+         llama_sampler_ptr child(llama_sampler_clone(smpl.ptr));
+@@ -771,6 +788,18 @@
+         res = res && cur_prefix;
+     }
+ 
++    for(const auto & child:chain->samplers) {chain->guard_finite_sampling|=llama_sampler_has_mask_guard(child.ptr);}
++    const bool nested=std::any_of(chain->samplers.begin(),chain->samplers.end(),
++        [](const llama_sampler_chain::info & child){return llama_sampler_is_chain(child.ptr);});
++    if(chain->guard_finite_sampling && (!res || nested || !llama_sampler_backend_can_bind_graph(smpl) ||
++            !llama_sampler_backend_support(smpl,buft))) {
++        // A partial/custom prefix could hide invalid original support before a
++        // CPU selector sees it. Keep constrained fallback entirely on CPU.
++        llama_sampler_disable_backend_prefix(chain);
++        LLAMA_LOG_DEBUG("%s: constrained partial/custom/nested chain uses complete CPU fallback\n",__func__);
++        res=false;
++    }
++    if(chain->guard_finite_sampling) {llama_sampler_mask_transactional_backend(chain);}
+     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
+     chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
+     chain->backend_selects_token = probe.selects_token;
+@@ -804,16 +833,21 @@
+     auto * chain = (llama_sampler_chain *) smpl->ctx;
+ 
+     GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
++    ggml_tensor * pre_filter=data->logits;
++    bool filter_seen=false;
+ 
+     for (auto & smpl : chain->samplers) {
+         if (!smpl.is_backend) {
+             break;
+         }
+ 
++        if(!filter_seen && llama_sampler_is_shrinking_filter(smpl.ptr)) {pre_filter=data->logits;filter_seen=true;}
+         if (smpl.ptr->iface->backend_apply) {
+             smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+         }
+-    }
++        if(!filter_seen) {pre_filter=data->logits;}
++    }
++    if(chain->guard_finite_sampling) {llama_sampler_mask_validate_backend(chain,ctx,gf,data,pre_filter);}
+ }
+ 
+ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
+@@ -887,6 +921,7 @@
+             /* .backend_selects_token = */ false,
+             /* .graph_binding_id       = */ next_graph_binding_id.fetch_add(1, std::memory_order_relaxed),
+             /* .graph_binding_revision = */ 0,
++            /* .guard_finite_sampling  = */ false,
+             /* .n_nodes              = */ 0,
+             /* .samplers             = */ {},
+             /* .cur                  = */ {},
+@@ -928,11 +963,14 @@
+     return chain->n_nodes;
+ }
+ 
+-llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
++llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) noexcept(false) {
+     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
+     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+     const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+     const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
++    if(sampled_token==LLAMA_TOKEN_NULL && llama_sampler_backend_masked_ready(smpl)) {
++        throw llama_sampler_constraint_error("Constrained sampling has no valid finite token; check grammar and logit biases");
++    }
+ 
+     // If a backend sampler has already sampled a token, return it.
+     if (sampled_token != LLAMA_TOKEN_NULL) {
+@@ -1006,6 +1044,7 @@
+         /* .ptr        = */ smpl,
+     });
+     ++p->graph_binding_revision;
++    p->guard_finite_sampling|=llama_sampler_has_mask_guard(smpl);
+ }
+ 
+ struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
+@@ -1193,6 +1232,12 @@
+ 
+ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (llama_sampler_dist *) smpl->ctx;
++    if(ctx->backend_transactional) {
++        // This call performs a real CPU draw (rather than consuming a backend
++        // token). Detached previews/clones must not also commit old GPU draws.
++        ctx->rng_backend=ctx->rng;
++        ctx->n_backend_draws_generated=ctx->n_backend_draws_committed=0;
++    }
+ 
+     // edge cases
+     if (cur_p->size == 0) {
+@@ -1679,6 +1724,9 @@
+     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+ 
+     auto ggml_sort = [ctx](struct ggml_tensor * a, struct ggml_tensor * b) {
++        // Previous gathers can represent candidate IDs as a contiguous[1,k]
++        // column. Sorting consumes their flattened order, not their row shape.
++        if(ggml_nrows(a)!=1) {a=ggml_reshape_1d(ctx,a,ggml_nelements(a));}
+         GGML_ASSERT(ggml_nrows(a) == 1);
+         struct ggml_tensor * a_reshaped = ggml_reshape_2d(ctx, a, 1, a->ne[0]);
+         struct ggml_tensor * a_sorted   = ggml_get_rows(ctx, a_reshaped, b);
+@@ -4477,6 +4525,7 @@
+ }
+ static void llama_sampler_token_mask_backend_apply(llama_sampler * sampler, ggml_context * ctx,
+         ggml_cgraph * gf, llama_sampler_data * data) {
++    GGML_UNUSED(gf); // the caller selects active output rows before expanding
+     auto & sctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
+     GGML_ASSERT(data->logits && !data->sampled && "token masks must precede selection");
+     sctx.inp_words=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,sctx.words.size());
+@@ -4484,7 +4533,6 @@
+     ggml_set_name(sctx.inp_words,"token_mask_words");
+     data->logits=ggml_token_mask(ctx,data->logits,sctx.inp_words,data->candidates,sctx.n_vocab);
+     data->probs=nullptr; // following selectors must renormalize the survivors
+-    ggml_build_forward_expand(gf,data->logits);
+ }
+ static void llama_sampler_token_mask_backend_set_input(llama_sampler * sampler) {
+     auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
+@@ -4588,6 +4636,80 @@
+     if (!llama_sampler_grammar_token_mask(grammar,ctx.next_words.data(),ctx.next_words.size())) { return false; }
+     if (ctx.words!=ctx.next_words) { ctx.words.swap(ctx.next_words); ++ctx.version; }
+     return true;
++}
++
++static bool llama_sampler_has_mask_guard(const llama_sampler * sampler) {
++    return sampler && (sampler->iface==&llama_sampler_token_mask_i ||
++        (sampler->iface==&llama_sampler_chain_i && static_cast<const llama_sampler_chain *>(sampler->ctx)->guard_finite_sampling));
++}
++static bool llama_sampler_is_chain(const llama_sampler * sampler) {return sampler->iface==&llama_sampler_chain_i;}
++static void llama_sampler_disable_backend_prefix(llama_sampler_chain * chain) {
++    for(auto & child:chain->samplers) {
++        child.is_backend=false;
++        if(child.ptr->iface==&llama_sampler_chain_i) {
++            llama_sampler_disable_backend_prefix(static_cast<llama_sampler_chain *>(child.ptr->ctx));
++        } else if(child.ptr->iface==&llama_sampler_token_mask_i) {
++            auto & mask=*static_cast<llama_sampler_token_mask *>(child.ptr->ctx);
++            mask.pinned.reset();mask.pinned_version=0;
++        }
++    }
++}
++static bool llama_sampler_is_shrinking_filter(const llama_sampler * sampler) {
++    const auto * iface=sampler->iface;
++    return iface==&llama_sampler_top_k_i || iface==&llama_sampler_top_p_i || iface==&llama_sampler_min_p_i ||
++        iface==&llama_sampler_typical_i || iface==&llama_sampler_xtc_i || iface==&llama_sampler_top_n_sigma_i || iface==&llama_sampler_infill_i;
++}
++static bool llama_sampler_mask_guard_before(const llama_sampler * sampler,const llama_token_data_array * cur,bool include_filters) {
++    const auto * iface=sampler->iface;
++    const bool terminal=iface==&llama_sampler_dist_i || iface==&llama_sampler_greedy_i ||
++        iface==&llama_sampler_mirostat_i || iface==&llama_sampler_mirostat_v2_i || iface==&llama_sampler_adaptive_p_i;
++    const bool filter=llama_sampler_is_shrinking_filter(sampler);
++    if(!terminal && !(include_filters && filter)) {return false;}
++    bool finite=false;
++    for(size_t i=0;i<cur->size;++i) {
++        const float score=cur->data[i].logit;
++        if(std::isnan(score) || score==INFINITY) {throw llama_sampler_constraint_error("Constrained sampling received nonfinite logits");}
++        finite|=std::isfinite(score);
++    }
++    if(!finite) {throw llama_sampler_constraint_error("Constrained sampling has no valid finite token; check grammar and logit biases");}
++    return true;
++}
++static void llama_sampler_mask_guard_result(const llama_token_data_array * cur) {
++    if(cur->selected<0) {return;}
++    if(size_t(cur->selected)>=cur->size || !std::isfinite(cur->data[cur->selected].logit) ||
++        !std::isfinite(cur->data[cur->selected].p)) {
++        throw llama_sampler_constraint_error("Constrained sampling produced an invalid token");
++    }
++}
++static void llama_sampler_mask_transactional_backend(llama_sampler_chain * chain) {
++    for(const auto & child:chain->samplers) {
++        if(!child.is_backend) {break;}
++        if(child.ptr->iface==&llama_sampler_dist_i) {
++            auto & ctx=*static_cast<llama_sampler_dist *>(child.ptr->ctx);
++            ctx.backend_transactional=true;ctx.rng_backend=ctx.rng;
++            ctx.n_backend_draws_generated=ctx.n_backend_draws_committed=0;
++        } else if(child.ptr->iface==&llama_sampler_chain_i) {
++            llama_sampler_mask_transactional_backend(static_cast<llama_sampler_chain *>(child.ptr->ctx));
++        }
++    }
++}
++static void llama_sampler_mask_validate_backend(llama_sampler_chain * chain,ggml_context * ctx,ggml_cgraph * gf,llama_sampler_data * data,ggml_tensor * pre_filter) {
++    GGML_UNUSED(gf); // inactive/padding chains must remain absent from compute
++    if(!data->sampled) {return;}
++    for(const auto & child:chain->samplers) {
++        if(!child.is_backend) {break;}
++        if(child.ptr->iface==&llama_sampler_token_mask_i) {
++            const auto & mask=*static_cast<llama_sampler_token_mask *>(child.ptr->ctx);
++            data->sampled=ggml_token_mask_validate(ctx,data->logits,mask.inp_words,data->sampled,
++                data->candidates,data->probs,pre_filter,mask.n_vocab);
++        }
++    }
++}
++bool llama_sampler_backend_masked_ready(const llama_sampler * sampler) {
++    if(!sampler || sampler->iface!=&llama_sampler_chain_i) {return false;}
++    const auto & chain=*static_cast<const llama_sampler_chain *>(sampler->ctx);
++    return chain.guard_finite_sampling && chain.is_init && chain.backend_selects_token && !chain.samplers.empty() &&
++        std::all_of(chain.samplers.begin(),chain.samplers.end(),[](const llama_sampler_chain::info & child){return child.is_backend;});
+ }
+ 
+ // Graph binding snapshots deliberately contain no RNG, penalty history, token
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -24,6 +24,7 @@
+     // Lifetime/topology identity for graph bindings, never copied as RNG state.
+     uint64_t graph_binding_id = 0;
+     uint64_t graph_binding_revision = 0;
++    bool guard_finite_sampling = false;
+ 
+     uint32_t n_nodes = 0;
+ 
+@@ -82,6 +83,7 @@
+     size_t entries = 0, bytes = 0;
+ };
+ LLAMA_API llama_grammar_mask_cache_stats llama_sampler_grammar_mask_cache_stats(const llama_sampler * grammar);
++LLAMA_API bool llama_sampler_backend_masked_ready(const llama_sampler * sampler);
+ 
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -1044,9 +1044,17 @@
+     auto * candidates=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,ids.size());
+     auto * full=ggml_token_mask(context.get(),logits,words,nullptr,n_vocab);
+     auto * partial=ggml_token_mask(context.get(),filtered,words,candidates,n_vocab);
++    auto * selected=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,1);
++    auto * probabilities=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,n_vocab);
++    auto * valid_full=ggml_token_mask_validate(context.get(),logits,words,selected,nullptr,probabilities,nullptr,n_vocab);
++    auto * valid_partial=ggml_token_mask_validate(context.get(),filtered,words,selected,candidates,nullptr,nullptr,n_vocab);
++    auto * valid_pre_filter=ggml_token_mask_validate(context.get(),filtered,words,selected,candidates,nullptr,logits,n_vocab);
+     auto * graph=ggml_new_graph(context.get());
+     ggml_build_forward_expand(graph,full); ggml_build_forward_expand(graph,partial);
++    ggml_build_forward_expand(graph,valid_full);ggml_build_forward_expand(graph,valid_partial);
++    ggml_build_forward_expand(graph,valid_pre_filter);
+     require(ggml_backend_dev_supports_op(device,full),"mask kernel is not actually supported by selected backend");
++    require(ggml_backend_dev_supports_op(device,valid_full),"mask validation kernel is not actually supported by selected backend");
+     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(context.get(),backend.get()));
+     require(bool(buffer),"mask operator buffer unavailable");
+     std::vector<float> input(n_vocab),small(ids.size()),out(n_vocab),sub(ids.size());
+@@ -1055,13 +1063,18 @@
+     std::memcpy(&input[31],&negative_zero,4);std::memcpy(&input[63],&nan_bits,4);
+     for(size_t i=0;i<ids.size();++i) { small[i]=input[i]; }
+     std::vector<uint32_t> mask((n_vocab+31)/32);
+-    for(int variant=0;variant<6;++variant) {
++    std::vector<float> probabilities_host(n_vocab,1.f);probabilities_host[258]=0.f;probabilities_host[0]=NAN;
++    const int32_t selected_ids[]={31,63,1000,-1,258,0,32};
++    for(int variant=0;variant<7;++variant) {
++        if(variant==2) {input[63]=1.f;}
+         std::fill(mask.begin(),mask.end(),0);
+         for(int id=0;id<n_vocab;++id) { if((id+variant)%3) { mask[id/32]|=UINT32_C(1)<<(id%32); } }
+         ggml_backend_tensor_set(logits,input.data(),0,input.size()*4);
+         ggml_backend_tensor_set(filtered,small.data(),0,small.size()*4);
+         ggml_backend_tensor_set(candidates,ids.data(),0,ids.size()*4);
+         ggml_backend_tensor_set(words,mask.data(),0,mask.size()*4);
++        ggml_backend_tensor_set(selected,&selected_ids[variant],0,4);
++        ggml_backend_tensor_set(probabilities,probabilities_host.data(),0,probabilities_host.size()*4);
+         require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"mask operator compute failed");
+         ggml_backend_tensor_get(full,out.data(),0,out.size()*4);ggml_backend_tensor_get(partial,sub.data(),0,sub.size()*4);
+         for(int i=0;i<n_vocab;++i) {
+@@ -1073,6 +1086,17 @@
+             const float expected=id>=0 && id<n_vocab && (mask[id/32]&(UINT32_C(1)<<(id%32))) ? small[i] : -INFINITY;
+             require(std::memcmp(&expected,&sub[i],4)==0,"candidate-ID mask changed bits or indexed outside vocabulary");
+         }
++        const int32_t id=selected_ids[variant];
++        const bool allowed=id>=0 && id<n_vocab && (mask[id/32]&(UINT32_C(1)<<(id%32)));
++        int32_t result_full,result_partial,result_pre_filter;
++        ggml_backend_tensor_get(valid_full,&result_full,0,4);ggml_backend_tensor_get(valid_partial,&result_partial,0,4);
++        ggml_backend_tensor_get(valid_pre_filter,&result_pre_filter,0,4);
++        const int32_t expected_full=variant>=2 && allowed && std::isfinite(input[id]) &&
++            std::isfinite(probabilities_host[id]) && probabilities_host[id]>0 ? id : -1;
++        bool supported=false;
++        for(size_t i=0;i<ids.size();++i) {if(ids[i]==id && std::isfinite(small[i])) {supported=true;}}
++        require(result_full==expected_full && result_partial==(allowed && supported ? id : -1),"mask validation accepted invalid/nonfinite/zero-mass token");
++        require(result_pre_filter==(variant>=2 && allowed && supported ? id : -1),"pre-filter invalid scores were hidden by candidate filtering");
+     }
+     std::puts("PASS token mask: actual kernel, odd vocabulary, high bits, reordered/invalid IDs, NaN and signed-zero bits");
+ }
+@@ -1181,6 +1205,154 @@
+     std::printf("PASS grammar-first %s: same CPU/backend tokens, distributions/RNG/checkpoints, %zu arenas, output_limit%d\n",compact?"compact":"detailed",arenas,output_limit);
+ }
+ 
++static void grammar_constraint_errors(llama_model * model) {
++    for(bool backend:{false,true}) for(bool compact:{false,true}) for(bool greedy:{false,true}) {
++        for(int failure=0;failure<8;++failure) {
++            common_params_sampling sampling;sampling.seed=1234;sampling.temp=greedy ? 0.f : .7f;
++            sampling.top_k=20;sampling.penalty_repeat=1.f;
++            sampling.backend_sampling=backend;sampling.grammar_first=true;
++            sampling.grammar=common_grammar(COMMON_GRAMMAR_TYPE_USER,failure==0 ? "root ::= \"A\"\n" : "root ::= [A-Z]+\n");
++            if(failure==0) {sampling.logit_bias={{2,-INFINITY}};}
++            else if(failure<4) {for(int id=0;id<n_vocab;++id) {sampling.logit_bias.push_back({id,failure==1 ? NAN : failure==2 ? -INFINITY : INFINITY});}}
++            else {const bool reverse=failure%2;sampling.logit_bias={{3+(reverse?'Z':'A'),failure<6 ? NAN : INFINITY},{3+(reverse?'A':'Z'),100.f}};}
++            common_sampler_ptr sampler(common_sampler_init(model,sampling));
++            if(failure==0) {common_sampler_accept(sampler.get(),3+'A',true);}
++            auto params=llama_context_default_params();params.n_ctx=64;params.n_batch=params.n_ubatch=8;
++            params.n_outputs_max_per_seq=1;params.n_threads=params.n_threads_batch=1;
++            llama_context_ptr context(llama_init_from_model(model,params));require(bool(context),"constraint failure context unavailable");
++            if(backend) {auto * chain=compact ? common_sampler_get_backend_selected_only(sampler.get()) : common_sampler_get_backend(sampler.get());
++                require(chain && llama_set_sampler(context.get(),0,chain),"constraint failure backend attach failed");}
++            common_batch batch(context.get());batch.add(3+'x',0,0,true);
++            require(llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get())==0,"constraint failure graph decode failed");
++            bool rejected=false;
++            try {common_sampler_sample(sampler.get(),context.get(),-1,true);}
++            catch(const common_sampler_constraint_error &) {rejected=true;}
++            require(rejected,"constrained sampling emitted a token from empty/nonfinite support");
++        }
++    }
++    // An empty owned mask is also a raw sampler API contract. Reject it before
++    // CPU dist asserts and report NULL on the backend, with no committed draw.
++    for(bool backend:{false,true}) {
++        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_ptr mask(llama_sampler_init_token_mask(n_vocab));auto * owned=mask.get();
++        std::vector<uint32_t> words((n_vocab+31)/32,0);require(llama_sampler_set_token_mask(owned,words.data(),words.size()),"empty mask setup failed");
++        llama_sampler_chain_add(chain.get(),mask.release());llama_sampler_chain_add(chain.get(),llama_sampler_init_dist(1234));
++        llama_sampler_ptr checkpoint(llama_sampler_clone(chain.get()));
++        if(backend) {
++            auto params=llama_context_default_params();params.n_ctx=64;params.n_batch=params.n_ubatch=8;params.n_outputs_max_per_seq=1;
++            params.n_threads=params.n_threads_batch=1;
++            llama_context_ptr context(llama_init_from_model(model,params));
++            require(context && llama_sampler_backend_set_selected_only(chain.get()) && llama_set_sampler(context.get(),0,chain.get()),"raw empty mask attach failed");
++            common_batch batch(context.get());batch.add(3+'x',0,0,true);
++            require(llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get())==0,"raw empty mask decode failed");
++            require(llama_get_sampled_token_ith(context.get(),-1)==LLAMA_TOKEN_NULL,"empty compact mask selected an invalid token");
++            bool rejected=false,cleaned=false;
++            try {struct cleanup{bool & flag;~cleanup(){flag=true;}} cleanup{cleaned};llama_sampler_sample(chain.get(),context.get(),-1);}
++            catch(const llama_sampler_constraint_error &) {rejected=true;}
++            require(rejected && cleaned,"raw backend error skipped cross-DLL /EHsc cleanup");
++            llama_sampler_ptr after_failure(llama_sampler_clone(chain.get()));
++            std::fill(words.begin(),words.end(),0);for(int c:{'A','Z'}) {words[(3+c)/32]|=UINT32_C(1)<<((3+c)%32);}
++            for(auto * clone:{checkpoint.get(),after_failure.get()}) {
++                require(llama_sampler_set_token_mask(llama_sampler_chain_get(clone,0),words.data(),words.size()),"rollback clone mask update failed");
++            }
++            for(int draw=0;draw<32;++draw) {
++                std::vector<llama_token_data> before={{3+'A',0.f,0.f},{3+'Z',0.f,0.f}},after=before;
++                llama_token_data_array a{before.data(),before.size(),-1,false},b{after.data(),after.size(),-1,false};
++                llama_sampler_apply(checkpoint.get(),&a);llama_sampler_apply(after_failure.get(),&b);
++                const auto x=a.data[a.selected].id,y=b.data[b.selected].id;
++                require(x==y,"invalid backend round or detached CPU clone committed an unaccepted RNG draw");
++                llama_sampler_accept(checkpoint.get(),x);llama_sampler_accept(after_failure.get(),y);
++            }
++            require(llama_set_sampler(context.get(),0,nullptr),"raw error detach failed");
++        } else {
++            std::vector<llama_token_data> values(n_vocab);for(int id=0;id<n_vocab;++id) {values[id]={id,0.f,0.f};}
++            llama_token_data_array array{values.data(),values.size(),-1,false};
++            bool rejected=false,cleaned=false;
++            try {struct cleanup{bool & flag;~cleanup(){flag=true;}} cleanup{cleaned};llama_sampler_apply(chain.get(),&array);}
++            catch(const llama_sampler_constraint_error &) {rejected=true;}
++            require(rejected && cleaned,"raw CPU error skipped cross-DLL /EHsc cleanup");
++        }
++    }
++    // The existing per-call API also chooses grammar-first without setting the
++    // process/request default. Its guard must be scoped and exception-safe.
++    auto params=common_params_sampling{};params.grammar_first=false;params.temp=.7f;
++    params.grammar=common_grammar(COMMON_GRAMMAR_TYPE_USER,"root ::= \"\"\n");params.logit_bias={{2,-INFINITY}};
++    common_sampler_ptr per_call(common_sampler_init(model,params));
++    auto context=fixture_context(model);common_batch batch(context.get());batch.add(3+'x',0,0,true);
++    require(llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get())==0,"per-call constraint fixture decode failed");
++    bool rejected=false;try{common_sampler_sample(per_call.get(),context.get(),-1,true);}catch(const common_sampler_constraint_error&){rejected=true;}
++    require(rejected && !static_cast<llama_sampler_chain *>(common_sampler_get(per_call.get())->ctx)->guard_finite_sampling,
++        "per-call grammar-first failed to guard/restore empty support");
++    std::puts("PASS constraints:64 CPU/backend compact/detailed greedy/stochastic EOG-blocked/all-nonfinite/mixed-nonwinning failures, raw empty masks and scoped per-call first are request errors");
++}
++
++static void raw_candidate_constraint_contract() {
++    auto * device=fixture_gpu_device ? fixture_gpu_device : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));require(bool(backend),"raw constraint backend missing");
++    const auto buft=ggml_backend_get_default_buffer_type(backend.get());
++    for(bool partial:{false,true}) {
++        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_ptr mask(llama_sampler_init_token_mask(n_vocab));std::vector<uint32_t> allowed((n_vocab+31)/32,0);
++        for(int c:{'A','Z'}) {allowed[(3+c)/32]|=UINT32_C(1)<<((3+c)%32);}
++        require(llama_sampler_set_token_mask(mask.get(),allowed.data(),allowed.size()),"raw allowed mask setup failed");
++        llama_sampler_chain_add(chain.get(),mask.release());llama_sampler_chain_add(chain.get(),llama_sampler_init_top_k(partial?1:2));
++        if(!partial) {llama_sampler_chain_add(chain.get(),llama_sampler_init_top_p(.9f,1));}
++        llama_sampler_chain_add(chain.get(),partial ? llama_sampler_init_mirostat(n_vocab,1234,5.f,.1f,100) : llama_sampler_init_greedy());
++        auto reference=llama_sampler_ptr(llama_sampler_clone(chain.get()));
++        const bool supported=chain->iface->backend_init(chain.get(),buft,1);
++        require(supported==!partial,"partial constrained chain did not choose complete CPU fallback");
++        if(partial) {for(const auto & child:static_cast<llama_sampler_chain *>(chain->ctx)->samplers) {require(!child.is_backend,"partial constrained prefix remained active");}}
++        ggml_context_ptr context(ggml_init({1024*1024,nullptr,true}));
++        auto * scores=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,4);
++        auto * ids=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,4);
++        auto * graph=ggml_new_graph(context.get());
++        llama_sampler_data data{scores,nullptr,nullptr,ids};
++        chain->iface->backend_reset(chain.get());chain->iface->backend_apply(chain.get(),context.get(),graph,&data);
++        require(ggml_graph_n_nodes(graph)==0,"sampler eagerly expanded a discarded/inactive output branch");
++        if(data.sampled) {ggml_build_forward_expand(graph,data.sampled);}
++        ggml_backend_buffer_ptr buffer;
++        if(!partial) {buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(),backend.get()));require(bool(buffer),"raw constraint buffer missing");}
++        for(bool reverse:{false,true}) for(bool invalid_allowed:{false,true}) {
++            std::vector<llama_token> candidates=reverse ? std::vector<llama_token>{3+'A',3+'B',3+'x',3+'Z'} :
++                std::vector<llama_token>{3+'Z',3+'x',3+'B',3+'A'};
++            std::vector<float> logits;std::vector<llama_token_data> values;
++            for(auto id:candidates) {
++                const float score=id==3+'Z' ? 5.f : id==3+'x' || (invalid_allowed && id==3+'A') ? NAN : 1.f;
++                logits.push_back(score);values.push_back({id,score,0.f});
++            }
++            auto control=values;llama_token_data_array expected{control.data(),control.size(),-1,false};
++            bool rejected=false;try {llama_sampler_apply(reference.get(),&expected);}catch(const llama_sampler_constraint_error&){rejected=true;}
++            require(rejected==invalid_allowed,"CPU pre-filter mask mishandled forbidden versus allowed NaN");
++            if(partial) {
++                llama_token_data_array actual{values.data(),values.size(),-1,false};bool failed=false;
++                try {llama_sampler_apply(chain.get(),&actual);}catch(const llama_sampler_constraint_error&){failed=true;}
++                require(failed==rejected,"partial fallback hid an invalid original candidate");
++            } else {
++                ggml_backend_tensor_set(scores,logits.data(),0,logits.size()*4);ggml_backend_tensor_set(ids,candidates.data(),0,candidates.size()*4);
++                chain->iface->backend_set_input(chain.get());
++                require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"raw mask graph failed");
++                llama_token selected;ggml_backend_tensor_get(data.sampled,&selected,0,4);
++                require(selected==(invalid_allowed ? LLAMA_TOKEN_NULL : 3+'Z'),"reordered raw candidate validation lost pre-filter/mask semantics");
++            }
++        }
++    }
++    for(bool valid:{false,true}) {
++        llama_sampler_ptr outer(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_ptr inner(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++        llama_sampler_ptr mask(llama_sampler_init_token_mask(n_vocab));std::vector<uint32_t> words((n_vocab+31)/32,0);
++        if(valid) {words[(3+'A')/32]|=UINT32_C(1)<<((3+'A')%32);}
++        require(llama_sampler_set_token_mask(mask.get(),words.data(),words.size()),"nested mask setup failed");
++        llama_sampler_chain_add(inner.get(),mask.release());llama_sampler_chain_add(outer.get(),inner.release());
++        llama_sampler_chain_add(outer.get(),llama_sampler_init_greedy());
++        require(!outer->iface->backend_init(outer.get(),buft,1),"nested constrained chain was unsafely offloaded");
++        std::vector<llama_token_data> values={{3+'Z',10.f,0.f},{3+'A',5.f,0.f}};
++        llama_token_data_array current{values.data(),values.size(),-1,false};bool rejected=false;
++        try {llama_sampler_apply(outer.get(),&current);}catch(const llama_sampler_constraint_error&){rejected=true;}
++        require(rejected==!valid && (!valid || current.data[current.selected].id==3+'A'),"recursive CPU fallback skipped inner token mask");
++    }
++    std::puts("PASS raw constrained contracts: prepopulated reordered IDs, forbidden/allowed nonwinning NaN, complete partial fallback and nested mask safety");
++}
++
+ struct grammar_bench_result { std::vector<llama_token> tokens; double milliseconds; };
+ static grammar_bench_result grammar_first_trial(llama_model * model,bool backend) {
+     common_params_sampling sampling;
+@@ -1252,6 +1424,8 @@
+         grammar_first_backend(model.get(),false);
+         grammar_first_backend(model.get(),true);
+         grammar_first_backend(model.get(),false,3);
++        grammar_constraint_errors(model.get());
++        raw_candidate_constraint_contract();
+         graph_owned_sampler_variants(model.get(),false,false);
+         graph_owned_sampler_variants(model.get(),false,true);
+         graph_owned_sampler_variants(model.get(),true,false);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4891,7 +4891,13 @@
+             llama_token id;
+             {
+                 scoped_timer timer(t_sampl, n_sampl);
+-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                try {
++                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                } catch(const common_sampler_constraint_error & error) {
++                    send_error(slot,error.what(),ERROR_TYPE_INVALID_REQUEST);
++                    slot.release();slot.prompt_clear();slot.i_batch=-1;
++                    return;
++                }
+             }
+ 
+             slot.i_batch = -1;
+@@ -4970,6 +4976,7 @@
+                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+ 
+                 std::vector<llama_token> accepted;
++                try {
+                 if (!synth_probs.empty()) {
+                     // synthetic acceptance replaces verification entirely, so it comes first
+                     accepted = server_sample_and_accept_synth(
+@@ -4981,6 +4988,11 @@
+                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                 } else {
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
++                }
++                } catch(const common_sampler_constraint_error & error) {
++                    send_error(slot,error.what(),ERROR_TYPE_INVALID_REQUEST);
++                    slot.release();slot.prompt_clear();slot.i_batch=-1;
++                    return;
+                 }
+ 
+                 GGML_ASSERT(accepted.size() >= 1 && accepted.size() <= n_draft + 1);

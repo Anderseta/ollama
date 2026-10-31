@@ -136,6 +136,40 @@ validation_target(test-graph-variants llama)
 target_include_directories(test-graph-variants PRIVATE "${WILDLLAMA_NATIVE}/src")
 add_test(NAME graph-variants-policy COMMAND test-graph-variants)
 
+# Optional device masks and cold snapshots retain exact fallback paths.
+validation_target(test-device-attn-mask llama)
+target_include_directories(test-device-attn-mask PRIVATE "${WILDLLAMA_NATIVE}/src")
+add_dependencies(test-device-attn-mask ggml-cpu)
+add_test(NAME device-attn-mask
+    COMMAND test-device-attn-mask "${CMAKE_BINARY_DIR}/device-mask-fixtures")
+if(TARGET ggml-cuda)
+    add_dependencies(test-device-attn-mask ggml-cuda)
+    add_test(NAME device-attn-mask-cuda
+        COMMAND test-device-attn-mask --cuda "${CMAKE_BINARY_DIR}/device-mask-cuda-fixtures")
+    set_tests_properties(device-attn-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
+add_executable(test-state-pager "${WILDLLAMA_NATIVE}/tests/test-state-pager.cpp")
+target_compile_features(test-state-pager PRIVATE cxx_std_17)
+add_test(NAME state-pager COMMAND test-state-pager "${CMAKE_BINARY_DIR}/state-pager-fixtures")
+validation_target(test-file-state-failure llama)
+target_include_directories(test-file-state-failure PRIVATE "${WILDLLAMA_NATIVE}/src")
+add_dependencies(test-file-state-failure ggml-cpu)
+add_test(NAME file-state-failure COMMAND test-file-state-failure
+    "${CMAKE_BINARY_DIR}/retained-prefix-fixtures/retained-prefix.gguf"
+    "${CMAKE_BINARY_DIR}/file-state-fixtures")
+set_tests_properties(retained-prefix PROPERTIES FIXTURES_SETUP tiny-prefix-model)
+set_tests_properties(file-state-failure PROPERTIES FIXTURES_REQUIRED tiny-prefix-model)
+validation_target(test-hybrid-prefix server-context)
+target_include_directories(test-hybrid-prefix PRIVATE
+    "${WILDLLAMA_NATIVE}/src" "${WILDLLAMA_NATIVE}/tools/server")
+add_dependencies(test-hybrid-prefix ggml-cpu)
+add_test(NAME hybrid-prefix COMMAND test-hybrid-prefix)
+if(TARGET ggml-cuda)
+    add_dependencies(test-hybrid-prefix ggml-cuda)
+    add_test(NAME hybrid-prefix-cuda COMMAND test-hybrid-prefix --cuda)
+    set_tests_properties(hybrid-prefix-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()
+
 # Offline dense calibration is explicit; its policy tests never initialize CUDA.
 add_executable(test-cuda-tuning-policy "${CMAKE_CURRENT_LIST_DIR}/tests/test-cuda-tuning-policy.cpp")
 target_compile_features(test-cuda-tuning-policy PRIVATE cxx_std_17)

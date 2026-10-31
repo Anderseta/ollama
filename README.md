@@ -31,7 +31,7 @@ The goal is to spend less time moving the same weights, repeating host work, or 
 
 These changes target unnecessary work and transfers. They do not prune routed experts, requantize weights, or automatically shrink the requested context to make a model fit. Eligible optimized paths retain the original calculation or fall back when their supported layout or kernel conditions are not met. Numerical regression tests accompany the native changes.
 
-Coordinated MoE execution, GPU-exclusive execution, physical KV growth, and the experimental CUDA dense kernels are **opt-in**. Ordinary runners retain their existing default behavior. See [runtime efficiency](docs/runtime-efficiency.md), [SGLang-inspired execution](docs/sglang-inspired-runtime.md), [resident execution and bounded reuse](docs/resident-execution.md), [dense-model improvements](docs/dense-runtime.md), and [GPU-first MoE inference](docs/gpu-first-moe-inference.md) for implementation details and activation rules.
+Coordinated MoE execution, GPU-exclusive execution, physical KV growth, and the experimental CUDA dense kernels are **opt-in**. Ordinary runners retain their existing default behavior. See [runtime efficiency](docs/runtime-efficiency.md), [SGLang-inspired execution](docs/sglang-inspired-runtime.md), [resident execution and bounded reuse](docs/resident-execution.md), [constrained sampling and cache tiers](docs/execution-pipeline.md), [dense-model improvements](docs/dense-runtime.md), and [GPU-first MoE inference](docs/gpu-first-moe-inference.md) for implementation details and activation rules.
 
 ## Large MoE models on smaller machines
 

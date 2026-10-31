@@ -1,0 +1,634 @@
+diff --git a/src/llama-hybrid-prefix-transaction.h b/src/llama-hybrid-prefix-transaction.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-hybrid-prefix-transaction.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdlib>
++#include <cerrno>
++
++inline size_t llama_prefix_recurrent_limit(const char * value) {
++    constexpr size_t mib=1024*1024, fallback=32*mib;
++    if (!value || !*value) { return fallback; }
++    char * end=nullptr;errno=0;
++    const auto parsed=std::strtoull(value,&end,10);
++    return errno || end==value || !end || *end || parsed>1024 ? fallback : size_t(parsed)*mib;
++}
++
++inline bool llama_prefix_recurrent_admit(size_t retained,size_t requested,size_t limit) {
++    return retained<=limit && requested<=limit-retained;
++}
++
++// Clear both destination memories on either-half failure. The saved handle is
++// immutable and remains usable; callers must recompute after a false result.
++// Clear callbacks must be allocation-free and must clear the full sequence.
++template<typename Attention, typename Recurrent, typename Clear>
++bool llama_hybrid_prefix_transaction(Attention attention, Recurrent recurrent, Clear clear) {
++    try {
++        if (attention() && recurrent()) { return true; }
++    } catch (...) {}
++    clear();
++    return false;
++}
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-context.h"
+ #include "llama-kv-growth.h"
+ #include "llama-ext.h"
++#include "llama-prefix-text.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -15,6 +16,7 @@
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
++#include <typeinfo>
+ #include <unordered_map>
+ 
+ static bool ggml_is_power_of_2(int n) {
+@@ -152,17 +154,23 @@
+ }
+ 
+ std::shared_ptr<llama_memory_prefix> llama_kv_cache::retain_prefix(llama_seq_id sequence, uint32_t max_tokens) {
++    // DSA/MSA/other derived caches own extra state not represented by aliases.
++    if (typeid(*this)!=typeid(llama_kv_cache)) { return {}; }
+     if (!max_tokens || other || growth_initial_tokens || v_cells_impl.use_count() != 1 || n_stream != 1 || n_swa ||
+-            hparams.n_pos_per_embd() != 1 || seq_to_stream.size() != LLAMA_MAX_SEQ ||
++            seq_to_stream.size() != LLAMA_MAX_SEQ ||
+             sequence < 0 || uint32_t(sequence) >= n_seq_max || get_has_shift()) { return {}; }
+     auto & cells = v_cells[0];
+     const auto & positions = cells.seq_pos_get(sequence);
+     const uint32_t count = positions.size();
+-    // Complete one-dimensional prefixes only. Gaps or shifted prefixes retain
++    // Complete contiguous text prefixes only. Gaps or shifted prefixes retain
+     // the existing serialized path rather than inventing missing KV state.
+     if (!count || positions.begin()->first != 0 || positions.rbegin()->first != llama_pos(count - 1)) { return {}; }
+     llama_pos expected = 0;
+-    for (const auto & position : positions) { if (position.first != expected++) { return {}; } }
++    for (const auto & position : positions) {
++        if (position.first != expected++) { return {}; }
++        if (!llama_prefix_text_cell(hparams.n_pos_per_embd(),hparams.ple_n_heads,
++                cells.ext_get(position.second),position.first)) { return {}; }
++    }
+     max_tokens = std::min(max_tokens, get_size() / 4);
+     uint64_t retained = count;
+     size_t slot = prefixes.size();
+@@ -2384,8 +2392,6 @@
+ }
+ 
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    // A full external state must not expose private cache-reference sequence IDs.
+-    if (seq_id < 0) { invalidate_prefixes(); }
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -2395,6 +2401,8 @@
+         return;
+     }
+ 
++    // A full external state must not expose private cache-reference sequence IDs.
++    if (seq_id < 0) { invalidate_prefixes(); }
+     io.write(&n_stream, sizeof(n_stream));
+ 
+     for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -2467,7 +2475,6 @@
+   llama_state_seq_flags   flags,
+       slot_info_vec_t *   sinfos_out,
+ const slot_info_vec_t *   sinfos_in) {
+-    invalidate_prefixes();
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -2476,6 +2483,8 @@
+     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+         return;
+     }
++
++    invalidate_prefixes();
+ 
+     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -3,6 +3,145 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
++#include "llama-io.h"
++#include "llama-ext.h"
++#include "llama-hybrid-prefix-transaction.h"
++
++#include <cstring>
++#include <stdexcept>
++#include <typeinfo>
++
++
++// Attention cells remain shared in their existing allocation. Only the compact
++// logical current recurrent state is captured on the host. Snapshot allocation
++// is optional and bounded separately from the existing retained-token quota.
++struct llama_hybrid_prefix_owner {
++    llama_memory_hybrid * memory;
++    size_t limit;
++    size_t bytes = 0;
++};
++
++class hybrid_prefix_writer final : public llama_io_write_i {
++    std::vector<uint8_t> * data;
++    size_t offset = 0;
++    const size_t limit;
++public:
++    explicit hybrid_prefix_writer(size_t limit,std::vector<uint8_t> * data = nullptr) : data(data),limit(limit) {}
++    void reserve(size_t size) {
++        if (size > limit - offset || (data && size > data->size() - offset)) {
++            throw std::length_error("hybrid prefix recurrent-state byte budget exceeded");
++        }
++    }
++    void write(const void * src, size_t size) override {
++        reserve(size);
++        if (data && size) { std::memcpy(data->data()+offset,src,size); }
++        offset += size;
++    }
++    void write_tensor(ggml_tensor * tensor, size_t begin, size_t size) override {
++        reserve(size);
++        if (data && size) { ggml_backend_tensor_get(tensor,data->data()+offset,begin,size); }
++        offset += size;
++    }
++    size_t n_bytes() override { return offset; }
++};
++
++class hybrid_prefix_reader final : public llama_io_read_i {
++    const std::vector<uint8_t> & data;
++    size_t offset = 0;
++public:
++    explicit hybrid_prefix_reader(const std::vector<uint8_t> & data) : data(data) {}
++    void require(size_t size) {
++        if (size > data.size()-offset) { throw std::runtime_error("truncated hybrid prefix recurrent state"); }
++    }
++    void read(void * dst, size_t size) override {
++        require(size);
++        if (size) { std::memcpy(dst,data.data()+offset,size); }
++        offset += size;
++    }
++    void read_tensor(ggml_tensor * tensor, size_t begin, size_t size) override {
++        require(size);
++        if (size) { ggml_backend_tensor_set(tensor,data.data()+offset,begin,size); }
++        offset += size;
++    }
++    size_t n_bytes() override { return offset; }
++};
++
++struct llama_hybrid_prefix_state final : llama_memory_prefix {
++    std::weak_ptr<llama_hybrid_prefix_owner> owner;
++    std::shared_ptr<llama_memory_prefix> attention;
++    std::vector<uint8_t> recurrent;
++    bool charged = false;
++    llama_hybrid_prefix_state(const std::shared_ptr<llama_hybrid_prefix_owner> & owner,
++            std::shared_ptr<llama_memory_prefix> attention, std::vector<uint8_t> recurrent) :
++        owner(owner), attention(std::move(attention)), recurrent(std::move(recurrent)) {}
++    ~llama_hybrid_prefix_state() override {
++        if (charged) {
++            if (auto locked = owner.lock()) { locked->bytes -= recurrent.size(); }
++        }
++    }
++    bool valid() const override { return !owner.expired() && attention && attention->valid() && !recurrent.empty(); }
++    size_t size() const override { return attention->size()+recurrent.size(); }
++    uint32_t n_tokens() const override { return attention->n_tokens(); }
++    bool restore(llama_memory_t memory, llama_seq_id destination) override {
++        auto locked = owner.lock();
++        if (!valid() || !locked || locked->memory != memory || destination < 0 ||
++                size_t(destination) >= locked->memory->get_mem_recr()->rs_idx.size()) { return false; }
++        auto * attn = locked->memory->get_mem_attn();
++        auto * recr = locked->memory->get_mem_recr();
++        return llama_hybrid_prefix_transaction(
++            [&] { return attention->restore(attn,destination); },
++            [&] {
++                hybrid_prefix_reader reader(recurrent);
++                recr->state_read(reader,destination,0);
++                return reader.n_bytes()==recurrent.size() &&
++                    attn->seq_pos_max(destination)==llama_pos(n_tokens()-1) &&
++                    recr->seq_pos_max(destination)==llama_pos(n_tokens()-1);
++            },
++            [&] {
++                // No half-restored state can be used by the next decode.
++                attn->seq_rm(destination,-1,-1);
++                recr->seq_rm(destination,-1,-1);
++            });
++    }
++};
++
++llama_memory_hybrid::~llama_memory_hybrid() {
++    invalidate_prefixes();
++    prefix_owner.reset();
++}
++
++void llama_memory_hybrid::invalidate_prefixes() const { static_cast<llama_memory_i *>(mem_attn.get())->invalidate_prefixes(); }
++
++std::shared_ptr<llama_memory_prefix> llama_memory_hybrid::retain_prefix(llama_seq_id sequence,uint32_t max_tokens) {
++    // Derived layouts can own additional indexer/compression state. They must
++    // explicitly implement a complete composite snapshot before opting in.
++    if (typeid(*this)!=typeid(llama_memory_hybrid) || sequence<0 ||
++            size_t(sequence)>=mem_recr->rs_idx.size()) { return {}; }
++    if (!prefix_owner) {
++        prefix_owner=std::make_shared<llama_hybrid_prefix_owner>(llama_hybrid_prefix_owner{
++            this,llama_prefix_recurrent_limit(std::getenv("WILDLLAMA_PREFIX_RECURRENT_MIB"))});
++    }
++    const auto limit=prefix_owner->limit;
++    if (!limit) { return {}; }
++    auto attention=mem_attn->retain_prefix(sequence,max_tokens);
++    if (!attention || mem_recr->seq_pos_max(sequence)!=llama_pos(attention->n_tokens()-1)) { return {}; }
++    hybrid_prefix_writer measure(limit);
++    try { mem_recr->state_write(measure,sequence,0); }
++    catch (const std::length_error &) { return {}; }
++    const size_t bytes=measure.n_bytes();
++    if (!bytes || bytes>SIZE_MAX-attention->size()) { return {}; }
++    if (!llama_prefix_recurrent_admit(prefix_owner->bytes,bytes,limit)) { return {}; }
++    std::vector<uint8_t> recurrent(bytes);
++    hybrid_prefix_writer writer(limit,&recurrent);
++    mem_recr->state_write(writer,sequence,0);
++    if (writer.n_bytes()!=bytes) { return {}; }
++    auto retained=std::make_shared<llama_hybrid_prefix_state>(prefix_owner,std::move(attention),std::move(recurrent));
++    prefix_owner->bytes+=bytes;
++    retained->charged=true;
++    return retained;
++}
++
++
+ 
+ //
+ // llama_memory_hybrid
+@@ -111,6 +250,11 @@
+         // prepare the attention cache
+         auto heads_attn = mem_attn->prepare(ubatches);
+         if (heads_attn.empty()) {
++            // Optional cached references must never prevent active inference.
++            static_cast<llama_memory_i *>(mem_attn.get())->invalidate_prefixes();
++            heads_attn = mem_attn->prepare(ubatches);
++        }
++        if (heads_attn.empty()) {
+             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
+             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+         }
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -15,6 +15,8 @@
+ 
+ // utilizes instances of llama_memory_recurrent and llama_kv_cache to
+ //   support models where each layer may be either attention-based or recurrent
++
++struct llama_hybrid_prefix_owner;
+ 
+ class llama_memory_hybrid : public llama_memory_i {
+ public:
+@@ -41,7 +43,7 @@
+     const layer_filter_cb & filter_attn = nullptr,
+     const layer_filter_cb & filter_recr = nullptr);
+ 
+-    ~llama_memory_hybrid() = default;
++    ~llama_memory_hybrid();
+ 
+     //
+     // llama_memory_i
+@@ -60,6 +62,9 @@
+ 
+     void clear(bool data) override;
+     size_t trim_empty() override;
++
++    std::shared_ptr<llama_memory_prefix> retain_prefix(llama_seq_id sequence, uint32_t max_tokens) override;
++    void invalidate_prefixes() const override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+@@ -89,6 +94,7 @@
+ 
+     const std::unique_ptr<llama_kv_cache> mem_attn;
+     const std::unique_ptr<llama_memory_recurrent> mem_recr;
++    std::shared_ptr<llama_hybrid_prefix_owner> prefix_owner;
+ };
+ 
+ class llama_memory_hybrid_context : public llama_memory_context_i {
+diff --git a/src/llama-prefix-text.h b/src/llama-prefix-text.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-prefix-text.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include "llama-kv-cells.h"
++
++// Text-only M-RoPE admission; the actual cell/ext storage stays shared intact.
++inline bool llama_prefix_text_cell(uint32_t n_pos,uint32_t ple_heads,
++        const llama_kv_cell_ext & ext,llama_pos position) {
++    if (n_pos==1) { return true; }
++    const bool aligned=(ext.x==0 && ext.y==0) || (ext.x==position && ext.y==position);
++    return !ple_heads && ext.tok!=LLAMA_TOKEN_NULL && aligned;
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -481,3 +481,16 @@
+     llama_test(test-device-attn-mask NAME test-device-attn-mask-cuda ARGS --cuda ${CMAKE_CURRENT_BINARY_DIR} LABEL "backend cuda")
+     set_tests_properties(test-device-attn-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+ endif()
++
++if (LLAMA_BUILD_SERVER AND LLAMA_BUILD_TOOLS)
++
++llama_build(test-hybrid-prefix.cpp LINK server-context llama-common)
++target_include_directories(test-hybrid-prefix PRIVATE ../tools/server ../src)
++add_dependencies(test-hybrid-prefix ggml-cpu)
++llama_test(test-hybrid-prefix LABEL "main behavior")
++if (TARGET ggml-cuda)
++    add_dependencies(test-hybrid-prefix ggml-cuda)
++    llama_test(test-hybrid-prefix NAME test-hybrid-prefix-cuda ARGS --cuda LABEL "backend cuda")
++    set_tests_properties(test-hybrid-prefix-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
++endif()
++endif()
+diff --git a/tests/test-hybrid-prefix.cpp b/tests/test-hybrid-prefix.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-hybrid-prefix.cpp
+@@ -0,0 +1,245 @@
++#include "llama.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "server-task.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-memory-hybrid.h"
++#include "../src/llama-hybrid-prefix-transaction.h"
++#include "../src/llama-prefix-text.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++static void require(bool b,const char * message){if(!b)throw std::runtime_error(message);}
++static bool gpu=false;
++static void recurrent_cap(const char * value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_PREFIX_RECURRENT_MIB",value);
++#else
++    setenv("WILDLLAMA_PREFIX_RECURRENT_MIB",value,1);
++#endif
++}
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, const std::string & export_path = {}) {
++    const int dim=embedding_width, vocab=259;
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
++    gguf_set_val_str(metadata.get(), "general.name", "mtp-rollback-diagnostic-fixture");
++    auto u32=[&](const char * key, uint32_t value) {
++        gguf_set_val_u32(metadata.get(), (std::string("qwen35.")+key).c_str(),value);
++    };
++    u32("context_length",512); u32("embedding_length",dim); u32("block_count",3);
++    u32("feed_forward_length",64); u32("attention.head_count",2);
++    u32("attention.head_count_kv",1); u32("rope.dimension_count",16);
++    u32("nextn_predict_layers",1); u32("full_attention_interval",2);
++    u32("ssm.conv_kernel",4); u32("ssm.inner_size",128);
++    u32("ssm.state_size",128); u32("ssm.time_step_rank",1); u32("ssm.group_count",1);
++    gguf_set_val_f32(metadata.get(),"qwen35.attention.layer_norm_rms_epsilon",1e-6f);
++    const uint32_t sections[]={4,4,0,0};
++    gguf_set_arr_data(metadata.get(),"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
++    gguf_set_val_str(metadata.get(),"tokenizer.ggml.model","llama");
++    std::vector<std::string> strings={"<unk>","<s>","</s>"};
++    for(int i=0;i<256;++i){char name[16];std::snprintf(name,sizeof(name),"<0x%02X>",i);strings.emplace_back(name);}
++    std::vector<const char *> names;for(auto & t:strings)names.push_back(t.c_str());
++    std::vector<float> scores(vocab,0);std::vector<int32_t> types(vocab,6);types[0]=2;types[1]=types[2]=3;
++    gguf_set_arr_str(metadata.get(),"tokenizer.ggml.tokens",names.data(),names.size());
++    gguf_set_arr_data(metadata.get(),"tokenizer.ggml.scores",GGUF_TYPE_FLOAT32,scores.data(),scores.size());
++    gguf_set_arr_data(metadata.get(),"tokenizer.ggml.token_type",GGUF_TYPE_INT32,types.data(),types.size());
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.unknown_token_id",0);
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.bos_token_id",1);
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.eos_token_id",2);
++    gguf_set_val_bool(metadata.get(),"tokenizer.ggml.add_bos_token",true);
++    gguf_context_ptr exported(gguf_init_empty());gguf_set_kv(exported.get(),metadata.get());
++    // Export only the ordinary hybrid trunk for the HTTP fixture; the in-memory
++    // regression model may also carry an unused MTP head.
++    gguf_set_val_u32(exported.get(),"qwen35.block_count",2);
++    gguf_set_val_u32(exported.get(),"qwen35.nextn_predict_layers",0);
++    ggml_context_ptr host_tensors(ggml_init({8*1024*1024,nullptr,false}));
++    struct capture {gguf_context * metadata;ggml_context * tensors;bool enabled;};
++    capture capture_state{exported.get(),host_tensors.get(),!export_path.empty()};
++    auto initialize=[](ggml_tensor * tensor, void * opaque) {
++        require(tensor->type == GGML_TYPE_F32,"unexpected tiny fixture type");
++        std::vector<float> values(ggml_nelements(tensor));
++        uint32_t state=2166136261u;
++        for (const char * p=tensor->name;*p;++p) state=(state^uint8_t(*p))*16777619u;
++        const std::string name(tensor->name);
++        for (auto & value:values) {
++            state^=state<<13; state^=state>>17; state^=state<<5;
++            value=(float(state&65535)/65535.f-.5f)*.12f;
++        }
++        if (name.find("norm")!=std::string::npos) std::fill(values.begin(),values.end(),1.f);
++        if (name.find("ssm_a")!=std::string::npos) std::fill(values.begin(),values.end(),-1.f);
++        if (name.find("ssm_dt.bias")!=std::string::npos) std::fill(values.begin(),values.end(),-1.f);
++        ggml_backend_tensor_set(tensor,values.data(),0,values.size()*sizeof(float));
++        auto & saved=*static_cast<capture *>(opaque);
++        if(saved.enabled && name.rfind("blk.2.",0)!=0){
++            auto * host=ggml_new_tensor(saved.tensors,tensor->type,ggml_n_dims(tensor),tensor->ne);
++            ggml_set_name(host,tensor->name);std::memcpy(host->data,values.data(),values.size()*sizeof(float));
++            gguf_add_tensor(saved.metadata,host);
++        }
++    };
++    auto params=llama_model_default_params();
++    ggml_backend_dev_t devices[]={gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    params.devices=devices; params.n_gpu_layers=gpu ? 99 : 0; params.gpu_exclusive=gpu; params.load_mode=LLAMA_LOAD_MODE_NONE;
++    params.use_extra_bufts=false; params.no_host=true; params.load_mtp=true;
++    llama_model_ptr model(llama_model_init_from_user(metadata.get(),initialize,&capture_state,params));
++    require(bool(model),"cannot initialize nonzero tiny recurrent fixture");
++    if(!export_path.empty()){require(gguf_write_to_file(exported.get(),export_path.c_str(),false),"cannot export tiny hybrid fixture");}
++    return model;
++}
++
++
++static llama_context_ptr context(llama_model * model,int tokens=256) {
++    auto p=llama_context_default_params();
++    p.n_ctx=tokens;p.n_batch=256;p.n_ubatch=256;p.n_seq_max=1;p.kv_unified=true;
++    p.n_rs_seq=2;p.n_threads=p.n_threads_batch=1;
++    p.op_offload=gpu;p.offload_kqv=gpu;
++    p.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    llama_context_ptr ctx(llama_init_from_model(model,p));
++    require(bool(ctx),"cannot create tiny hybrid prefix context");
++    require(dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx.get())),"fixture is not hybrid");
++    return ctx;
++}
++static llama_tokens pattern(int n,int salt=0){llama_tokens a;for(int i=0;i<n;++i)a.push_back(3+(i*13+salt)%60);return a;}
++static std::vector<float> decode(llama_context * ctx,const llama_tokens & tokens,int pos) {
++    auto b=llama_batch_init(tokens.size(),0,1);b.n_tokens=tokens.size();
++    for(int i=0;i<b.n_tokens;++i){b.token[i]=tokens[i];b.pos[i]=pos+i;b.n_seq_id[i]=1;b.seq_id[i][0]=0;b.logits[i]=i+1==b.n_tokens;}
++    const int result=llama_decode(ctx,b);llama_batch_free(b);require(result==0,"hybrid prefix decode failed");
++    if(gpu){llama_gpu_execution_stats stats{};require(llama_gpu_execution_stats_get(ctx,&stats) &&
++        stats.gpu_heavy_ops_submitted>0 && stats.cpu_heavy_ops_submitted==0,"hybrid fixture silently used CPU arithmetic");}
++    const auto * out=llama_get_logits_ith(ctx,-1);require(out,"hybrid logits missing");
++    const int n=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    return {out,out+n};
++}
++static void equal(const std::vector<float> & a,const std::vector<float> & b,const char * stage) {
++    require(a.size()==b.size(),"hybrid logits changed shape");float max=0;
++    for(size_t i=0;i<a.size();++i){require(std::isfinite(a[i])&&std::isfinite(b[i]),"nonfinite hybrid logits");max=std::max(max,std::abs(a[i]-b[i])/(1+std::abs(a[i])));}
++    require(std::max_element(a.begin(),a.end())-a.begin()==std::max_element(b.begin(),b.end())-b.begin(),"hybrid top token changed");
++    std::printf("HYBRID_LOGITS stage=%s max_scaled=%.9g\n",stage,max);require(max<=1e-5f,"hybrid prefix logits differ");
++}
++static void clear(llama_context * ctx){llama_memory_clear(llama_get_memory(ctx),true);}
++static void transactions() {
++    constexpr size_t mib=1024*1024;
++    require(llama_prefix_recurrent_limit(nullptr)==32*mib,"missing cap default changed");
++    require(llama_prefix_recurrent_limit("0")==0 && llama_prefix_recurrent_limit("1")==mib &&
++        llama_prefix_recurrent_limit("1024")==1024*mib,"valid RNN cap rejected");
++    for(const char * bad:{"-1","1025","invalid","9999999999999999999999999999999"}){
++        require(llama_prefix_recurrent_limit(bad)==32*mib,"invalid RNN cap changed default");
++    }
++    require(llama_prefix_recurrent_admit(16*mib,16*mib,32*mib),"RNN cap exact boundary rejected");
++    require(!llama_prefix_recurrent_admit(16*mib,16*mib+1,32*mib),"RNN aggregate cap exceeded");
++    require(!llama_prefix_recurrent_admit(SIZE_MAX,1,32*mib),"RNN byte quota overflow admitted");
++    for(int fail=0;fail<5;++fail){int attn=0,recr=0,clears=0;
++        const bool result=llama_hybrid_prefix_transaction([&]{++attn;if(fail==1)throw std::runtime_error("attn");return fail!=2;},
++            [&]{++recr;if(fail==3)throw std::runtime_error("recr");return fail!=4;},[&]{clears+=2;});
++        require(result==(fail==0),"composite transaction result changed");
++        require(clears==(fail?2:0),"failure did not clear both halves");
++        require(recr==((fail==1||fail==2)?0:1),"recurrent restore ran after attention failure");
++    }
++}
++static void native_cases(llama_model * model) {
++    auto a=pattern(12),b=pattern(5,7);
++    recurrent_cap("0");
++    {auto disabled=context(model);decode(disabled.get(),a,0);
++        require(!llama_memory_prefix_retain(disabled.get(),0,64),"zero RNN byte cap retained hybrid state");}
++    recurrent_cap("32");
++    auto ctx=context(model),ref=context(model);
++    equal(decode(ctx.get(),a,0),decode(ref.get(),a,0),"initial");
++    auto held=llama_memory_prefix_retain(ctx.get(),0,64);
++    require(held&&held->valid()&&held->n_tokens()==12&&held->size()>0,"hybrid text-MRoPE prefix not retained");
++    recurrent_cap("0");
++    {auto same_owner=llama_memory_prefix_retain(ctx.get(),0,64);
++        require(same_owner&&same_owner->valid(),"live owner byte cap changed after capture");}
++    recurrent_cap("32");
++    const auto fullbytes=llama_state_seq_get_size(ctx.get(),0);
++    require(held->valid(),"sequence-specific serialization invalidated immutable prefix");
++    std::printf("HYBRID_RETAIN tokens=%u logical_charged_bytes=%zu serialized_all_bytes=%zu\n",held->n_tokens(),held->size(),fullbytes);
++    common_prompt_checkpoint partial;partial.update_pos(12,11,11);
++    partial.update_tgt(ctx.get(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    require(held->valid(),"recurrent-only checkpoint save invalidated attention alias");
++    equal(decode(ctx.get(),{17},12),decode(ref.get(),{17},12),"append");
++    require(partial.load_tgt(ctx.get(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY),"recurrent-only checkpoint load failed");
++    require(held->valid(),"recurrent-only checkpoint load invalidated attention alias");
++    require(llama_memory_seq_rm(llama_get_memory(ctx.get()),0,12,-1),"cannot trim checkpoint suffix");
++    equal(decode(ctx.get(),{17},12),std::vector<float>(llama_get_logits_ith(ref.get(),-1),llama_get_logits_ith(ref.get(),-1)+259),"partial-checkpoint");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()),0,-1,-1);decode(ctx.get(),b,0);
++    require(llama_memory_prefix_restore(ctx.get(),held,0),"A-B-A hybrid restore failed");
++    equal(decode(ctx.get(),{17},12),std::vector<float>(llama_get_logits_ith(ref.get(),-1),llama_get_logits_ith(ref.get(),-1)+259),"A-B-A");
++    require(llama_memory_prefix_restore(ctx.get(),held,0),"hybrid branch restore failed");
++    clear(ref.get());decode(ref.get(),a,0);
++    equal(decode(ctx.get(),{18},12),decode(ref.get(),{18},12),"branch");
++    require(!llama_memory_prefix_restore(ref.get(),held,0),"hybrid handle crossed contexts");
++    require(!llama_memory_prefix_restore(ctx.get(),held,-1),"negative destination admitted");
++    llama_set_warmup(ctx.get(),true);require(!held->valid(),"hybrid warmup failed to invalidate handle");
++    require(!llama_memory_prefix_retain(ctx.get(),0,64),"hybrid retained during warmup");llama_set_warmup(ctx.get(),false);
++    clear(ctx.get());decode(ctx.get(),a,0);held=llama_memory_prefix_retain(ctx.get(),0,64);
++    require(held&&held->valid(),"cannot retain before destruction");ctx.reset();require(!held->valid(),"hybrid handle survived context destruction");held.reset();
++
++    ctx=context(model);decode(ctx.get(),a,0);
++    // Synthetic spatial edge cases exercise the exact production admission predicate.
++    llama_kv_cell_ext text;text.tok=7;
++    require(llama_prefix_text_cell(4,0,text,5),"neutral text spatial metadata rejected");
++    text.x=text.y=5;require(llama_prefix_text_cell(4,0,text,5),"position-aligned text metadata rejected");
++    text.x=91;text.y=17;require(!llama_prefix_text_cell(4,0,text,5),"nontext spatial metadata admitted");
++    text.x=text.y=0;text.tok=LLAMA_TOKEN_NULL;require(!llama_prefix_text_cell(4,0,text,5),"media metadata admitted");
++    text.tok=7;require(!llama_prefix_text_cell(4,1,text,5),"PLE media placeholder cannot prove text");
++    require(llama_memory_seq_rm(llama_get_memory(ctx.get()),0,3,5),"cannot create sparse prefix");
++    require(!llama_memory_prefix_retain(ctx.get(),0,64),"noncontiguous hybrid prefix admitted");
++    clear(ctx.get());
++    auto embedded=llama_batch_init(2,32,1);embedded.n_tokens=2;std::free(embedded.pos);embedded.pos=(llama_pos *)std::malloc(8*sizeof(llama_pos));
++    for(int i=0;i<2;++i){for(int j=0;j<4;++j)embedded.pos[j*2+i]=i;embedded.n_seq_id[i]=1;embedded.seq_id[i][0]=0;embedded.logits[i]=i==1;}
++    std::fill(embedded.embd,embedded.embd+64,.01f);
++    const int er=llama_decode(ctx.get(),embedded);llama_batch_free(embedded);require(er==0,"tiny embeddings decode failed");
++    require(!llama_memory_prefix_retain(ctx.get(),0,64),"actual embedding prefix admitted");
++    clear(ctx.get());clear(ref.get());
++    decode(ctx.get(),pattern(40),0);held=llama_memory_prefix_retain(ctx.get(),0,64);require(held&&held->valid(),"pressure prefix missing");
++    llama_memory_seq_rm(llama_get_memory(ctx.get()),0,-1,-1);
++    equal(decode(ctx.get(),pattern(230,9),0),decode(ref.get(),pattern(230,9),0),"pressure-eviction");
++    require(!held->valid(),"pressure did not evict optional hybrid prefix");
++}
++static void cache_cases(llama_model * model) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_PREFIX_RETAIN_TOKENS","64");
++#else
++    setenv("WILDLLAMA_PREFIX_RETAIN_TOKENS","64",1);
++#endif
++    const auto a=pattern(32),b=pattern(5,7);
++    for(bool shorten:{false,true}){
++        auto ctx=context(model),ref=context(model);
++        server_prompt prompt;prompt.tokens=server_tokens(a,false);
++        decode(ctx.get(),{a.begin(),a.begin()+16},0);
++        common_prompt_checkpoint checkpoint;checkpoint.update_pos(16,15,15);checkpoint.update_tgt(ctx.get(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        decode(ctx.get(),{a.begin()+16,a.end()},16);prompt.checkpoints.push_back(checkpoint);
++        server_prompt_cache cache(4,256);
++        require(cache.save_resident(prompt,ctx.get(),0),"server did not retain checkpointed hybrid prompt");
++        require(cache.states.size()==1 && cache.states.front().resident && cache.states.front().data.main.empty(),"server used serialized full KV instead of hybrid handle");
++        require(cache.states.front().prompt.checkpoints.size()==1,"checkpoint lost during cache save");
++        llama_memory_seq_rm(llama_get_memory(ctx.get()),0,-1,-1);decode(ctx.get(),b,0);
++        server_prompt live;live.tokens=server_tokens(b,false);
++        auto query=a;if(shorten)query.resize(20);query.push_back(21);
++        require(cache.load(live,server_tokens(query,false),ctx.get(),nullptr,0,nullptr),"hybrid server cache restore failed");
++        require(live.checkpoints.size()==1,"checkpoint lost during resident cache load");
++        if(shorten){
++            require(live.checkpoints.front().load_tgt(ctx.get(),0,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY),"shorter prompt recurrent checkpoint restore failed");
++            require(llama_memory_seq_rm(llama_get_memory(ctx.get()),0,16,-1),"shorter prompt KV trim failed");
++            decode(ref.get(),{a.begin(),a.begin()+20},0);
++            equal(decode(ctx.get(),{query.begin()+16,query.end()},16),decode(ref.get(),{21},20),"server-shorter-checkpoint");
++        }else{
++            decode(ref.get(),a,0);equal(decode(ctx.get(),{21},32),decode(ref.get(),{21},32),"server-append");
++        }
++        server_prompt media;media.tokens=server_tokens(query,true);require(!cache.save_resident(media,ctx.get(),0),"server admitted media prompt");
++    }
++}
++int main(int argc,char ** argv) {
++    try{
++        std::setvbuf(stdout,nullptr,_IONBF,0);gpu=argc>1&&std::strcmp(argv[1],"--cuda")==0;
++        ggml_backend_load_all();
++        if(argc==3&&std::strcmp(argv[1],"--write-fixture")==0){auto model=tiny_model(false,32,argv[2]);return 0;}
++        if(gpu&&!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))return 77;
++        transactions();auto model=tiny_model(gpu);native_cases(model.get());cache_cases(model.get());
++        std::printf("HYBRID_PREFIX backend=%s native+server+checkpoint+transaction PASS\n",gpu?"CUDA":"CPU");return 0;
++    }catch(const std::exception & e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
++}
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1820,12 +1820,19 @@
+ }
+ 
+ bool server_prompt_cache::save_resident(const server_prompt & prompt, llama_context * ctx, llama_seq_id sequence) {
+-    if (!retain_tokens || prompt.tokens.has_mtmd || !prompt.checkpoints.empty()) { return false; }
++    // The native capability decides which memory layouts support retention.
++    // Keep recurrent checkpoints with the prompt so shorter/divergent reuse
++    // still follows the existing exact recurrent rollback path.
++    if (!retain_tokens || prompt.tokens.has_mtmd) { return false; }
+     prune_invalid();
+     if (!can_save(prompt, 0)) { return false; }
+     auto resident = llama_memory_prefix_retain(ctx, sequence, retain_tokens);
+     if (!resident || resident->n_tokens() != prompt.tokens.size()) { return false; }
+-    return alloc(prompt, {}, std::move(resident)) != nullptr;
++    auto * saved=alloc(prompt, {}, std::move(resident));
++    if (!saved) { return false; }
++    SRV_DBG("retained native prompt state: %u tokens, %zu logical bytes, %zu checkpoints\n",
++            saved->resident->n_tokens(),saved->resident->size(),saved->prompt.checkpoints.size());
++    return true;
+ }
+ 
+ bool server_prompt_cache::can_save(const server_prompt & prompt, size_t state_size) const {
+@@ -1984,6 +1991,8 @@
+                 erase_state(it_best);
+                 return false;
+             }
++            SRV_DBG("restored native prompt state: %u tokens, %zu checkpoints\n",
++                    it_best->resident->n_tokens(),it_best->prompt.checkpoints.size());
+             prefix_index.erase(&*it_best);
+             prompt = std::move(it_best->prompt);
+             states.erase(it_best); // active sequence now owns the shared cells

@@ -1,0 +1,1133 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2331,6 +2331,13 @@
+         }
+     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
+     add_opt(common_arg(
++        {"--grammar-first"},
++        "apply grammar before sampling filters (explicit ordering change; default: grammar-last validation/resampling)",
++        [](common_params & params) {
++            params.sampling.grammar_first = true;
++        }
++    ).set_sampling().set_env("LLAMA_ARG_GRAMMAR_FIRST"));
++    add_opt(common_arg(
+         {"--pooling"}, "{none,mean,cls,last,rank}",
+         "pooling type for embeddings, use model default if unspecified",
+         [](common_params & params, const std::string & value) {
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -297,6 +297,9 @@
+     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+ 
+     bool backend_sampling = false;
++    // Explicitly change grammar ordering. False preserves grammar-last token
++    // validation/resampling; true allows a single-row backend grammar mask.
++    bool grammar_first = false;
+ 
+     // print the parameters into a string
+     std::string print() const;
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -118,6 +118,7 @@
+     struct llama_sampler * grmr;
+     struct llama_sampler * rbudget;
+     struct llama_sampler * chain;
++    struct llama_sampler * token_mask; // owned by chain, never by grammar
+ 
+     ring_buffer<llama_token> prev;
+ 
+@@ -197,11 +198,13 @@
+             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
+             "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
+             "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
+-            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, adaptive_target = %.3f, adaptive_decay = %.3f",
++            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f, adaptive_target = %.3f, adaptive_decay = %.3f\n"
++            "\tgrammar_first = %d, backend_sampling = %d",
+             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
+             dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
+             top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
+-            mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
++            mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay,
++            int(grammar_first), int(backend_sampling));
+ 
+     return std::string(result);
+ }
+@@ -436,7 +439,7 @@
+         GGML_ASSERT(false && "unknown mirostat version");
+     }
+ 
+-    if (grmr && params.backend_sampling) {
++    if (grmr && params.backend_sampling && !params.grammar_first) {
+         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
+ 
+         params.backend_sampling = false;
+@@ -446,6 +449,20 @@
+         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+ 
+         params.backend_sampling = false;
++    }
++
++    llama_sampler * token_mask = nullptr;
++    if (grmr && params.backend_sampling && params.grammar_first) {
++        llama_sampler_ptr mask(llama_sampler_init_token_mask(llama_vocab_n_tokens(vocab)));
++        if (llama_sampler_set_grammar_token_mask(mask.get(),grmr.get())) {
++            auto * state=static_cast<llama_sampler_chain *>(chain->ctx);
++            state->samplers.insert(state->samplers.begin(), {false,mask.get()});
++            ++state->graph_binding_revision;
++            token_mask=mask.release();
++        } else {
++            LOG_WRN("%s: this grammar implementation has no backend mask contract; using CPU\n",__func__);
++            params.backend_sampling=false;
++        }
+     }
+ 
+     auto * result = new common_sampler {
+@@ -453,6 +470,7 @@
+         /* .grmr    = */ grmr.get(),
+         /* .rbudget = */ rbudget.get(),
+         /* .chain   = */ chain.get(),
++        /* .token_mask = */ token_mask,
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+         /* .cur_p   = */ {},
+@@ -520,6 +538,9 @@
+ 
+     if (gsmpl->grmr && accept_grammar) {
+         llama_sampler_accept(gsmpl->grmr, token);
++        if (gsmpl->token_mask) {
++            GGML_ASSERT(llama_sampler_set_grammar_token_mask(gsmpl->token_mask,gsmpl->grmr));
++        }
+     }
+ 
+     llama_sampler_accept(gsmpl->chain, token);
+@@ -544,6 +565,7 @@
+         /* .grmr    = */ grmr.get(),
+         /* .rbudget = */ rbudget.get(),
+         /* .chain   = */ chain.get(),
++        /* .token_mask = */ gsmpl->token_mask ? llama_sampler_chain_get(chain.get(),0) : nullptr,
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
+@@ -563,6 +585,7 @@
+ 
+     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
+     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
++    GGML_ASSERT((src->token_mask == nullptr) == (dst->token_mask == nullptr));
+ 
+     llama_sampler_copy(src->grmr,    dst->grmr);
+     llama_sampler_copy(src->rbudget, dst->rbudget);
+@@ -633,7 +656,8 @@
+ }
+ 
+ struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl) {
+-    return gsmpl && gsmpl->params.backend_sampling && !gsmpl->grmr && !gsmpl->rbudget ? gsmpl->chain : nullptr;
++    return gsmpl && gsmpl->params.backend_sampling && (!gsmpl->grmr || gsmpl->token_mask) &&
++        !gsmpl->rbudget ? gsmpl->chain : nullptr;
+ }
+ 
+ struct llama_sampler * common_sampler_get_backend_selected_only(const struct common_sampler * gsmpl) {
+@@ -646,6 +670,7 @@
+ 
+ static llama_token common_sampler_sample_synchronized(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first,
+         llama_sampler_output * deferred_backend = nullptr) {
++    grammar_first=grammar_first || gsmpl->params.grammar_first;
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
+@@ -674,7 +699,7 @@
+         if (id != LLAMA_TOKEN_NULL) {
+             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
+ 
+-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
++            GGML_ASSERT((!gsmpl->grmr || (gsmpl->token_mask && grammar_first)) && "backend grammar requires explicit grammar_first");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+ 
+             if (!output.sampled_probs && !output.sampled_logits &&
+@@ -757,6 +782,7 @@
+ }
+ 
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
++    grammar_first=grammar_first || gsmpl->params.grammar_first;
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+     std::vector<llama_token> result;
+@@ -817,6 +843,7 @@
+ // Preserves the target distribution exactly, and accepts more often than matching does when the
+ // draft samples instead of taking its argmax.
+ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
++    grammar_first=grammar_first || gsmpl->params.grammar_first;
+     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -55,6 +55,10 @@
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl);
++// params.grammar_first=true is an explicit grammar-order contract. With
++// backend_sampling it permits a graph-owned GPU mask for one output/sequence.
++// Default grammar-last, reasoning controllers and unsupported backends retain
++// their CPU path. Pass that same contract to all sample/accept operations.
+ // Before attaching a newly created sampler: request selected-token-only backend
+ // output when no probabilities/grammar/controllers/custom accept observers need
+ // candidates. Unsupported/partial chains retain their normal output. This is
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    1
++#define RPC_PROTO_PATCH_VERSION    3
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -603,6 +603,8 @@
+         GGML_OP_GLU,
+ 
+         GGML_OP_ATTN_MASK, // compact causal positions/sequence memberships -> exact dense mask
++        // Inference-only allowed-token bitset; appended to preserve op IDs.
++        GGML_OP_TOKEN_MASK,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1803,6 +1805,17 @@
+             float                 min,
+             float                 max);
+ 
++    // Preserve allowed logits bitwise and replace rejected tokens with -INF.
++    // logits is a contiguous F32 vector; allowed is ceil(n_vocab/32) I32 words,
++    // least-significant bit first. Optional contiguous I32 IDs map filtered
++    // candidates back to vocabulary IDs. Invalid IDs are always rejected.
++    GGML_API struct ggml_tensor * ggml_token_mask(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * allowed,
++            struct ggml_tensor  * candidates,
++            int32_t               n_vocab);
++
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1737,6 +1737,22 @@
+ 
+ /////////////////////////////////
+ 
++static void ggml_compute_forward_token_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
++    const int64_t n = ggml_nelements(dst);
++    const int64_t chunk = (n + params->nth - 1)/params->nth;
++    const int64_t first = chunk*params->ith, last = MIN(n, first + chunk);
++    const int32_t n_vocab = ggml_get_op_params_i32(dst, 0);
++    const float * logits = (const float *) dst->src[0]->data;
++    const uint32_t * words = (const uint32_t *) dst->src[1]->data;
++    const int32_t * ids = dst->src[2] ? (const int32_t *) dst->src[2]->data : NULL;
++    float * output = (float *) dst->data;
++    for (int64_t i = first; i < last; ++i) {
++        const int64_t id = ids ? ids[i] : i;
++        const bool allowed = id >= 0 && id < n_vocab && (words[id/32] & (UINT32_C(1) << (id%32)));
++        output[i] = allowed ? logits[i] : -INFINITY;
++    }
++}
++
+ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+     GGML_ASSERT(params);
+ 
+@@ -1933,6 +1949,10 @@
+         case GGML_OP_CLAMP:
+             {
+                 ggml_compute_forward_clamp(params, tensor);
++            } break;
++        case GGML_OP_TOKEN_MASK:
++            {
++                ggml_compute_forward_token_mask(params, tensor);
+             } break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             {
+@@ -2400,6 +2420,10 @@
+         case GGML_OP_ADD_REL_POS:
+             {
+                 n_tasks = n_threads;
++            } break;
++        case GGML_OP_TOKEN_MASK:
++            {
++                n_tasks = node->ne[0] >= 8192 ? n_threads : 1;
+             } break;
+         case GGML_OP_CLAMP:
+             {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -16,6 +16,7 @@
+ #include "ggml-cuda/argsort.cuh"
+ #include "ggml-cuda/binbcast.cuh"
+ #include "ggml-cuda/clamp.cuh"
++#include "ggml-cuda/token-mask.cuh"
+ #include "ggml-cuda/col2im-1d.cuh"
+ #include "ggml-cuda/concat.cuh"
+ #include "ggml-cuda/conv-transpose-1d.cuh"
+@@ -3068,6 +3069,9 @@
+         case GGML_OP_CLAMP:
+             ggml_cuda_op_clamp(ctx, dst);
+             break;
++        case GGML_OP_TOKEN_MASK:
++            ggml_cuda_op_token_mask(ctx, dst);
++            break;
+         case GGML_OP_LOG:
+             ggml_cuda_op_log(ctx, dst);
+             break;
+@@ -6918,6 +6922,10 @@
+             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type;
+         case GGML_OP_CLAMP:
+             return ggml_is_contiguous_rows(op->src[0]);
++        case GGML_OP_TOKEN_MASK:
++            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++                op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
++                (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2])));
+         case GGML_OP_ADD:
+         case GGML_OP_SUB:
+         case GGML_OP_MUL:
+diff --git a/ggml/src/ggml-cuda/token-mask.cu b/ggml/src/ggml-cuda/token-mask.cu
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/token-mask.cu
+@@ -0,0 +1,20 @@
++#include "token-mask.cuh"
++
++static __global__ void token_mask_kernel(const float * logits, const uint32_t * words,
++        const int32_t * ids, float * output, int64_t n, int32_t n_vocab) {
++    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (i >= n) { return; }
++    const int64_t id = ids ? ids[i] : i;
++    const bool allowed = id >= 0 && id < n_vocab && (words[id/32] & (uint32_t(1) << (id%32)));
++    output[i] = allowed ? logits[i] : -INFINITY;
++}
++
++void ggml_cuda_op_token_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
++    const int64_t n = ggml_nelements(dst);
++    const int32_t n_vocab = ggml_get_op_params_i32(dst, 0);
++    constexpr int threads = 256;
++    token_mask_kernel<<<(n+threads-1)/threads,threads,0,ctx.stream()>>>(
++        (const float *)dst->src[0]->data, (const uint32_t *)dst->src[1]->data,
++        dst->src[2] ? (const int32_t *)dst->src[2]->data : nullptr, (float *)dst->data, n, n_vocab);
++}
+diff --git a/ggml/src/ggml-cuda/token-mask.cuh b/ggml/src/ggml-cuda/token-mask.cuh
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/token-mask.cuh
+@@ -0,0 +1,2 @@
++#include "common.cuh"
++void ggml_cuda_op_token_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1109,9 +1109,10 @@
+ 
+     "GLU",
+     "ATTN_MASK",
++    "TOKEN_MASK",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1125,14 +1126,14 @@
+     "x*y",
+     "x/y",
+     "x^2",
+-    "√x",
++    "âˆšx",
+     "log(x)",
+     "sin(x)",
+     "cos(x)",
+-    "Σx",
+-    "Σx_k",
++    "Î£x",
++    "Î£x_k",
+     "cumsum(x)",
+-    "Σx/n",
++    "Î£x/n",
+     "argmax(x)",
+     "count_equal(x)",
+     "repeat(x)",
+@@ -1226,9 +1227,10 @@
+ 
+     "glu(x)",
+     "causal_mask(k,q)",
++    "token_mask(x,allowed,ids)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4174,6 +4176,26 @@
+     return ggml_clamp_impl(ctx, a, min, max, false);
+ }
+ 
++struct ggml_tensor * ggml_token_mask(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * allowed,
++        struct ggml_tensor  * candidates,
++        int32_t               n_vocab) {
++    GGML_ASSERT(n_vocab > 0 && ggml_is_vector(logits) && logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
++    GGML_ASSERT(allowed->type == GGML_TYPE_I32 && ggml_is_vector(allowed) && ggml_is_contiguous(allowed));
++    GGML_ASSERT(allowed->ne[0] == ((int64_t) n_vocab + 31)/32);
++    GGML_ASSERT(!candidates || (candidates->type == GGML_TYPE_I32 && ggml_is_vector(candidates) &&
++                ggml_is_contiguous(candidates) && candidates->ne[0] == logits->ne[0]));
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, logits);
++    result->op = GGML_OP_TOKEN_MASK;
++    result->src[0] = logits;
++    result->src[1] = allowed;
++    result->src[2] = candidates;
++    ggml_set_op_params_i32(result, 0, n_vocab);
++    return result;
++}
++
+ struct ggml_tensor * ggml_clamp_inplace(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,
+@@ -4583,7 +4605,7 @@
+ }
+ 
+ // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+-// a: [OC，IC, KH, KW]
++// a: [OCï¼ŒIC, KH, KW]
+ // b: [N, IC, IH, IW]
+ // result: [N, OH, OW, IC*KH*KW]
+ struct ggml_tensor * ggml_im2col(
+@@ -4667,7 +4689,7 @@
+     struct ggml_tensor * result =
+         ggml_mul_mat(ctx,
+                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
+-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
++                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OCï¼ŒIC, K] => [OC, IC * K]
+ 
+     result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]); // [OC, N, OL]
+     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                // [N, OC, OL]
+@@ -4790,7 +4812,7 @@
+ 
+ // ggml_conv_2d
+ 
+-// a: [OC，IC, KH, KW]
++// a: [OCï¼ŒIC, KH, KW]
+ // b: [N, IC, IH, IW]
+ // result: [N, OC, OH, OW]
+ struct ggml_tensor * ggml_conv_2d(
+@@ -4808,7 +4830,7 @@
+     struct ggml_tensor * result =
+         ggml_mul_mat(ctx,
+                 ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
+-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC，IC, KH, KW] => [OC, IC * KH * KW]
++                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OCï¼ŒIC, KH, KW] => [OC, IC * KH * KW]
+ 
+     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
+     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
+@@ -4938,7 +4960,7 @@
+                                         s0, s1, p0, p1, d0, d1, true, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N * IC, OH, OW, KH * KW]
+     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]); // [N * IC, OH, OW, KH * KW] => [N, IC, OH * OW, KH * KW]
+ 
+-    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC，1, KH, KW] => [1, OC, 1, KH * KW]
++    new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OCï¼Œ1, KH, KW] => [1, OC, 1, KH * KW]
+     struct ggml_tensor * result = ggml_mul_mat(ctx, new_a, new_b);
+     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], b->ne[2], b->ne[3]); // [N, OC, OH, OW]
+ 
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -1356,7 +1356,8 @@
+     return result;
+ }
+ 
+-void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_data_array * cur_p) {
++template<class TokenAt, class Reject>
++static void llama_grammar_reject_mask(const llama_grammar & grammar, size_t count, TokenAt token_at, Reject reject_token) {
+     GGML_ASSERT(grammar.vocab != nullptr);
+ 
+     if (grammar.awaiting_trigger) {
+@@ -1372,21 +1373,21 @@
+     }
+ 
+     std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
+-    candidates_decoded.reserve(cur_p->size);
++    candidates_decoded.reserve(count);
+ 
+     llama_grammar_candidates candidates_grammar;
+-    candidates_grammar.reserve(cur_p->size);
+-
+-    for (size_t i = 0; i < cur_p->size; ++i) {
+-        const llama_token id      = cur_p->data[i].id;
++    candidates_grammar.reserve(count);
++
++    for (size_t i = 0; i < count; ++i) {
++        const llama_token id      = token_at(i);
+         const std::string & piece = grammar.vocab->token_to_piece(id);
+ 
+         if (grammar.vocab->is_eog(id)) {
+             if (!allow_eog) {
+-                cur_p->data[i].logit = -INFINITY;
++                reject_token(i);
+             }
+         } else if (piece.empty() || piece[0] == 0) {
+-            cur_p->data[i].logit = -INFINITY;
++            reject_token(i);
+         } else {
+             candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
+             candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+@@ -1395,8 +1396,23 @@
+ 
+     const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+     for (const auto & reject : rejects) {
+-        cur_p->data[reject.index].logit = -INFINITY;
+-    }
++        reject_token(reject.index);
++    }
++}
++
++void llama_grammar_apply_impl(const llama_grammar & grammar, llama_token_data_array * cur_p) {
++    llama_grammar_reject_mask(grammar, cur_p->size,
++            [&](size_t i) { return cur_p->data[i].id; },
++            [&](size_t i) { cur_p->data[i].logit = -INFINITY; });
++}
++
++void llama_grammar_token_mask(const llama_grammar & grammar, uint32_t * words, size_t n_words) {
++    GGML_ASSERT(grammar.vocab && words);
++    const size_t n_vocab = grammar.vocab->n_tokens();
++    GGML_ASSERT(n_words == (n_vocab+31)/32);
++    std::fill(words, words+n_words, UINT32_MAX);
++    llama_grammar_reject_mask(grammar, n_vocab, [](size_t i) { return llama_token(i); },
++            [&](size_t i) { words[i/32] &= ~(UINT32_C(1) << (i%32)); });
+ }
+ 
+ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
+diff --git a/src/llama-grammar.h b/src/llama-grammar.h
+--- a/src/llama-grammar.h
++++ b/src/llama-grammar.h
+@@ -180,6 +180,9 @@
+         const struct llama_grammar & grammar,
+             llama_token_data_array * cur_p);
+ 
++// Same parser, UTF-8 state, lazy-trigger and EOG rules as apply_impl.
++void llama_grammar_token_mask(const llama_grammar & grammar, uint32_t * words, size_t n_words);
++
+ void llama_grammar_accept_impl(
+               struct llama_grammar & grammar,
+                        llama_token   token);
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -2708,6 +2708,19 @@
+     std::string grammar_root;
+ 
+     struct llama_grammar * grammar;
++
++    struct mask_entry {
++        llama_grammar_stacks stacks;
++        llama_partial_utf8 utf8;
++        std::vector<uint32_t> words;
++        uint64_t used;
++        size_t bytes;
++    };
++    // Exact keys are local to this immutable rules object. No hash collision
++    // can accept an invalid token, and cloned/reset grammars start empty.
++    mutable std::vector<mask_entry> mask_cache;
++    mutable size_t mask_cache_bytes = 0;
++    mutable uint64_t mask_clock = 0, mask_hits = 0, mask_misses = 0;
+ };
+ 
+ static const char * llama_sampler_grammar_name(const struct llama_sampler * /*smpl*/) {
+@@ -2757,6 +2770,8 @@
+                                                  ctx->grammar->lazy, trigger_patterns_c.data(), trigger_patterns_c.size(),
+                                                  ctx->grammar->trigger_tokens.data(), ctx->grammar->trigger_tokens.size());
+ 
++    ctx->mask_cache.clear(); ctx->mask_cache_bytes=0;
++    ctx->mask_clock=ctx->mask_hits=ctx->mask_misses=0;
+     llama_grammar_free_impl(ctx->grammar);
+     ctx->grammar = grammar_new;
+ }
+@@ -4406,6 +4421,175 @@
+     return !accept || accept == llama_sampler_empty_accept || accept == llama_sampler_dist_accept;
+ }
+ 
++// Owned dynamic allowed-token bitset. Logical words/versions survive arena
++// changes; only inp_words belongs to a particular graph.
++struct llama_sampler_token_mask : llama_sampler_backend {
++    explicit llama_sampler_token_mask(int32_t n_vocab) : llama_sampler_backend("token-mask"),
++        n_vocab(n_vocab), words((size_t(n_vocab)+31)/32, UINT32_MAX), next_words(words.size()) { }
++
++    const int32_t n_vocab;
++    std::vector<uint32_t> words;
++    std::vector<uint32_t> next_words;
++    uint64_t version = 1;
++    ggml_backend_buffer_ptr pinned;
++    uint64_t pinned_version = 0;
++    ggml_tensor * inp_words = nullptr;
++
++    void copy_state(const llama_sampler_token_mask & src) {
++        GGML_ASSERT(n_vocab == src.n_vocab);
++        if (words != src.words) { words = src.words; ++version; }
++    }
++};
++
++static const char * llama_sampler_token_mask_name(const llama_sampler * sampler) {
++    return static_cast<llama_sampler_token_mask *>(sampler->ctx)->get_name();
++}
++static void llama_sampler_token_mask_apply(llama_sampler * sampler, llama_token_data_array * cur) {
++    const auto & ctx = *static_cast<const llama_sampler_token_mask *>(sampler->ctx);
++    for (size_t i=0; i<cur->size; ++i) {
++        const auto id=cur->data[i].id;
++        if (id<0 || id>=ctx.n_vocab || !(ctx.words[id/32] & (UINT32_C(1) << (id%32)))) {
++            cur->data[i].logit=-INFINITY;
++        }
++    }
++    cur->sorted=false;
++}
++static void llama_sampler_token_mask_free(llama_sampler * sampler) {
++    delete static_cast<llama_sampler_token_mask *>(sampler->ctx);
++}
++static llama_sampler * llama_sampler_token_mask_clone(const llama_sampler * sampler) {
++    const auto & ctx=*static_cast<const llama_sampler_token_mask *>(sampler->ctx);
++    llama_sampler_ptr clone(llama_sampler_init_token_mask(ctx.n_vocab));
++    static_cast<llama_sampler_token_mask *>(clone->ctx)->copy_state(ctx);
++    return clone.release();
++}
++static bool llama_sampler_token_mask_backend_init(llama_sampler * sampler, ggml_backend_buffer_type_t buft,
++        uint32_t n_outputs_max_per_seq) {
++    auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++    const bool support=n_outputs_max_per_seq==1 && llama_sampler_backend_support(sampler,buft);
++    ctx.init(support);
++    if (support) {
++        auto * device=ggml_backend_buft_get_device(buft);
++        auto * host=device ? ggml_backend_dev_host_buffer_type(device) : nullptr;
++        if (host) { ctx.pinned.reset(ggml_backend_buft_alloc_buffer(host,ctx.words.size()*sizeof(uint32_t))); }
++    }
++    return support;
++}
++static void llama_sampler_token_mask_backend_apply(llama_sampler * sampler, ggml_context * ctx,
++        ggml_cgraph * gf, llama_sampler_data * data) {
++    auto & sctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++    GGML_ASSERT(data->logits && !data->sampled && "token masks must precede selection");
++    sctx.inp_words=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,sctx.words.size());
++    ggml_set_input(sctx.inp_words);
++    ggml_set_name(sctx.inp_words,"token_mask_words");
++    data->logits=ggml_token_mask(ctx,data->logits,sctx.inp_words,data->candidates,sctx.n_vocab);
++    data->probs=nullptr; // following selectors must renormalize the survivors
++    ggml_build_forward_expand(gf,data->logits);
++}
++static void llama_sampler_token_mask_backend_set_input(llama_sampler * sampler) {
++    auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++    if (!ctx.inp_words) { return; }
++    const size_t bytes=ctx.words.size()*sizeof(uint32_t);
++    const void * source=ctx.words.data();
++    if (ctx.pinned) {
++        if (ctx.pinned_version!=ctx.version) {
++            std::memcpy(ggml_backend_buffer_get_base(ctx.pinned.get()),source,bytes);
++            ctx.pinned_version=ctx.version;
++        }
++        source=ggml_backend_buffer_get_base(ctx.pinned.get());
++    }
++    // Input arena storage may be reused after its last consumer, even when
++    // topology/words are unchanged. Always refill the selected graph's input.
++    ggml_backend_tensor_set(ctx.inp_words,source,0,bytes);
++}
++static void llama_sampler_token_mask_backend_reset(llama_sampler * sampler) {
++    auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++    ctx.inp_words=nullptr;
++}
++static llama_sampler_i llama_sampler_token_mask_i = {
++    llama_sampler_token_mask_name, nullptr, llama_sampler_token_mask_apply, nullptr,
++    llama_sampler_token_mask_clone, llama_sampler_token_mask_free,
++    llama_sampler_token_mask_backend_init, nullptr, llama_sampler_token_mask_backend_apply,
++    llama_sampler_token_mask_backend_set_input, llama_sampler_token_mask_backend_reset,
++    llama_sampler_backend_copy_state<llama_sampler_token_mask>,
++};
++llama_sampler * llama_sampler_init_token_mask(int32_t n_vocab) {
++    if (n_vocab<=0) { throw std::invalid_argument("token mask vocabulary must be positive"); }
++    auto ctx=std::unique_ptr<llama_sampler_token_mask>(new llama_sampler_token_mask(n_vocab));
++    auto * sampler=llama_sampler_init(&llama_sampler_token_mask_i,ctx.get());
++    ctx.release(); return sampler;
++}
++bool llama_sampler_set_token_mask(llama_sampler * sampler,const uint32_t * words,size_t n_words) {
++    if (!sampler || sampler->iface!=&llama_sampler_token_mask_i || !words) { return false; }
++    auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++    if (n_words!=ctx.words.size()) { return false; }
++    if (!std::equal(ctx.words.begin(),ctx.words.end(),words)) {
++        std::copy(words,words+n_words,ctx.words.begin()); ++ctx.version;
++    }
++    return true;
++}
++bool llama_sampler_grammar_token_mask(const llama_sampler * sampler,uint32_t * words,size_t n_words) {
++    if (!sampler || sampler->iface!=&llama_sampler_grammar_i || !words) { return false; }
++    const auto & ctx=*static_cast<const llama_sampler_grammar *>(sampler->ctx);
++    if (n_words!=(size_t(ctx.vocab->n_tokens())+31)/32) { return false; }
++    if (!ctx.grammar || ctx.grammar->awaiting_trigger) { std::fill(words,words+n_words,UINT32_MAX); return true; }
++    const auto & grammar=*ctx.grammar;
++    for(auto & entry:ctx.mask_cache) {
++        if(entry.utf8.value==grammar.partial_utf8.value && entry.utf8.n_remain==grammar.partial_utf8.n_remain &&
++                entry.stacks==grammar.stacks) {
++            std::copy(entry.words.begin(),entry.words.end(),words);
++            entry.used=++ctx.mask_clock; ++ctx.mask_hits; return true;
++        }
++    }
++    ++ctx.mask_misses;
++    llama_grammar_token_mask(grammar,words,n_words);
++    constexpr size_t max_entries=16,budget=1024*1024;
++    // Preflight large stack keys before making an optional duplicate. A huge
++    // grammar state still works; it simply cannot consume this small cache.
++    size_t estimate=n_words*sizeof(uint32_t);
++    if(estimate>budget || grammar.stacks.size()>(budget-estimate)/sizeof(llama_grammar_stack)) { return true; }
++    estimate+=grammar.stacks.size()*sizeof(llama_grammar_stack);
++    for(const auto & stack:grammar.stacks) {
++        if(stack.size()>(budget-estimate)/sizeof(const llama_grammar_element *)) { return true; }
++        estimate+=stack.size()*sizeof(const llama_grammar_element *);
++    }
++    try {
++        if(ctx.mask_cache.capacity()<max_entries) { ctx.mask_cache.reserve(max_entries); }
++        const size_t fixed=ctx.mask_cache.capacity()*sizeof(llama_sampler_grammar::mask_entry);
++        if(estimate>budget-fixed) { return true; }
++        llama_sampler_grammar::mask_entry entry{grammar.stacks,grammar.partial_utf8,
++            std::vector<uint32_t>(words,words+n_words),++ctx.mask_clock,0};
++        entry.bytes=entry.words.capacity()*sizeof(uint32_t)+entry.stacks.capacity()*sizeof(llama_grammar_stack);
++        for(const auto & stack:entry.stacks) { entry.bytes+=stack.capacity()*sizeof(const llama_grammar_element *); }
++        if(entry.bytes>budget-fixed) { return true; }
++        while(!ctx.mask_cache.empty() && (ctx.mask_cache.size()>=max_entries ||
++                ctx.mask_cache_bytes>budget-fixed-entry.bytes)) {
++            auto victim=std::min_element(ctx.mask_cache.begin(),ctx.mask_cache.end(),
++                [](const llama_sampler_grammar::mask_entry & a,const llama_sampler_grammar::mask_entry & b){return a.used<b.used;});
++            ctx.mask_cache_bytes-=victim->bytes;ctx.mask_cache.erase(victim);
++        }
++        ctx.mask_cache.push_back(std::move(entry));
++        ctx.mask_cache_bytes+=ctx.mask_cache.back().bytes;
++    } catch(const std::bad_alloc &) {
++        // The mask was already computed correctly. Cache admission must never
++        // turn an otherwise valid constrained request into an allocation error.
++    }
++    return true;
++}
++llama_grammar_mask_cache_stats llama_sampler_grammar_mask_cache_stats(const llama_sampler * sampler) {
++    if(!sampler || sampler->iface!=&llama_sampler_grammar_i) { return {}; }
++    const auto & ctx=*static_cast<const llama_sampler_grammar *>(sampler->ctx);
++    return {ctx.mask_hits,ctx.mask_misses,ctx.mask_cache.size(),
++        ctx.mask_cache_bytes+ctx.mask_cache.capacity()*sizeof(llama_sampler_grammar::mask_entry)};
++}
++bool llama_sampler_set_grammar_token_mask(llama_sampler * mask,const llama_sampler * grammar) {
++    if (!mask || mask->iface!=&llama_sampler_token_mask_i) { return false; }
++    auto & ctx=*static_cast<llama_sampler_token_mask *>(mask->ctx);
++    if (!llama_sampler_grammar_token_mask(grammar,ctx.next_words.data(),ctx.next_words.size())) { return false; }
++    if (ctx.words!=ctx.next_words) { ctx.words.swap(ctx.next_words); ++ctx.version; }
++    return true;
++}
++
+ // Graph binding snapshots deliberately contain no RNG, penalty history, token
+ // counters or candidate arrays. Restoring sampler state must never redirect an
+ // input write to another graph's compute arena.
+@@ -4415,7 +4599,8 @@
+            iface == &llama_sampler_dist_i      || iface == &llama_sampler_top_k_i  ||
+            iface == &llama_sampler_top_p_i     || iface == &llama_sampler_min_p_i  ||
+            iface == &llama_sampler_temp_i      || iface == &llama_sampler_temp_ext_i ||
+-           iface == &llama_sampler_penalties_i || iface == &llama_sampler_logit_bias_i;
++           iface == &llama_sampler_penalties_i || iface == &llama_sampler_logit_bias_i ||
++           iface == &llama_sampler_token_mask_i;
+ }
+ 
+ class sampler_graph_binding final : public llama_sampler_graph_binding {
+@@ -4459,6 +4644,9 @@
+         } else if (sampler->iface == &llama_sampler_logit_bias_i) {
+             const auto & ctx = *static_cast<llama_sampler_logit_bias *>(sampler->ctx);
+             e.input0 = ctx.inp_logit_bias; e.input1 = ctx.inp_logit_idxs;
++        } else if (sampler->iface == &llama_sampler_token_mask_i) {
++            const auto & ctx=*static_cast<llama_sampler_token_mask *>(sampler->ctx);
++            e.input0=ctx.inp_words;
+         }
+         entries.push_back(std::move(e));
+         if (sampler->iface == &llama_sampler_chain_i) {
+@@ -4508,6 +4696,9 @@
+             } else if (e.iface == &llama_sampler_logit_bias_i) {
+                 auto & ctx = *static_cast<llama_sampler_logit_bias *>(e.identity->ctx);
+                 std::swap(ctx.inp_logit_bias, e.input0); std::swap(ctx.inp_logit_idxs, e.input1);
++            } else if (e.iface == &llama_sampler_token_mask_i) {
++                auto & ctx=*static_cast<llama_sampler_token_mask *>(e.identity->ctx);
++                std::swap(ctx.inp_words,e.input0);
+             }
+         }
+     }
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -69,6 +69,20 @@
+ LLAMA_API bool llama_sampler_backend_can_bind_graph(const llama_sampler * sampler);
+ LLAMA_API std::unique_ptr<llama_sampler_graph_binding> llama_sampler_backend_capture_bindings(llama_sampler * sampler);
+ 
++// An owned allow-mask, applied before probability/selection stages. State
++// copies/clone own their words; graph bindings never borrow caller memory.
++// Backend application requires one output per sequence, because successive
++// constrained states cannot be inferred from unaccepted speculative rows.
++LLAMA_API llama_sampler * llama_sampler_init_token_mask(int32_t n_vocab);
++LLAMA_API bool llama_sampler_set_token_mask(llama_sampler * sampler, const uint32_t * words, size_t n_words);
++LLAMA_API bool llama_sampler_grammar_token_mask(const llama_sampler * sampler, uint32_t * words, size_t n_words);
++LLAMA_API bool llama_sampler_set_grammar_token_mask(llama_sampler * mask, const llama_sampler * grammar);
++struct llama_grammar_mask_cache_stats {
++    uint64_t hits = 0, misses = 0;
++    size_t entries = 0, bytes = 0;
++};
++LLAMA_API llama_grammar_mask_cache_stats llama_sampler_grammar_mask_cache_stats(const llama_sampler * grammar);
++
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+         float   dry_base,
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -43,7 +44,7 @@
+ 
+ static ggml_backend_dev_t fixture_gpu_device = nullptr;
+ constexpr int width = 32, n_vocab = 259;
+-static llama_model_ptr fixture_model(bool hybrid = false) {
++static llama_model_ptr fixture_model(bool hybrid = false, int vocab_size = n_vocab) {
+     const std::string architecture = hybrid ? "qwen35" : "llama";
+     gguf_context_ptr meta(gguf_init_empty());
+     gguf_set_val_str(meta.get(), "general.architecture", architecture.c_str());
+@@ -71,10 +72,12 @@
+         char value[16]; std::snprintf(value, sizeof(value), "<0x%02X>", i);
+         names.emplace_back(value);
+     }
++    for(int i=n_vocab;i<vocab_size;++i) { names.emplace_back("w"+std::to_string(i)); }
+     std::vector<const char *> tokens;
+     for (const auto & name : names) { tokens.push_back(name.c_str()); }
+-    std::vector<float> scores(n_vocab, 0);
+-    std::vector<int32_t> types(n_vocab, 6); types[0] = 2; types[1] = types[2] = 3;
++    std::vector<float> scores(vocab_size, 0);
++    std::vector<int32_t> types(vocab_size, 6); types[0] = 2; types[1] = types[2] = 3;
++    for(int i=n_vocab;i<vocab_size;++i) { types[i]=1; }
+     gguf_set_arr_str(meta.get(), "tokenizer.ggml.tokens", tokens.data(), tokens.size());
+     gguf_set_arr_data(meta.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
+     gguf_set_arr_data(meta.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
+@@ -101,7 +104,8 @@
+     params.devices = devices; params.n_gpu_layers = fixture_gpu_device ? 99 : 0; params.load_mode = LLAMA_LOAD_MODE_NONE;
+     params.use_extra_bufts = false; params.no_host = true;
+     llama_model_ptr model(llama_model_init_from_user(meta.get(), init, nullptr, params));
+-    require(bool(model) && llama_model_size(model.get()) < 1024 * 1024, "tiny model unavailable/oversized");
++    require(bool(model) && llama_model_size(model.get()) < 64 * 1024 * 1024 &&
++            (vocab_size!=n_vocab || llama_model_size(model.get())<1024*1024), "small model unavailable/oversized");
+     require(!fixture_gpu_device || llama_model_n_devices(model.get()) > 0, "fixture model did not use GPU");
+     return model;
+ }
+@@ -1028,10 +1032,202 @@
+     std::printf("PASS graph-owned sampler arenas: %s%s%s, %zu retained arenas\n", penalties?"penalties ":"seeded ", mixed?"mixed compact ":"detailed ",partial?"CPU suffix fallback":"",arenas);
+ }
+ 
++static void token_mask_operator() {
++    auto * device=fixture_gpu_device ? fixture_gpu_device : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
++    require(bool(backend),"mask backend unavailable");
++    ggml_context_ptr context(ggml_init({1024*1024,nullptr,true}));
++    auto * logits=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,n_vocab);
++    auto * words=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,(n_vocab+31)/32);
++    const std::vector<int32_t> ids={258,0,31,32,63,64,127,128,255,256,257,-1,259,30,33,65,129};
++    auto * filtered=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,ids.size());
++    auto * candidates=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,ids.size());
++    auto * full=ggml_token_mask(context.get(),logits,words,nullptr,n_vocab);
++    auto * partial=ggml_token_mask(context.get(),filtered,words,candidates,n_vocab);
++    auto * graph=ggml_new_graph(context.get());
++    ggml_build_forward_expand(graph,full); ggml_build_forward_expand(graph,partial);
++    require(ggml_backend_dev_supports_op(device,full),"mask kernel is not actually supported by selected backend");
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(context.get(),backend.get()));
++    require(bool(buffer),"mask operator buffer unavailable");
++    std::vector<float> input(n_vocab),small(ids.size()),out(n_vocab),sub(ids.size());
++    for(int i=0;i<n_vocab;++i) { input[i]=float(i-100)*.03f; }
++    const uint32_t negative_zero=0x80000000u,nan_bits=0x7fc12345u;
++    std::memcpy(&input[31],&negative_zero,4);std::memcpy(&input[63],&nan_bits,4);
++    for(size_t i=0;i<ids.size();++i) { small[i]=input[i]; }
++    std::vector<uint32_t> mask((n_vocab+31)/32);
++    for(int variant=0;variant<6;++variant) {
++        std::fill(mask.begin(),mask.end(),0);
++        for(int id=0;id<n_vocab;++id) { if((id+variant)%3) { mask[id/32]|=UINT32_C(1)<<(id%32); } }
++        ggml_backend_tensor_set(logits,input.data(),0,input.size()*4);
++        ggml_backend_tensor_set(filtered,small.data(),0,small.size()*4);
++        ggml_backend_tensor_set(candidates,ids.data(),0,ids.size()*4);
++        ggml_backend_tensor_set(words,mask.data(),0,mask.size()*4);
++        require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"mask operator compute failed");
++        ggml_backend_tensor_get(full,out.data(),0,out.size()*4);ggml_backend_tensor_get(partial,sub.data(),0,sub.size()*4);
++        for(int i=0;i<n_vocab;++i) {
++            const float expected=(mask[i/32]&(UINT32_C(1)<<(i%32))) ? input[i] : -INFINITY;
++            require(std::memcmp(&expected,&out[i],4)==0,"full mask changed allowed-logit bits");
++        }
++        for(size_t i=0;i<ids.size();++i) {
++            const int id=ids[i];
++            const float expected=id>=0 && id<n_vocab && (mask[id/32]&(UINT32_C(1)<<(id%32))) ? small[i] : -INFINITY;
++            require(std::memcmp(&expected,&sub[i],4)==0,"candidate-ID mask changed bits or indexed outside vocabulary");
++        }
++    }
++    std::puts("PASS token mask: actual kernel, odd vocabulary, high bits, reordered/invalid IDs, NaN and signed-zero bits");
++}
++
++static void grammar_mask_equivalence(llama_model * model) {
++    auto compare=[](llama_sampler * grammar) {
++        std::vector<llama_token_data> candidates(n_vocab);
++        for(int i=0;i<n_vocab;++i) { candidates[i]={i,0.f,0.f}; }
++        llama_token_data_array array{candidates.data(),candidates.size(),-1,false};
++        llama_sampler_apply(grammar,&array);
++        std::vector<uint32_t> words((n_vocab+31)/32);
++        require(llama_sampler_grammar_token_mask(grammar,words.data(),words.size()),"grammar mask export failed");
++        for(int i=0;i<n_vocab;++i) {
++            require(bool(words[i/32]&(UINT32_C(1)<<(i%32)))==(candidates[i].logit!=-INFINITY),"grammar mask changed UTF8/lazy/EOG rule");
++        }
++    };
++    const auto * vocab=llama_model_get_vocab(model);
++    llama_sampler_ptr unicode(llama_sampler_init_grammar(vocab,"root ::= \"\xc3\xa1\xc3\xa7\"\n","root"));
++    compare(unicode.get());compare(unicode.get());
++    require(llama_sampler_grammar_mask_cache_stats(unicode.get()).hits>0,"identical grammar state did not reuse bitset");
++    for(auto byte:{0xc3,0xa1,0xc3,0xa7}) { llama_sampler_accept(unicode.get(),3+byte);compare(unicode.get()); }
++    const llama_token trigger=3+'[';
++    llama_sampler_ptr lazy(llama_sampler_init_grammar_lazy(vocab,"root ::= \"[AB]\"\n","root",nullptr,0,&trigger,1));
++    compare(lazy.get());llama_sampler_accept(lazy.get(),3+'x');compare(lazy.get());
++    for(auto byte:{'[','A','B',']'}) { llama_sampler_accept(lazy.get(),3+byte);compare(lazy.get()); }
++    auto clone=llama_sampler_ptr(llama_sampler_clone(lazy.get()));compare(clone.get());
++    const std::string sequence="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
++    const std::string grammar="root ::= \""+sequence+"\"\n";
++    llama_sampler_ptr many(llama_sampler_init_grammar(vocab,grammar.c_str(),"root"));
++    for(unsigned char c:sequence) {
++        compare(many.get());
++        const auto stats=llama_sampler_grammar_mask_cache_stats(many.get());
++        require(stats.entries<=16 && stats.bytes<=1024*1024,"grammar-state mask cache exceeded its retained quota");
++        llama_sampler_accept(many.get(),3+c);
++    }
++    compare(many.get());llama_sampler_reset(many.get());compare(many.get());
++    require(llama_sampler_grammar_mask_cache_stats(many.get()).entries==1,"grammar reset retained stale stack pointers");
++    std::puts("PASS grammar bitsets: identical legacy rejection across partial UTF8, lazy triggers, EOG and clone");
++}
++
++static void grammar_first_backend(llama_model * model,bool compact,int output_limit=1) {
++    common_params_sampling aparams;
++    aparams.seed=424242;aparams.temp=.7f;aparams.top_k=20;aparams.top_p=.9f;
++    aparams.penalty_repeat=1.f;aparams.penalty_freq=aparams.penalty_present=0.f;
++    aparams.grammar_first=true;
++    aparams.grammar=common_grammar(COMMON_GRAMMAR_TYPE_USER,
++        compact ? "root ::= [A-Za-z0-9, ]+\n" : "root ::= ([A-Z] [0-9])+\n");
++    aparams.logit_bias={{0,-INFINITY},{1,-INFINITY},{2,-INFINITY}};
++    aparams.n_probs=compact ? 0 : 20;
++    auto bparams=aparams;bparams.backend_sampling=true;
++    common_sampler_ptr reference(common_sampler_init(model,aparams)),next(common_sampler_init(model,bparams));
++    auto params=llama_context_default_params();params.n_ctx=128;params.n_batch=params.n_ubatch=8;
++    params.n_outputs_max_per_seq=output_limit;params.n_threads=params.n_threads_batch=1;
++    const char * env=std::getenv("WILDLLAMA_GRAPH_VARIANTS_MIB");const std::string old_budget=env?env:"";
++    struct restore_budget {std::string value;~restore_budget(){graph_binding_budget(value.c_str());}} restore{old_budget};
++    graph_binding_budget("0");llama_context_ptr left(llama_init_from_model(model,params));
++    graph_binding_budget("64");llama_context_ptr right(llama_init_from_model(model,params));
++    require(left && right,"grammar-first contexts unavailable");
++    auto * backend=compact ? common_sampler_get_backend_selected_only(next.get()) : common_sampler_get_backend(next.get());
++    require(backend && llama_set_sampler(right.get(),0,backend),"grammar-first backend attach failed");
++    require(llama_sampler_backend_can_bind_graph(backend)==(output_limit==1),"multi-output constraint did not retain fallback");
++    llama_pos position=0;size_t arenas=0;int accepted=0;
++    const int shapes[]={1,3,2,3,1,3,2,1,3,2,3,1};
++    for(size_t step=0;step<sizeof(shapes)/sizeof(shapes[0]);++step) {
++        common_batch a(left.get()),b(right.get());
++        for(int i=0;i<shapes[step];++i) {
++            const bool output=output_limit>1 || i==shapes[step]-1;
++            a.add(3+'a'+int(step%19),position,0,output);b.add(3+'a'+int(step%19),position++,0,output);
++        }
++        require(llama_process(left.get(),LLAMA_PROCESS_TYPE_DECODE,a.get())==0 &&
++                llama_process(right.get(),LLAMA_PROCESS_TYPE_DECODE,b.get())==0,"grammar-first decode failed");
++        for(int i=output_limit>1 ? 0 : shapes[step]-1;i<shapes[step];++i) {
++            const auto token=common_sampler_sample(reference.get(),left.get(),i,true);
++            const auto actual=common_sampler_sample(next.get(),right.get(),i,true);
++            if(token!=actual) {std::fprintf(stderr,"grammar-first mismatch step%zu row%d compact%d limit%d: CPU%d backend%d\n",step,i,int(compact),output_limit,token,actual);}
++            if(!compact) {
++                const auto * x=common_sampler_get_candidates(reference.get(),true);
++                const auto * y=common_sampler_get_candidates(next.get(),true);
++                std::map<llama_token,float> expected,got;
++                for(size_t j=0;j<x->size;++j) {if(x->data[j].p>0.f){expected[x->data[j].id]=x->data[j].p;}}
++                for(size_t j=0;j<y->size;++j) {if(y->data[j].p>0.f){got[y->data[j].id]=y->data[j].p;}}
++                require(expected.size()==got.size(),"grammar-first distribution support changed");
++                for(const auto & item:expected) {require(got.count(item.first) && std::fabs(item.second-got[item.first])<2e-6f,"grammar-first distribution changed");}
++            }
++            require(token==actual,"grammar-first CPU/backend token or RNG changed");
++            common_sampler_accept(reference.get(),token,true);common_sampler_accept(next.get(),actual,true);
++            ++accepted;
++        }
++        if(step==5) {
++            common_sampler_ptr ac(common_sampler_clone(reference.get())),bc(common_sampler_clone(next.get()));
++            const auto perturb=3+(compact || accepted%2==0 ? 'Z' : '7');
++            common_sampler_accept(reference.get(),perturb,true);common_sampler_accept(next.get(),perturb,true);
++            common_sampler_copy(ac.get(),reference.get());common_sampler_copy(bc.get(),next.get());
++        }
++        arenas=std::max(arenas,right->get_graph_variant_stats().arenas);
++    }
++    require(output_limit>1 ? arenas==0 : arenas>0,"grammar-first graph-cache/fallback path not exercised");
++    auto default_params=aparams;default_params.grammar_first=false;default_params.backend_sampling=true;
++    common_sampler_ptr default_order(common_sampler_init(model,default_params));
++    require(!common_sampler_get_backend(default_order.get()) && !default_params.backend_sampling,"default grammar-last behavior changed");
++    auto controller_params=aparams;controller_params.backend_sampling=true;
++    controller_params.reasoning_budget_tokens=2;controller_params.reasoning_budget_start={3+'['};
++    controller_params.reasoning_budget_end={{3+']'}};controller_params.reasoning_budget_forced={3+']'};
++    common_sampler_ptr controller(common_sampler_init(model,controller_params));
++    require(!common_sampler_get_backend(controller.get()) && !controller_params.backend_sampling,"reasoning controller lost its CPU fallback");
++    std::printf("PASS grammar-first %s: same CPU/backend tokens, distributions/RNG/checkpoints, %zu arenas, output_limit%d\n",compact?"compact":"detailed",arenas,output_limit);
++}
++
++struct grammar_bench_result { std::vector<llama_token> tokens; double milliseconds; };
++static grammar_bench_result grammar_first_trial(llama_model * model,bool backend) {
++    common_params_sampling sampling;
++    sampling.seed=424242;sampling.temp=.7f;sampling.top_k=40;sampling.top_p=.9f;
++    sampling.penalty_repeat=1.f;sampling.penalty_freq=sampling.penalty_present=0.f;
++    sampling.backend_sampling=backend;sampling.grammar_first=true;sampling.n_probs=0;
++    sampling.logit_bias={{0,-INFINITY},{1,-INFINITY},{2,-INFINITY}};
++    sampling.grammar=common_grammar(COMMON_GRAMMAR_TYPE_USER,"root ::= [a-z0-9 ]+\n");
++    common_sampler_ptr sampler(common_sampler_init(model,sampling));
++    auto params=llama_context_default_params();params.n_ctx=128;params.n_batch=params.n_ubatch=8;
++    params.n_outputs_max_per_seq=1;params.n_threads=params.n_threads_batch=1;
++    graph_binding_budget("0");
++    llama_context_ptr context(llama_init_from_model(model,params));require(bool(context),"grammar benchmark context unavailable");
++    if(backend) { require(llama_set_sampler(context.get(),0,common_sampler_get_backend_selected_only(sampler.get())),"grammar benchmark backend attach failed"); }
++    constexpr int warmup=8,steps=64;
++    std::chrono::steady_clock::time_point start;
++    grammar_bench_result result;
++    for(int position=0;position<warmup+steps;++position) {
++        if(position==warmup) { start=std::chrono::steady_clock::now(); }
++        common_batch batch(context.get());batch.add(3+'x',position,0,true);
++        require(llama_process(context.get(),LLAMA_PROCESS_TYPE_DECODE,batch.get())==0,"grammar benchmark decode failed");
++        const auto token=common_sampler_sample(sampler.get(),context.get(),-1,true);
++        if(backend) {require(llama_get_sampled_token_ith(context.get(),-1)!=LLAMA_TOKEN_NULL,"grammar benchmark silently used CPU fallback");}
++        common_sampler_accept(sampler.get(),token,true);result.tokens.push_back(token);
++    }
++    result.milliseconds=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
++    return result;
++}
++static void grammar_first_benchmark(llama_model * model) {
++    const char * env=std::getenv("WILDLLAMA_GRAPH_VARIANTS_MIB");const std::string previous=env?env:"";
++    struct restore_budget {std::string value;~restore_budget(){graph_binding_budget(value.c_str());}} restore{previous};
++    const auto a0=grammar_first_trial(model,false),b0=grammar_first_trial(model,true),
++               b1=grammar_first_trial(model,true),a1=grammar_first_trial(model,false);
++    require(a0.tokens==b0.tokens && a0.tokens==b1.tokens && a0.tokens==a1.tokens,"grammar ABBA token/RNG mismatch");
++    const double cpu=(a0.milliseconds+a1.milliseconds)/2, accelerated=(b0.milliseconds+b1.milliseconds)/2;
++    std::printf("GRAMMAR_BENCH {\"vocab\":%d,\"steps\":64,\"cpu_first_ms\":%.3f,\"backend_first_ms\":%.3f,\"speedup\":%.4f,\"exact_tokens\":true}\n",
++        llama_vocab_n_tokens(llama_model_get_vocab(model)),cpu,accelerated,cpu/accelerated);
++}
++
+ int main(int argc, char ** argv) {
+     try {
+-        const bool cuda = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
+-        require(argc == 1 || cuda, "usage: test-sampler-output-view [--cuda]");
++        bool cuda=false,benchmark=false;
++        for(int i=1;i<argc;++i) {
++            if(std::strcmp(argv[i],"--cuda")==0) {cuda=true;}
++            else if(std::strcmp(argv[i],"--grammar-bench")==0) {benchmark=true;}
++            else {require(false,"usage: test-sampler-output-view [--cuda] [--grammar-bench]");}
++        }
+         require(ggml_backend_load(GGML_TEST_CPU_BACKEND_PATH), "explicit CPU backend unavailable");
+         if (cuda) {
+ #ifdef GGML_TEST_CUDA_BACKEND_PATH
+@@ -1048,8 +1244,14 @@
+         device->iface.init_backend = counted_init;
+         struct restore { ggml_backend_dev_t device; ~restore() { device->iface.init_backend = original_init; } } restore{device};
+         llama_backend_init();
++        if(benchmark) {auto wide=fixture_model(false,32768);grammar_first_benchmark(wide.get());return 0;}
+         auto model = fixture_model();
+         auto hybrid = fixture_model(true);
++        token_mask_operator();
++        grammar_mask_equivalence(model.get());
++        grammar_first_backend(model.get(),false);
++        grammar_first_backend(model.get(),true);
++        grammar_first_backend(model.get(),false,3);
+         graph_owned_sampler_variants(model.get(),false,false);
+         graph_owned_sampler_variants(model.get(),false,true);
+         graph_owned_sampler_variants(model.get(),true,false);
+diff --git a/tests/test-server-component.cpp b/tests/test-server-component.cpp
+--- a/tests/test-server-component.cpp
++++ b/tests/test-server-component.cpp
+@@ -3,6 +3,7 @@
+ #include "../tools/server/server-common.h"
+ #include "../tools/server/server-decision.h"
+ #include "../tools/server/server-task.h"
++#include "../tools/server/server-schema.h"
+ 
+ #include <cstdlib>
+ #include <regex>
+@@ -623,6 +624,20 @@
+     t.assert_equal("disabled controller has no accumulated timing", 0.0, control.window_us);
+ }
+ 
++static void test_grammar_first_request_contract(testing & t) {
++    common_params base;
++    auto evaluate=[&](const json & data) {return server_schema::eval_llama_cmpl_schema(nullptr,base,{},data);};
++    t.assert_true("grammar-last default",!evaluate(json::object()).sampling.grammar_first);
++    t.assert_true("explicit request enables first",evaluate({{"grammar_first",true}}).sampling.grammar_first);
++    base.sampling.grammar_first=true;
++    t.assert_true("process mode inherited",evaluate(json::object()).sampling.grammar_first);
++    t.assert_true("JSON false overrides process mode",!evaluate({{"grammar_first",false}}).sampling.grammar_first);
++    t.assert_true("JSON null inherits process mode",evaluate({{"grammar_first",nullptr}}).sampling.grammar_first);
++    bool rejected=false;
++    try {evaluate({{"grammar_first","true"}});} catch(const std::invalid_argument &) {rejected=true;}
++    t.assert_true("string cannot silently change order",rejected);
++}
++
+ int main(int argc, char ** argv) {
+     testing t;
+ 
+@@ -647,6 +662,7 @@
+     t.test("adaptive_speculation", test_adaptive_speculation);
+     t.test("speculation_cost_recovery", test_speculation_cost_recovery);
+     t.test("speculation_reference_and_clock", test_speculation_reference_and_clock);
++    t.test("grammar_first_request", test_grammar_first_request_contract);
+ 
+     return t.summary();
+ }
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -186,6 +186,8 @@
+ 
+     add((new field_bool("backend_sampling", params.sampling.backend_sampling))
+         ->set_desc("Use backend sampling instead of llama.cpp sampling"));
++    add((new field_bool("grammar_first", params.sampling.grammar_first))
++        ->set_desc("Explicitly apply grammar before sampling filters. With backend_sampling, single-output compatible chains use a GPU token mask. Default preserves grammar-last validation/resampling."));
+     add((new field_bool("speculative_adaptive", params.speculative_adaptive))
+         ->set_desc("Measure normal decoding and reduce draft work when verification is slower"));
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -83,6 +83,7 @@
+             {"timings_per_token",         timings_per_token},
+             {"post_sampling_probs",       post_sampling_probs},
+             {"backend_sampling",          sampling.backend_sampling},
++            {"grammar_first",             sampling.grammar_first},
+             {"lora",                      lora},
+         };
+     }
+@@ -142,6 +143,7 @@
+         {"timings_per_token",         timings_per_token},
+         {"post_sampling_probs",       post_sampling_probs},
+         {"backend_sampling",          sampling.backend_sampling},
++        {"grammar_first",             sampling.grammar_first},
+         {"lora",                      lora},
+     };
+ }

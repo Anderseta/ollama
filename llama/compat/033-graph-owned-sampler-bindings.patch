@@ -1,0 +1,788 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -856,6 +856,7 @@
+ 
+     synchronize();
+     graph_variants_clear();
++    graph_sampler_bindings_failed = false;
+ 
+     const int64_t t_start_us = ggml_time_us();
+ 
+@@ -1785,9 +1786,15 @@
+ 
+ size_t llama_context::graph_variant_retained_bytes() const {
+     size_t bytes = graph_variant_active ? graph_variant_bytes : 0;
++    const auto & primary = graph_variant_active ? graph_variants[0].results : gf_res_prev;
++    for (const auto & result : primary) {
++        if (result && !llama_graph_variant_policy::add_size(bytes, result->sampler_bindings_bytes)) {
++            return std::numeric_limits<size_t>::max();
++        }
++    }
+     if (graph_variant_active) {
+         for (const auto & result : gf_res_prev) {
+-            if (result && !llama_graph_variant_policy::add_size(bytes, result->buf_compute_meta.capacity())) {
++            if (result && !llama_graph_variant_policy::add_size(bytes, result->metadata_bytes())) {
+                 return std::numeric_limits<size_t>::max();
+             }
+         }
+@@ -1797,12 +1804,19 @@
+             return std::numeric_limits<size_t>::max();
+         }
+         for (const auto & result : graph_variants[i].results) {
+-            if (result && !llama_graph_variant_policy::add_size(bytes, result->buf_compute_meta.capacity())) {
++            if (result && !llama_graph_variant_policy::add_size(bytes, result->metadata_bytes())) {
+                 return std::numeric_limits<size_t>::max();
+             }
+         }
+     }
+     return bytes;
++}
++
++bool llama_context::graph_sampler_bindings_enabled() const {
++    return graph_variant_budget && !graph_sampler_bindings_failed && !sampling.samplers.empty() &&
++        std::all_of(sampling.samplers.begin(), sampling.samplers.end(), [](const auto & entry) {
++            return llama_sampler_backend_can_bind_graph(entry.second);
++        });
+ }
+ 
+ llama_context::graph_variant_selection llama_context::graph_variant_select(
+@@ -1810,11 +1824,12 @@
+     // Host-provider graphs have extra model-owned bindings that are not owned
+     // by a scheduler. Keep those, training, encoder and pipeline paths on the
+     // original arena. Fully resident dense and MoE models need no name list.
+-    // Backend samplers also own graph-input pointers: switching their RNG and
+-    // history alone would leave their input writes bound to the newest graph.
++    // Only complete builtin chains have an explicit graph-binding contract.
++    // Custom/partially supported chains stay on the original arena.
+     const bool eligible = graph_variant_budget && !graph_reuse_disable && !cparams.training &&
+         !cparams.pipeline_parallel && !cparams.warmup && !model.hparams.no_alloc && !moe_cache &&
+-        !model.ram_cache && sampling.samplers.empty() && !cparams.cb_eval && model.hparams.causal_attn &&
++        !model.ram_cache && (sampling.samplers.empty() || graph_sampler_bindings_enabled()) &&
++        !cparams.cb_eval && model.hparams.causal_attn &&
+         cparams.causal_attn &&
+         ubatch.token && !ubatch.embd &&
+         ubatch.n_tokens && ubatch.n_tokens <= llama_graph_variant_policy::max_tokens &&
+@@ -1913,6 +1928,10 @@
+                 result.reset(new llm_graph_result(max_nodes));
+             } else { result->reset(); }
+             auto * graph = model.build_graph(graph_params(result.get(), ubatch, mctx, gtype));
++            if (!result->sampler_bindings_ready()) {
++                graph_sampler_bindings_failed = true;
++                return nullptr;
++            }
+             // Apply the same input placement during preflight and allocation
+             // as the baseline arena. Its backend is also in can_reuse's key.
+             place_nextn_input(result.get(), sched.get(), nextn_input_backend());
+@@ -1988,6 +2007,7 @@
+ 
+     const bool reuse_current = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+     const auto selected = reuse_current ? graph_variant_selection::none : graph_variant_select(ubatch, mctx, gtype);
++    if (graph_sampler_bindings_failed) { graph_variants_clear(); }
+     if (selected != graph_variant_selection::none) {
+         res = get_gf_res_prev();
+         gf = res->get_gf();
+@@ -1999,6 +2019,9 @@
+         gf = res->get_gf();
+         gparams = graph_params(res, ubatch, mctx, gtype);
+     }
++    // An optional snapshot may have failed while a new arena was preflighted.
++    // Refresh even when we restored the same primary result pointer.
++    gparams.sampler_bindings = graph_sampler_bindings_enabled();
+ 
+     if (reuse_current || selected != graph_variant_selection::none) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+@@ -2021,6 +2044,24 @@
+         //const auto t_start_us = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
++
++        if (!res->sampler_bindings_ready() || res->sampler_bindings_bytes > graph_variant_budget) {
++            // The freshly built primary graph is still bound correctly. Stop
++            // retaining sampler graphs until the next reservation and keep
++            // ordinary inference available if snapshot allocation failed.
++            graph_sampler_bindings_failed = true;
++            res->disable_sampler_bindings();
++            graph_variants_clear();
++        }
++        // A conventional large request can grow primary snapshot metadata.
++        // Evict optional arenas rather than exceeding the extra-cache quota.
++        if (graph_variant_budget && graph_variant_retained_bytes() > graph_variant_budget) {
++            graph_variants_clear();
++            if (graph_variant_retained_bytes() > graph_variant_budget) {
++                graph_sampler_bindings_failed = true;
++                res->disable_sampler_bindings();
++            }
++        }
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -3260,6 +3301,7 @@
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
+         /*.nextn_input_backend =*/ nextn_input_backend(),
++        /*.sampler_bindings    =*/ res != gf_res_reserve.get() && graph_sampler_bindings_enabled(),
+     };
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -76,14 +76,18 @@
+     // excluding the primary reservation. No graph/scheduler pointers escape.
+     graph_variant_stats get_graph_variant_stats() const {
+         graph_variant_stats stats;
++        // The primary tensor arena is baseline memory, but its new sampler
++        // snapshots exist only for the optional cache and count towards it.
++        const auto & primary = graph_variant_active ? graph_variants[0].results : gf_res_prev;
++        for (const auto & result : primary) { if (result) { stats.metadata_bytes += result->sampler_bindings_bytes; } }
+         if (graph_variant_active) {
+             ++stats.arenas;
+             stats.compute_bytes += graph_variant_bytes;
+-            for (const auto & result : gf_res_prev) { if (result) { stats.metadata_bytes += result->buf_compute_meta.capacity(); } }
++            for (const auto & result : gf_res_prev) { if (result) { stats.metadata_bytes += result->metadata_bytes(); } }
+         }
+         for (size_t i = 1; i < graph_variants.size(); ++i) {
+             if (graph_variants[i].sched) { ++stats.arenas; stats.compute_bytes += graph_variants[i].bytes; }
+-            for (const auto & result : graph_variants[i].results) { if (result) { stats.metadata_bytes += result->buf_compute_meta.capacity(); } }
++            for (const auto & result : graph_variants[i].results) { if (result) { stats.metadata_bytes += result->metadata_bytes(); } }
+         }
+         return stats;
+     }
+@@ -317,6 +321,7 @@
+     void graph_variant_restore(size_t index);
+     void graph_variant_evict(size_t index);
+     size_t graph_variant_retained_bytes() const;
++    bool graph_sampler_bindings_enabled() const;
+ 
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+@@ -484,6 +489,7 @@
+     std::array<graph_variant_runtime, 5> graph_variants;
+     size_t graph_variant_active = 0;
+     size_t graph_variant_budget = 0;
++    bool graph_sampler_bindings_failed = false;
+     size_t graph_variant_bytes = 0;
+     uint64_t graph_variant_clock = 0;
+     uint64_t graph_variant_last_used = 0;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1363,6 +1363,40 @@
+     return res;
+ }
+ 
++llm_graph_input_sampling::llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
++    samplers(std::move(samplers)) { }
++
++llm_graph_input_sampling::~llm_graph_input_sampling() = default;
++
++bool llm_graph_input_sampling::capture_bindings() {
++    return capture_bindings(llama_sampler_backend_capture_bindings);
++}
++
++bool llm_graph_input_sampling::capture_bindings(binding_factory capture) {
++    try {
++        for (const auto & entry : samplers) {
++            auto binding = capture(entry.second);
++            if (!binding) { bindings.clear(); return false; }
++            bindings.emplace(entry.first, std::move(binding));
++        }
++        return true;
++    } catch (const std::bad_alloc &) {
++        // This is an optional cache. The newly built graph's original binding
++        // remains valid, so inference can continue in the conventional arena.
++        bindings.clear();
++        return false;
++    }
++}
++
++size_t llm_graph_input_sampling::binding_bytes() const {
++    size_t bytes = 0;
++    for (const auto & entry : bindings) {
++        // Include a conservative map-node allowance, not just pointer payloads.
++        bytes += sizeof(entry) + 4*sizeof(void *) + entry.second->memory_size();
++    }
++    return bytes;
++}
++
+ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
+     // set the inputs only for the active samplers in the current ubatch
+     std::unordered_set<llama_seq_id> active_samplers;
+@@ -1381,6 +1415,19 @@
+         auto & sampler = samplers[seq_id];
+ 
+         if (sampler->iface->backend_set_input) {
++            const auto binding = bindings.find(seq_id);
++            auto * owned = binding == bindings.end() ? nullptr : binding->second.get();
++            // The logical sampler owns one RNG/history across all arenas. Only
++            // tensor pointers and graph scratch are exchanged, then restored
++            // even if an input callback throws. No per-token state copying.
++            struct binding_scope {
++                llama_sampler_graph_binding * binding;
++                llama_sampler * sampler;
++                binding_scope(llama_sampler_graph_binding * b, llama_sampler * s) : binding(b), sampler(s) {
++                    if (binding) { binding->swap_bindings(sampler); }
++                }
++                ~binding_scope() { if (binding) { binding->swap_bindings(sampler); } }
++            } scope(owned, sampler);
+             sampler->iface->backend_set_input(sampler);
+         }
+     }
+@@ -1392,8 +1439,13 @@
+     }
+ 
+     for (const auto & [seq_id, sampler] : params.samplers) {
+-        if (samplers[seq_id] != sampler) {
++        const auto previous = samplers.find(seq_id);
++        if (previous == samplers.end() || previous->second != sampler) {
+             return false;
++        }
++        if (params.sampler_bindings) {
++            const auto binding = bindings.find(seq_id);
++            if (binding == bindings.end() || !binding->second->matches(sampler)) { return false; }
+         }
+     }
+ 
+@@ -1432,6 +1484,9 @@
+     t_candidates.clear();
+ 
+     params = {};
++    sampler_bindings_bytes = 0;
++    sampler_bindings_owned = false;
++    sampling_input = nullptr;
+ 
+     inputs.clear();
+     fused_nodes.clear();
+@@ -1454,6 +1509,13 @@
+     for (auto & input : inputs) {
+         input->set_input(ubatch);
+     }
++}
++
++void llm_graph_result::disable_sampler_bindings() {
++    params.sampler_bindings = false;
++    if (sampling_input) { sampling_input->bindings.clear(); }
++    sampler_bindings_bytes = 0;
++    sampler_bindings_owned = false;
+ }
+ 
+ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+@@ -4326,6 +4388,7 @@
+ 
+ void llm_graph_context::build_sampling() const {
+     if (samplers.empty() || !res->t_logits) {
++        res->sampler_bindings_owned = true;
+         return;
+     }
+ 
+@@ -4333,6 +4396,8 @@
+     outs[0] = res->t_logits;
+ 
+     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
++    auto * sampling_input = inp_sampling.get();
++    res->sampling_input = sampling_input;
+     res->add_input(std::move(inp_sampling));
+ 
+     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
+@@ -4426,6 +4491,11 @@
+         }
+     }
+ 
++    if (res->wants_sampler_bindings()) {
++        res->sampler_bindings_owned = sampling_input->capture_bindings();
++        res->sampler_bindings_bytes = sampling_input->binding_bytes();
++    }
++
+     // TODO: Call backend_accept after all samplers have been applied.
+     /*
+     for (const auto & [seq_id, sampler] : samplers) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -761,16 +761,21 @@
+     const llama_memory_hybrid_iswa_context * mctx;
+ };
+ 
++class llama_sampler_graph_binding;
+ class llm_graph_input_sampling : public llm_graph_input_i {
+ public:
+-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
+-        samplers(std::move(samplers)) { }
+-    virtual ~llm_graph_input_sampling() = default;
+-
+-    void set_input(const llama_ubatch * ubatch) override;
+-    bool can_reuse(const llm_graph_params & params) override;
++    LLAMA_API explicit llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers);
++    LLAMA_API virtual ~llm_graph_input_sampling();
++
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++    bool capture_bindings();
++    using binding_factory = std::unique_ptr<llama_sampler_graph_binding> (*)(llama_sampler *);
++    LLAMA_API bool capture_bindings(binding_factory capture);
++    LLAMA_API size_t binding_bytes() const;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
++    std::map<llama_seq_id, std::unique_ptr<llama_sampler_graph_binding>> bindings;
+ };
+ 
+ //
+@@ -837,6 +842,10 @@
+     // Placement of NextN inputs is part of an arena's immutable allocation
+     // contract. A graph captured with CPU staging cannot serve device inputs.
+     ggml_backend_t nextn_input_backend = nullptr;
++
++    // Input pointers are owned by this graph, not by the most recently built
++    // graph attached to a logical sampler. Part of the reuse contract.
++    bool sampler_bindings = false;
+ 
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+@@ -902,6 +911,7 @@
+         }
+ 
+         return
++            sampler_bindings               == other.sampler_bindings               &&
+             nextn_input_backend             == other.nextn_input_backend             &&
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+@@ -964,6 +974,14 @@
+     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+ 
+     void set_params(const llm_graph_params & params);
++
++    bool wants_sampler_bindings() const { return params.sampler_bindings; }
++    bool sampler_bindings_ready() const { return !params.sampler_bindings || sampler_bindings_owned; }
++    void disable_sampler_bindings();
++    size_t metadata_bytes() const { return buf_compute_meta.capacity() + sampler_bindings_bytes; }
++    size_t sampler_bindings_bytes = 0;
++    bool sampler_bindings_owned = false;
++    llm_graph_input_sampling * sampling_input = nullptr;
+ 
+     // important graph nodes
+     ggml_tensor * t_inp_tokens  = nullptr;
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -8,6 +8,7 @@
+ #include "ggml-cpp.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <algorithm>
+ #include <cassert>
+ #include <cfloat>
+@@ -876,6 +877,7 @@
+ };
+ 
+ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params) {
++    static std::atomic<uint64_t> next_graph_binding_id{1};
+     return llama_sampler_init(
+         /* .iface = */ &llama_sampler_chain_i,
+         /* .ctx   = */ new llama_sampler_chain {
+@@ -883,6 +885,8 @@
+             /* .is_init              = */ false,
+             /* .selected_only        = */ false,
+             /* .backend_selects_token = */ false,
++            /* .graph_binding_id       = */ next_graph_binding_id.fetch_add(1, std::memory_order_relaxed),
++            /* .graph_binding_revision = */ 0,
+             /* .n_nodes              = */ 0,
+             /* .samplers             = */ {},
+             /* .cur                  = */ {},
+@@ -1001,6 +1005,7 @@
+         /* .is_backend = */ false,
+         /* .ptr        = */ smpl,
+     });
++    ++p->graph_binding_revision;
+ }
+ 
+ struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
+@@ -1034,6 +1039,7 @@
+ 
+     auto * result = p->samplers[i].ptr;
+     p->samplers.erase(p->samplers.begin() + i);
++    ++p->graph_binding_revision;
+ 
+     return result;
+ }
+@@ -4400,6 +4406,142 @@
+     return !accept || accept == llama_sampler_empty_accept || accept == llama_sampler_dist_accept;
+ }
+ 
++// Graph binding snapshots deliberately contain no RNG, penalty history, token
++// counters or candidate arrays. Restoring sampler state must never redirect an
++// input write to another graph's compute arena.
++namespace {
++bool graph_binding_leaf(const llama_sampler_i * iface) {
++    return iface == &llama_sampler_empty_i     || iface == &llama_sampler_greedy_i ||
++           iface == &llama_sampler_dist_i      || iface == &llama_sampler_top_k_i  ||
++           iface == &llama_sampler_top_p_i     || iface == &llama_sampler_min_p_i  ||
++           iface == &llama_sampler_temp_i      || iface == &llama_sampler_temp_ext_i ||
++           iface == &llama_sampler_penalties_i || iface == &llama_sampler_logit_bias_i;
++}
++
++class sampler_graph_binding final : public llama_sampler_graph_binding {
++    struct entry {
++        llama_sampler * identity = nullptr;
++        const llama_sampler_i * iface = nullptr;
++        const void * context = nullptr;
++        uint64_t chain_id = 0, chain_revision = 0;
++        size_t children = 0;
++        bool selected_only = false, selects_token = false;
++
++        // dist's graph inputs and immutable per-graph draw mode.
++        std::vector<ggml_tensor *> uniforms;
++        bool transactional = false;
++
++        // penalties/logit-bias graph inputs. Penalty scratch follows the graph
++        // geometry, without cloning or exchanging the logical token history.
++        ggml_tensor * input0 = nullptr, * input1 = nullptr;
++        int32_t n_max = 0;
++        bool has_candidates = false;
++        std::vector<int32_t> token_ids, counts;
++    };
++    std::vector<entry> entries;
++
++    void capture(llama_sampler * sampler) {
++        entry e;
++        e.identity = sampler; e.iface = sampler->iface; e.context = sampler->ctx;
++        if (sampler->iface == &llama_sampler_chain_i) {
++            const auto & chain = *static_cast<llama_sampler_chain *>(sampler->ctx);
++            e.chain_id = chain.graph_binding_id; e.chain_revision = chain.graph_binding_revision;
++            e.children = chain.samplers.size(); e.selected_only = chain.selected_only;
++            e.selects_token = chain.backend_selects_token;
++        } else if (sampler->iface == &llama_sampler_dist_i) {
++            const auto & ctx = *static_cast<llama_sampler_dist *>(sampler->ctx);
++            e.uniforms = ctx.inp_uniforms; e.transactional = ctx.backend_transactional;
++        } else if (sampler->iface == &llama_sampler_penalties_i) {
++            const auto & ctx = *static_cast<llama_sampler_penalties *>(sampler->ctx);
++            e.input0 = ctx.inp_token_ids; e.input1 = ctx.inp_counts;
++            e.n_max = ctx.n_max; e.has_candidates = ctx.has_candidates;
++            e.token_ids = ctx.host_token_ids; e.counts = ctx.host_counts;
++        } else if (sampler->iface == &llama_sampler_logit_bias_i) {
++            const auto & ctx = *static_cast<llama_sampler_logit_bias *>(sampler->ctx);
++            e.input0 = ctx.inp_logit_bias; e.input1 = ctx.inp_logit_idxs;
++        }
++        entries.push_back(std::move(e));
++        if (sampler->iface == &llama_sampler_chain_i) {
++            for (const auto & child : static_cast<llama_sampler_chain *>(sampler->ctx)->samplers) {
++                capture(child.ptr);
++            }
++        }
++    }
++
++    bool matches_impl(const llama_sampler * sampler, size_t & index) const noexcept {
++        if (!sampler || index >= entries.size()) { return false; }
++        const auto & e = entries[index++];
++        // Compare identities before inspecting live objects. Stored identities
++        // are never dereferenced; destruction/replacement may precede eviction.
++        if (e.identity != sampler || e.iface != sampler->iface || e.context != sampler->ctx) { return false; }
++        if (sampler->iface == &llama_sampler_chain_i) {
++            const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++            if (!chain.is_init || e.chain_id != chain.graph_binding_id ||
++                e.chain_revision != chain.graph_binding_revision || e.children != chain.samplers.size() ||
++                e.selected_only != chain.selected_only || e.selects_token != chain.backend_selects_token) { return false; }
++            for (const auto & child : chain.samplers) {
++                if (!child.is_backend || !matches_impl(child.ptr, index)) { return false; }
++            }
++        }
++        return true;
++    }
++public:
++    explicit sampler_graph_binding(llama_sampler * sampler) { capture(sampler); }
++
++    bool matches(const llama_sampler * sampler) const noexcept override {
++        size_t index = 0;
++        return matches_impl(sampler, index) && index == entries.size();
++    }
++
++    void swap_bindings(llama_sampler * sampler) noexcept override {
++        GGML_ASSERT(matches(sampler));
++        for (auto & e : entries) {
++            if (e.iface == &llama_sampler_dist_i) {
++                auto & ctx = *static_cast<llama_sampler_dist *>(e.identity->ctx);
++                ctx.inp_uniforms.swap(e.uniforms);
++                std::swap(ctx.backend_transactional, e.transactional);
++            } else if (e.iface == &llama_sampler_penalties_i) {
++                auto & ctx = *static_cast<llama_sampler_penalties *>(e.identity->ctx);
++                std::swap(ctx.inp_token_ids, e.input0); std::swap(ctx.inp_counts, e.input1);
++                std::swap(ctx.n_max, e.n_max); std::swap(ctx.has_candidates, e.has_candidates);
++                ctx.host_token_ids.swap(e.token_ids); ctx.host_counts.swap(e.counts);
++            } else if (e.iface == &llama_sampler_logit_bias_i) {
++                auto & ctx = *static_cast<llama_sampler_logit_bias *>(e.identity->ctx);
++                std::swap(ctx.inp_logit_bias, e.input0); std::swap(ctx.inp_logit_idxs, e.input1);
++            }
++        }
++    }
++
++    size_t memory_size() const noexcept override {
++        size_t bytes = sizeof(*this) + entries.capacity()*sizeof(entry);
++        for (const auto & e : entries) {
++            bytes += e.uniforms.capacity()*sizeof(ggml_tensor *);
++            bytes += (e.token_ids.capacity() + e.counts.capacity())*sizeof(int32_t);
++        }
++        return bytes;
++    }
++};
++} // namespace
++
++bool llama_sampler_backend_can_bind_graph(const llama_sampler * sampler) {
++    if (!sampler || !sampler->iface) { return false; }
++    if (sampler->iface == &llama_sampler_chain_i) {
++        const auto & chain = *static_cast<const llama_sampler_chain *>(sampler->ctx);
++        return chain.is_init && !chain.samplers.empty() &&
++            std::all_of(chain.samplers.begin(), chain.samplers.end(), [](const llama_sampler_chain::info & child) {
++                return child.is_backend && llama_sampler_backend_can_bind_graph(child.ptr);
++            });
++    }
++    // Custom callbacks may retain additional tensor pointers. They require an
++    // explicit binding contract before they can use multiple graph arenas.
++    return graph_binding_leaf(sampler->iface);
++}
++
++std::unique_ptr<llama_sampler_graph_binding> llama_sampler_backend_capture_bindings(llama_sampler * sampler) {
++    if (!llama_sampler_backend_can_bind_graph(sampler)) { return nullptr; }
++    return std::unique_ptr<llama_sampler_graph_binding>(new sampler_graph_binding(sampler));
++}
++
+ // perf
+ 
+ struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ 
+ #include <vector>
++#include <memory>
+ 
+ struct llama_vocab;
+ struct llama_grammar;
+@@ -19,6 +20,10 @@
+     // chain produced a selected token. Partial/unsupported chains keep outputs.
+     bool selected_only = false;
+     bool backend_selects_token = false;
++
++    // Lifetime/topology identity for graph bindings, never copied as RNG state.
++    uint64_t graph_binding_id = 0;
++    uint64_t graph_binding_revision = 0;
+ 
+     uint32_t n_nodes = 0;
+ 
+@@ -50,6 +55,20 @@
+ LLAMA_API bool llama_sampler_backend_selected_only_ready(const llama_sampler * sampler);
+ void llama_sampler_backend_begin(llama_sampler * sampler);
+ 
++// A graph owns tensor bindings, while the original sampler remains the only
++// owner of RNG/history. Swapping is allocation-free and must be undone before
++// accepting, cloning, resetting or destroying a sampler. Destruction never
++// dereferences a sampler, which may already have been replaced by the caller.
++class llama_sampler_graph_binding {
++public:
++    virtual ~llama_sampler_graph_binding() = default;
++    virtual bool matches(const llama_sampler * sampler) const noexcept = 0;
++    virtual void swap_bindings(llama_sampler * sampler) noexcept = 0;
++    virtual size_t memory_size() const noexcept = 0;
++};
++LLAMA_API bool llama_sampler_backend_can_bind_graph(const llama_sampler * sampler);
++LLAMA_API std::unique_ptr<llama_sampler_graph_binding> llama_sampler_backend_capture_bindings(llama_sampler * sampler);
++
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+         float   dry_base,
+diff --git a/tests/test-graph-variants.cpp b/tests/test-graph-variants.cpp
+--- a/tests/test-graph-variants.cpp
++++ b/tests/test-graph-variants.cpp
+@@ -162,7 +162,8 @@
+             require(malformed.peak_arenas == 0, "invalid budget enabled retention");
+             require(limited.peak_arenas < cached.peak_arenas, "small budget admission was not exercised");
+             require(sampler_baseline.sampled == sampler_cached.sampled, "fallback changed stochastic RNG");
+-            require(sampler_cached.peak_arenas == 0, "backend sampler graph bindings were retained");
++            require(sampler_cached.peak_arenas > 0, "backend sampler graph bindings were not retained");
++            require(sampler_cached.reused > sampler_baseline.reused, "backend sampler shapes were rebuilt rather than reused");
+             std::printf("graph variants: PASS, reused %d -> %d; peak %zu arenas / %zu compute bytes\n",
+                     baseline.reused, cached.reused, cached.peak_arenas, cached.peak_compute_bytes);
+         } catch (...) { llama_model_free(model); throw; }
+diff --git a/tests/test-sampler-output-view.cpp b/tests/test-sampler-output-view.cpp
+--- a/tests/test-sampler-output-view.cpp
++++ b/tests/test-sampler-output-view.cpp
+@@ -3,6 +3,7 @@
+ #include "../ggml/src/ggml-backend-impl.h"
+ #include "../src/llama-ext.h"
+ #include "../src/llama-sampler.h"
++#include "../src/llama-context.h"
+ #include "sampling.h"
+ #include "reasoning-budget.h"
+ 
+@@ -876,6 +877,157 @@
+     require(!common_sampler_get_backend_selected_only(grammar.get()), "grammar changed its CPU fallback");
+ }
+ 
++static void graph_binding_budget(const char * value) {
++#ifdef _WIN32
++    require(_putenv_s("WILDLLAMA_GRAPH_VARIANTS_MIB", value) == 0, "graph binding budget failed");
++#else
++    require(setenv("WILDLLAMA_GRAPH_VARIANTS_MIB", value, 1) == 0, "graph binding budget failed");
++#endif
++}
++
++static llama_sampler_ptr graph_binding_chain(int seed, bool compact, bool penalties, bool partial = false) {
++    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    const llama_logit_bias biases[] = {{0, -INFINITY}, {1, -INFINITY}, {2, -INFINITY}, {3+'a', .1f}};
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(n_vocab, 4, biases));
++    if (penalties) { llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 8, 1.1f, .1f, .1f)); }
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(20));
++    if (partial) { llama_sampler_chain_add(chain.get(), llama_sampler_init_typical(.8f, 1)); }
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(.7f));
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
++    if (compact) { require(llama_sampler_backend_set_selected_only(chain.get()), "compact graph binding contract failed"); }
++    return chain;
++}
++
++static int binding_capture_calls = 0;
++static std::unique_ptr<llama_sampler_graph_binding> binding_capture_failure(llama_sampler * sampler) {
++    if (++binding_capture_calls == 2) { throw std::bad_alloc(); }
++    return llama_sampler_backend_capture_bindings(sampler);
++}
++
++static void graph_binding_outputs(const llama_sampler_output & a, const llama_sampler_output & b) {
++    require(a.sampled_token == b.sampled_token && a.sampled_probs_count == b.sampled_probs_count &&
++            a.sampled_logits_count == b.sampled_logits_count && a.candidates_count == b.candidates_count,
++            "graph arena changed sampler output shape/token");
++    require(bool(a.raw_logits) == bool(b.raw_logits) && bool(a.sampled_probs) == bool(b.sampled_probs) &&
++            bool(a.sampled_logits) == bool(b.sampled_logits) && bool(a.candidates) == bool(b.candidates),
++            "graph arena changed sampler output availability");
++    if (a.raw_logits) { require(std::equal(a.raw_logits, a.raw_logits+n_vocab, b.raw_logits), "graph arena changed raw logits"); }
++    if (a.sampled_probs) { require(std::equal(a.sampled_probs, a.sampled_probs+a.sampled_probs_count, b.sampled_probs), "graph arena changed probabilities"); }
++    if (a.sampled_logits) { require(std::equal(a.sampled_logits, a.sampled_logits+a.sampled_logits_count, b.sampled_logits), "graph arena changed filtered logits"); }
++    if (a.candidates) { require(std::equal(a.candidates, a.candidates+a.candidates_count, b.candidates), "graph arena changed candidate IDs"); }
++}
++
++static void graph_owned_sampler_variants(llama_model * model, bool penalties, bool mixed, bool partial = false) {
++    // Construct the same tiny CPU/CUDA model with different graph retention
++    // policies. The contexts snapshot their environment at construction.
++    const char * old_env = std::getenv("WILDLLAMA_GRAPH_VARIANTS_MIB");
++    const std::string old_budget = old_env ? old_env : "";
++    struct restore_budget { std::string value; ~restore_budget() { graph_binding_budget(value.c_str()); } } restore{old_budget};
++    auto make_context = [&](const char * budget) {
++        graph_binding_budget(budget);
++        auto params = llama_context_default_params();
++        params.n_ctx = 256; params.n_batch = params.n_ubatch = 8; params.n_seq_max = 2; params.n_rs_seq = 2;
++        params.n_outputs_max_per_seq = penalties ? 1 : 3;
++        params.n_threads = params.n_threads_batch = 1; params.no_perf = false;
++        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
++        llama_context_ptr context(llama_init_from_model(model, params));
++        require(bool(context), "graph binding context unavailable"); return context;
++    };
++    auto left = make_context("0"), right = make_context("64");
++    std::vector<llama_sampler_ptr> a, b;
++    for (int seq = 0; seq < 2; ++seq) {
++        const bool compact = mixed && seq == 0;
++        a.push_back(graph_binding_chain(451+seq, compact, penalties, partial));
++        b.push_back(graph_binding_chain(451+seq, compact, penalties, partial));
++        require(llama_set_sampler(left.get(), seq, a.back().get()) && llama_set_sampler(right.get(), seq, b.back().get()),
++                "graph binding sampler attach failed");
++        require(llama_sampler_backend_can_bind_graph(b.back().get()) == !partial, "graph binding capability accepted CPU suffix");
++    }
++    llama_pos positions[2]{};
++    size_t arenas = 0;
++    // Repeated A B C B A shapes plus sparse/reordered sequence rows. The same
++    // logical RNG/history must fill each old arena, not the newest one built.
++    const int shapes[] = {1,3,2,3,1,4,3,2,3,1,4,3,2,3,1};
++    for (size_t step=0; step<sizeof(shapes)/sizeof(shapes[0]); ++step) {
++        if (step == 10) {
++            for (int seq=0; seq<2; ++seq) {
++                auto na=graph_binding_chain(981+seq, mixed && seq==0, penalties, partial);
++                auto nb=graph_binding_chain(981+seq, mixed && seq==0, penalties, partial);
++                require(llama_set_sampler(left.get(),seq,na.get()) && llama_set_sampler(right.get(),seq,nb.get()), "replacement attach failed");
++                // Destroy the old sampler BEFORE reserve/arena invalidation.
++                a[seq]=std::move(na); b[seq]=std::move(nb);
++            }
++        }
++        std::vector<llama_sampler_ptr> checkpoints_a, checkpoints_b;
++        if (step==6) {
++            for (int seq=0; seq<2; ++seq) {
++                checkpoints_a.emplace_back(llama_sampler_clone(a[seq].get()));
++                checkpoints_b.emplace_back(llama_sampler_clone(b[seq].get()));
++                require(!llama_sampler_backend_capture_bindings(checkpoints_b.back().get()), "clone borrowed graph bindings");
++            }
++        }
++        common_batch ba(left.get()), bb(right.get());
++        std::vector<std::pair<int,int>> outputs;
++        const int n=shapes[step];
++        int last[2]={-1,-1};
++        for (int i=0;i<n;++i) { last[(n==1 ? 0 : (i+1)%2)]=i; }
++        for (int i=0;i<n;++i) {
++            const int seq=n==1 ? 0 : (i+1)%2;
++            const bool output=i==last[seq] || (!penalties && n==4 && i==0);
++            const auto token=3+'a'+int((step+i)%21);
++            ba.add(token,positions[seq],seq,output); bb.add(token,positions[seq],seq,output);
++            ++positions[seq];
++            if (output) { outputs.emplace_back(i,seq); }
++        }
++        require(llama_process(left.get(),LLAMA_PROCESS_TYPE_DECODE,ba.get())==0 &&
++                llama_process(right.get(),LLAMA_PROCESS_TYPE_DECODE,bb.get())==0, "graph binding shape decode failed");
++        for (const auto & item:outputs) {
++            const auto av=llama_get_sampler_output_ith(left.get(),item.first);
++            const auto bv=llama_get_sampler_output_ith(right.get(),item.first);
++            graph_binding_outputs(av,bv);
++            require(partial || bv.sampled_token!=LLAMA_TOKEN_NULL, "graph binding fixture did not sample on backend");
++            // Do not commit the second generated row: the next decode must
++            // resume from accepted RNG state, regardless of selected arena.
++            if (!penalties && n==4 && item.first==2 && item.second==1) { continue; }
++            const auto expected=llama_sampler_sample(a[item.second].get(),left.get(),item.first);
++            const auto actual=llama_sampler_sample(b[item.second].get(),right.get(),item.first);
++            require(expected==actual,"graph-owned input binding changed logical RNG/history");
++        }
++        if (step==6) {
++            for (int seq=0;seq<2;++seq) {
++                llama_sampler_copy(checkpoints_a[seq].get(),a[seq].get());
++                llama_sampler_copy(checkpoints_b[seq].get(),b[seq].get());
++                llama_sampler_accept(a[seq].get(),3+'q'); llama_sampler_accept(b[seq].get(),3+'q');
++            }
++        }
++        const auto stats=right->get_graph_variant_stats();
++        arenas=std::max(arenas,stats.arenas);
++        require(stats.compute_bytes+stats.metadata_bytes<=64*1024*1024,"sampler bindings escaped graph retention quota");
++    }
++    if (partial) { require(arenas==0,"partial/custom chain retained graph bindings"); }
++    else {
++        require(arenas>0 && llama_perf_context(right.get()).n_reused>llama_perf_context(left.get()).n_reused,
++                "stochastic fixture never used the graph variant cache");
++        llm_graph_input_sampling failed({{0,b[0].get()},{1,b[1].get()}});
++        binding_capture_calls=0;
++        require(!failed.capture_bindings(binding_capture_failure) && failed.bindings.empty() && failed.binding_bytes()==0,
++                "partial snapshot allocation failure retained borrowed bindings");
++        auto binding=llama_sampler_backend_capture_bindings(b[0].get());
++        require(binding && binding->matches(b[0].get()),"live graph binding not matched");
++        auto * terminal=llama_sampler_chain_remove(b[0].get(),llama_sampler_chain_n(b[0].get())-1);
++        require(!binding->matches(b[0].get()),"removed stage kept graph binding valid");
++        llama_sampler_chain_add(b[0].get(),terminal);
++        require(!binding->matches(b[0].get()),"re-added stage kept old graph binding valid");
++        int live=0; bool fail=false;
++        llama_sampler_ptr custom(tracked_sampler(&live,&fail));
++        require(!llama_sampler_backend_can_bind_graph(custom.get()),"custom callback claimed graph binding capability");
++    }
++    // Bindings may outlive their logical sampler at destruction. Detach before
++    // vector cleanup, matching an ordinary client replacing a sampler.
++    for(int seq=0;seq<2;++seq) { llama_set_sampler(left.get(),seq,nullptr); llama_set_sampler(right.get(),seq,nullptr); }
++    std::printf("PASS graph-owned sampler arenas: %s%s%s, %zu retained arenas\n", penalties?"penalties ":"seeded ", mixed?"mixed compact ":"detailed ",partial?"CPU suffix fallback":"",arenas);
++}
++
+ int main(int argc, char ** argv) {
+     try {
+         const bool cuda = argc == 2 && std::strcmp(argv[1], "--cuda") == 0;
+@@ -898,6 +1050,11 @@
+         llama_backend_init();
+         auto model = fixture_model();
+         auto hybrid = fixture_model(true);
++        graph_owned_sampler_variants(model.get(),false,false);
++        graph_owned_sampler_variants(model.get(),false,true);
++        graph_owned_sampler_variants(model.get(),true,false);
++        graph_owned_sampler_variants(hybrid.get(),false,true);
++        graph_owned_sampler_variants(model.get(),false,false,true);
+         permutation_views(hybrid.get());
+         common_params_sampling params;
+         params.seed = 424242; params.temp = .7f; params.top_k = 20; params.top_p = .9f;

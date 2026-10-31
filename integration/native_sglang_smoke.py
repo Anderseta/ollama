@@ -67,7 +67,7 @@ def compare_outputs(before, after, probability_tolerance=0.0):
     return metrics
 
 
-def run_payload(executable, model, output_dir, label, gpu, speculative, resident_caches=False):
+def run_payload(executable, model, output_dir, label, gpu, speculative, resident_caches=False, device_mask=False):
     (output_dir / "cuda-cache").mkdir(parents=True, exist_ok=True)
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
@@ -92,7 +92,9 @@ def run_payload(executable, model, output_dir, label, gpu, speculative, resident
         # Unknown additive settings are ignored by the reference payload. Both
         # payloads keep exactly the same context, weights and sampling inputs.
         env.update(WILDLLAMA_GRAPH_VARIANTS_MIB="32",
-                   WILDLLAMA_PREFIX_RETAIN_TOKENS="256")
+                   WILDLLAMA_PREFIX_RETAIN_TOKENS="1024" if device_mask else "256")
+    if device_mask:
+        env["WILDLLAMA_DEVICE_MASK"] = "1"
     if gpu:
         suffix = "ggml-cuda.dll" if os.name == "nt" else "libggml-cuda.so"
         candidates = [executable.parent / "cuda_v12" / suffix,
@@ -108,12 +110,19 @@ def run_payload(executable, model, output_dir, label, gpu, speculative, resident
                                             env.get(library_path, "")))
     else:
         env["CUDA_VISIBLE_DEVICES"] = ""
-    args = [str(executable), "--model", str(model), "--ctx-size", "1024",
-            "--batch-size", "128", "--ubatch-size", "128", "--parallel", "2",
+    args = [str(executable), "--model", str(model), "--ctx-size", "4096" if device_mask else "1024",
+            "--batch-size", "512" if device_mask else "128",
+            "--ubatch-size", "512" if device_mask else "128", "--parallel", "2",
             "--threads", "1", "--threads-batch", "1", "--cache-ram", "32",
             "--no-warmup", "--no-webui", "--host", "127.0.0.1", "--port", str(port),
             "--n-gpu-layers", "99" if gpu else "0"]
     args += ["--device", "CUDA0" if gpu else "none"]
+    if device_mask:
+        # The local synthetic Llama fixture declares only 256 training tokens.
+        # Override that fixture metadata identically in both isolated servers;
+        # otherwise the native HTTP slot caps the 512-token mask case at 256.
+        # No GGUF bytes, user model or saved setting is changed.
+        args += ["--log-verbosity", "5", "--override-kv", "llama.context_length=int:4096"]
     if resident_caches:
         args += ["--kv-unified"]
     if speculative:
@@ -155,7 +164,7 @@ def run_payload(executable, model, output_dir, label, gpu, speculative, resident
 
             results = []
             # Repeated and branching prefixes exercise cache replacement/restore.
-            prefix = list(range(20, 84))
+            prefix = [20 + i % 200 for i in range(512)] if device_mask else list(range(20, 84))
             for suffix in ([100], [101], [102], [100], [103], [101]):
                 results.append(stable(complete(prefix + suffix)))
             # Preserve both sampling and final candidate probability responses.
@@ -216,13 +225,22 @@ def main():
     parser.add_argument("--speculative", action="store_true")
     parser.add_argument("--resident-caches", action="store_true",
                         help="Exercise bounded graph variants and retained unified KV prefixes")
+    parser.add_argument("--device-mask", action="store_true",
+                        help="Use a small long-prefill case and require actual compact CUDA mask input use")
     args = parser.parse_args()
     assert 0 < args.model.stat().st_size <= 64 * 1024 * 1024, "Use a tiny fixture, at most 64 MiB"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     before = run_payload(args.before.resolve(), args.model.resolve(), args.output_dir.resolve(),
-                         "before", args.gpu, args.speculative, args.resident_caches)
+                         "before", args.gpu, args.speculative, args.resident_caches, args.device_mask)
     after = run_payload(args.after.resolve(), args.model.resolve(), args.output_dir.resolve(),
-                        "after", args.gpu, args.speculative, args.resident_caches)
+                        "after", args.gpu, args.speculative, args.resident_caches, args.device_mask)
+    after_log = args.output_dir / f"after-{'gpu' if args.gpu else 'cpu'}-{'draft' if args.speculative else 'plain'}.log"
+    mask_inputs = after_log.read_text(encoding="utf-8", errors="replace").count("device-mask inputs:")
+    if args.device_mask and args.gpu:
+        if not mask_inputs:
+            raise AssertionError("Compact CUDA mask path was never executed; refusing a fallback-only pass")
+    elif mask_inputs:
+        raise AssertionError("Compact CUDA mask inputs appeared in a disabled/CPU comparison")
     # Shared physical KV rows can change CUDA attention reduction order. Apply
     # a conservative 1e-5 absolute probability-metadata bound only in this
     # opt-in GPU test. Native fixtures check logits separately. Tokens, candidate
@@ -239,9 +257,12 @@ def main():
                   before_outputs_sha256=hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
                   outputs_sha256=hashlib.sha256(json.dumps(after, sort_keys=True).encode()).hexdigest(),
                   throughput_measured=False, resident_caches=args.resident_caches,
+                  device_mask=args.device_mask, actual_device_mask_inputs=mask_inputs,
+                  synthetic_context_metadata_override="llama.context_length=int:4096" if args.device_mask else None,
                   comparison=comparison)
     cache_suffix = "-caches" if args.resident_caches else ""
-    name = f"smoke-{'gpu' if args.gpu else 'cpu'}-{'draft' if args.speculative else 'plain'}{cache_suffix}.json"
+    mask_suffix = "-device-mask" if args.device_mask else ""
+    name = f"smoke-{'gpu' if args.gpu else 'cpu'}-{'draft' if args.speculative else 'plain'}{cache_suffix}{mask_suffix}.json"
     (args.output_dir / name).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
 
