@@ -1,0 +1,1171 @@
+{
+  "status": "passed",
+  "artifact": "dense_runtime_defaults_and_bounded_writeback",
+  "base_commit": "779a081ebdbc0811d77780603acbc7a069908683",
+  "sealed_at_utc": "2026-10-31T04:34:30.974769+00:00",
+  "native_base": {
+    "upstream_commit": "9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e",
+    "patches": [
+      "001-llama-cpp-hooks.patch",
+      "002-moe-ram-limit.patch",
+      "003-runtime-performance.patch",
+      "004-gpu-first-moe.patch",
+      "005-live-runtime-activity.patch",
+      "006-moe-residency-pipeline.patch",
+      "007-dense-runtime.patch",
+      "008-runtime-efficiency.patch",
+      "009-bounded-copy-pipeline.patch",
+      "010-scheduler-exception-contract.patch",
+      "011-moe-read-and-execution-batching.patch",
+      "012-expert-major-and-packed-rows.patch",
+      "013-resident-gpu-tuning.patch",
+      "014-kv-reclamation-and-prompt-state.patch",
+      "015-mtp-checkpoint-state.patch",
+      "016-tuning-reuse.patch",
+      "017-sampler-output-view.patch",
+      "018-speculative-round-efficiency.patch",
+      "019-cuda-graph-reuse.patch",
+      "020-checkpoint-restore-transaction.patch",
+      "021-sampler-batch-fences-and-owned-candidates.patch",
+      "022-sampler-init-and-mtp-state-transactions.patch",
+      "023-speculative-snapshot-and-clone-ownership.patch",
+      "024-moe-binding-transaction.patch",
+      "025-prompt-prefix-index.patch",
+      "026-postverify-candidate-and-residual-work.patch",
+      "027-overlapped-admission-and-decode-metadata.patch",
+      "028-device-mtp-state.patch",
+      "029-compact-backend-sampler-outputs.patch",
+      "030-bounded-graph-variants.patch",
+      "032-retained-prefix.patch",
+      "033-graph-owned-sampler-bindings.patch",
+      "034-device-attention-mask.patch",
+      "036-paged-state-cache.patch",
+      "037-grammar-first-device-mask.patch",
+      "038-hybrid-retained-prefix.patch",
+      "039-sampler-binding-preflight.patch",
+      "040-device-mask-placement.patch",
+      "041-grammar-mask-validation.patch",
+      "042-async-prefix-writeback.patch",
+      "043-canonical-penalties.patch",
+      "044-hybrid-text-device-mask.patch",
+      "045-auto-device-mask.patch",
+      "046-shared-cache-diagnostics.patch",
+      "047-preserve-mask-execution.patch",
+      "048-conservative-extended-mask-default.patch"
+    ]
+  },
+  "release_decision": {
+    "approved_defaults": true,
+    "default_policy": {
+      "canonical_penalties": true,
+      "device_attention_mask": "auto",
+      "device_mask_execution_flags_preserved": true,
+      "prefix_disk_async": "opt_in",
+      "device_mask_policy": {
+        "minimum_queries_per_stream": 512,
+        "ordinary_minimum_dense_bytes": 262144,
+        "extended_inputs": "hybrid OR n_pos>1",
+        "extended_minimum_dense_bytes": 2097152,
+        "manual_enable": "WILDLLAMA_DEVICE_MASK=1",
+        "manual_minimum_queries_per_stream": 32,
+        "manual_minimum_dense_bytes": 262144,
+        "explicit_disable": "WILDLLAMA_DEVICE_MASK=0",
+        "unsupported_layouts": "original_host_path"
+      }
+    },
+    "weights_quantization_rng_and_logical_context_contract_preserved": true,
+    "trained_model_quality_not_measured": true
+  },
+  "validation": {
+    "native_cpu_ctest": {
+      "status": "passed",
+      "passed": 36,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/dense-default-20261030/native-release/native-cpu-tests.xml",
+        "sha256": "fd7783723dec00b2395e437a16e558d494eb4a36245ce00083b0adec2f21fe9a"
+      }
+    },
+    "native_cuda_ctest": {
+      "status": "passed",
+      "passed": 11,
+      "failed": 0,
+      "skipped": 0,
+      "junit": {
+        "path": ".build/dense-default-20261030/native-release/native-cuda-tests.xml",
+        "sha256": "409598f80303fb85632860bd4d2ad223d61f9c35295ea4de9b6a99478ad9c741"
+      }
+    },
+    "native_components": {
+      "status": "passed",
+      "steps": 15,
+      "model_families": 7,
+      "server_tests": 45,
+      "server_assertions": 190,
+      "report": {
+        "path": ".build/dense-default-20261030/native-release/runner-summary-all.json",
+        "sha256": "f6208841fe183f2e26da1a4c5edcbab8630e7a1b14e878403e5163318d10094d"
+      }
+    },
+    "patch_replay": {
+      "status": "passed",
+      "canonical_files_compared": 173,
+      "patch_count": 46,
+      "fresh_ordered_replay": true,
+      "repeat_cmake_idempotence": true,
+      "no_outside_native_changes": true,
+      "report": {
+        "path": ".build/dense-default-20261030/patch-replay.json",
+        "sha256": "8cbc854114ba786b5d159a7ea3f07f4b9334675cb893e34c065bf49784da8eb5"
+      },
+      "repeat_log": {
+        "path": ".build/dense-default-20261030/patch-replay-cmake.log",
+        "sha256": "814fe8b9cbe87dd122cf553d5294614bbb5fa5b50c69d143a9565f6621f53b6a"
+      },
+      "replay_generator": {
+        "path": ".build/dense-default-20261030/replay_final.py",
+        "sha256": "6f3b9996817a3ebaf504c18e606220c7c1886bd59ee03a6b8bb3974d88191ae7"
+      },
+      "materialization": "Affected paths read from compiled native upstream HEAD into a fresh partial non-Git tree",
+      "ownership": {
+        "path": ".build/dense-default-20261030/native-source-ownership.json",
+        "sha256": "4ee6abbf428916aa8fcaa050eac5530c3399d38a4928d9aa4e4f1721e5a9cbf7"
+      }
+    },
+    "source_guard": {
+      "status": "passed",
+      "native_files_rechecked": 1992,
+      "mandatory_guarded_inputs": 56,
+      "successful_snapshot_sha256": "789fd61a86ecc67be6bc8f9804b8ee4e4b61e25caf8939078fc8997aa196ae7a"
+    },
+    "stable_release_payloads": {
+      "status": "passed",
+      "before": {
+        "path": ".build/dense-default-20261030/release-suite-before.json",
+        "sha256": "946c8a342ed9d6ea0a58daf62d7e8e2e0e9f92a727d56e62ee0a9a70339da730"
+      },
+      "after": {
+        "path": ".build/dense-default-20261030/release-suite-after.json",
+        "sha256": "0eae0cebc2bc81b5afc229f8a40883a3803bcd6cec31cb70f283a05bb8432e48"
+      },
+      "files_per_bundle": 39,
+      "unchanged_before_after_and_current": true,
+      "baseline_published_commit": "779a081ebdbc0811d77780603acbc7a069908683"
+    },
+    "http_cases_per_payload": 300,
+    "http_equivalence": {
+      "status": "passed",
+      "cases_per_payload": 300,
+      "configurations": [
+        {
+          "configuration": "cpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-draft-caches.json",
+            "sha256": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e"
+          }
+        },
+        {
+          "configuration": "cpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-draft.json",
+            "sha256": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-plain-caches-device-mask.json",
+            "sha256": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc"
+          }
+        },
+        {
+          "configuration": "cpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-plain-caches.json",
+            "sha256": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3"
+          }
+        },
+        {
+          "configuration": "cpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-plain-device-mask.json",
+            "sha256": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4"
+          }
+        },
+        {
+          "configuration": "cpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-cpu-plain.json",
+            "sha256": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac"
+          }
+        },
+        {
+          "configuration": "gpu-draft-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-draft-caches.json",
+            "sha256": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827"
+          }
+        },
+        {
+          "configuration": "gpu-draft",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-draft.json",
+            "sha256": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-plain-caches-device-mask.json",
+            "sha256": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af"
+          }
+        },
+        {
+          "configuration": "gpu-plain-caches",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-plain-caches.json",
+            "sha256": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3"
+          }
+        },
+        {
+          "configuration": "gpu-plain-device-mask",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 1,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-plain-device-mask.json",
+            "sha256": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d"
+          }
+        },
+        {
+          "configuration": "gpu-plain",
+          "cases_per_payload": 25,
+          "probability_differences": 0,
+          "max_probability_abs_error": 0.0,
+          "actual_compact_inputs": 0,
+          "report": {
+            "path": ".build/dense-default-20261030/http-comparison/smoke-gpu-plain.json",
+            "sha256": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2"
+          }
+        }
+      ],
+      "provenance": "Stable full39-file bundle snapshots surround the release HTTP matrix; existing summary harness emits semantic digests"
+    },
+    "same_payload_grammar_http_features": {
+      "cpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/dense-default-20261030/http-features/cpu.json",
+          "sha256": "4e9aad85f7ef0d6f818b29d5ad03a9b86c2e2beecf9c7f64861edde2206f115a"
+        }
+      },
+      "gpu": {
+        "status": "passed",
+        "cases": 20,
+        "positive_feature_cases": 12,
+        "max_probability_abs_error": 2.9802322387695312e-08,
+        "report": {
+          "path": ".build/dense-default-20261030/http-features/gpu.json",
+          "sha256": "d351de9e0ac81c57d5469fcb9fdc562b5ef3264410e4dd5075c84181f49d6395"
+        }
+      }
+    },
+    "dense_prelogprob_http": {
+      "status": "passed",
+      "cases": 26,
+      "probability_values_compared": 2064,
+      "meaningful_nonzero_probabilities": true,
+      "tokens_content_candidate_ids_exact": true,
+      "maximum_logprob_absolute_error": 0.0,
+      "devices": {
+        "cpu": {
+          "status": "passed",
+          "cases": 8,
+          "logprob_scalars": 768,
+          "exact": true,
+          "meaningful_nonzero_alternatives": true,
+          "mask_controls": {},
+          "report": {
+            "path": ".build/dense-default-20261030/meaningful-cpu-release/report.json",
+            "sha256": "2c246231de25532c2ac2023c03825db2b6a28aba5208a5c76b0bcd142178be42"
+          }
+        },
+        "gpu": {
+          "status": "passed",
+          "cases": 18,
+          "logprob_scalars": 1296,
+          "exact": true,
+          "meaningful_nonzero_alternatives": true,
+          "mask_controls": {
+            "ordinary": {
+              "cases": 4,
+              "exact_logprobs": true,
+              "fixture_observations_by_prompt": {
+                "512": true,
+                "2048": true
+              }
+            },
+            "hybrid": {
+              "cases": 6,
+              "exact_logprobs": true,
+              "fixture_observations_by_prompt": {
+                "512": false,
+                "2048": false,
+                "3072": true
+              }
+            }
+          },
+          "report": {
+            "path": ".build/dense-default-20261030/meaningful-gpu-release/report.json",
+            "sha256": "bb2fb397ef463384afb43115a5c7f0f74286f3c0a58f1213c731cb3da9044ece"
+          }
+        }
+      },
+      "mask_geometry": {
+        "path": ".build/dense-default-20261030/meaningful-mask-expectation-fix.json",
+        "sha256": "9dd29322efe9823f48029c8b6f98fe33538492f956e640e67206d5677a68528b"
+      },
+      "mask_eligibility_basis": "Actual query-batch size and dense mask geometry; logical prompt length alone does not determine admission"
+    },
+    "prefix_disk_http": {
+      "sync": {
+        "status": "passed",
+        "cases": 11,
+        "cold_restores": 1,
+        "restored_cache_n512": true,
+        "actual_async_prewrite": false,
+        "pre_sampling_logprob_values": 498
+      },
+      "async": {
+        "status": "passed",
+        "cases": 11,
+        "cold_restores": 1,
+        "restored_cache_n512": true,
+        "actual_async_prewrite": true,
+        "pre_sampling_logprob_values": 498
+      },
+      "report": {
+        "path": ".build/dense-default-20261030/prefix-disk-release/report.json",
+        "sha256": "d0dcd0f576e3e258016e7d785fb44455b74bf07e5b76ffdd396fb9460ea823e2"
+      },
+      "scope": "Real CPU HTTP cold-file restore/EOS proof; not an expert-weight or model-TPS benchmark"
+    },
+    "same_payload_constraint_errors_http": {
+      "status": "passed",
+      "case_count": 40,
+      "nan_input_rejections": 2,
+      "concurrent_valid_cases": 8,
+      "seeded_recovery_and_concurrent_tokens_exact": true,
+      "actual_loaded_core_module_pins": true,
+      "harness": {
+        "path": ".build/dense-default-20261030/http_constraints_release.py",
+        "sha256": "5ee7fbaafabb88fb04d34e0dde1a14534a2e9115ebc93c0f07ddfc190b241304"
+      },
+      "report": {
+        "path": ".build/dense-default-20261030/constraints-release/report.json",
+        "sha256": "fa1dd4036feb09b2267b8aa886eca4bda2c8589e45d3d181bbc305fde04cf922"
+      }
+    },
+    "performance_release": {
+      "status": "passed",
+      "benchmarks": {
+        "ordinary-auto": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/ordinary-auto/report.json",
+            "sha256": "02fa5057dbdd1e0a6c178bd260316652ef86ad5a9f97d19aca0715dabaf5150d"
+          },
+          "raw_harness_roles": {
+            "before": "final_payload_mask_disabled",
+            "after": "final_payload_automatic_mask"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "prompt_tokens": 128,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 1.458,
+                  "after_median": 1.467,
+                  "after_change_percent": 0.6172839506172867,
+                  "before_cv_percent": 4.442328201994734,
+                  "after_cv_percent": 5.260817400604883
+                },
+                "wall_ms": {
+                  "before_median": 2.9298,
+                  "after_median": 2.9818499999999997,
+                  "after_change_percent": 1.7765717796436542,
+                  "before_cv_percent": 98.87564484881307,
+                  "after_cv_percent": 14.681762813792076
+                }
+              }
+            },
+            {
+              "prompt_tokens": 512,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 3.226,
+                  "after_median": 2.525,
+                  "after_change_percent": -21.729696218226913,
+                  "before_cv_percent": 10.98323555896962,
+                  "after_cv_percent": 9.830428762757565
+                },
+                "wall_ms": {
+                  "before_median": 5.3164,
+                  "after_median": 4.6129,
+                  "after_change_percent": -13.232638627642768,
+                  "before_cv_percent": 78.52501140550807,
+                  "after_cv_percent": 74.31217217297299
+                }
+              }
+            },
+            {
+              "prompt_tokens": 768,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 4.981999999999999,
+                  "after_median": 4.201499999999999,
+                  "after_change_percent": -15.66639903653152,
+                  "before_cv_percent": 8.4122697137041,
+                  "after_cv_percent": 9.69039313172719
+                },
+                "wall_ms": {
+                  "before_median": 7.6335,
+                  "after_median": 6.9383,
+                  "after_change_percent": -9.10722473308443,
+                  "before_cv_percent": 41.27526815035095,
+                  "after_cv_percent": 84.02249743186015
+                }
+              }
+            },
+            {
+              "prompt_tokens": 2048,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 16.7125,
+                  "after_median": 12.9855,
+                  "after_change_percent": -22.300673148840676,
+                  "before_cv_percent": 5.583509777404281,
+                  "after_cv_percent": 5.58180079536029
+                },
+                "wall_ms": {
+                  "before_median": 19.8984,
+                  "after_median": 16.1665,
+                  "after_change_percent": -18.754774253206286,
+                  "before_cv_percent": 5.0159987108890265,
+                  "after_cv_percent": 4.397462163086949
+                }
+              }
+            },
+            {
+              "prompt_tokens": 4096,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 39.131,
+                  "after_median": 29.2785,
+                  "after_change_percent": -25.17824742531497,
+                  "before_cv_percent": 6.742743660509618,
+                  "after_cv_percent": 8.575444723857617
+                },
+                "wall_ms": {
+                  "before_median": 44.296,
+                  "after_median": 34.8856,
+                  "after_change_percent": -21.244356149539467,
+                  "before_cv_percent": 6.108628918869295,
+                  "after_cv_percent": 14.271034852859662
+                }
+              }
+            }
+          ]
+        },
+        "hybrid-auto": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/hybrid-auto/report.json",
+            "sha256": "d7b42849a88056a638e1ea7d8c0291a4dde110fec4d96e4217de5fcc96997da2"
+          },
+          "raw_harness_roles": {
+            "before": "final_payload_mask_disabled",
+            "after": "final_payload_automatic_mask"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "prompt_tokens": 512,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 4.4475,
+                  "after_median": 4.769500000000001,
+                  "after_change_percent": 7.240022484541897,
+                  "before_cv_percent": 2.589433693299761,
+                  "after_cv_percent": 11.169671393670662
+                },
+                "wall_ms": {
+                  "before_median": 6.44785,
+                  "after_median": 7.0973500000000005,
+                  "after_change_percent": 10.0731251502439,
+                  "before_cv_percent": 64.92968083661395,
+                  "after_cv_percent": 60.00306147616497
+                }
+              }
+            },
+            {
+              "prompt_tokens": 768,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 11.857,
+                  "after_median": 11.6955,
+                  "after_change_percent": -1.3620646031879957,
+                  "before_cv_percent": 5.49762206668973,
+                  "after_cv_percent": 10.983604458176085
+                },
+                "wall_ms": {
+                  "before_median": 14.2234,
+                  "after_median": 14.18355,
+                  "after_change_percent": -0.28017211074707893,
+                  "before_cv_percent": 21.91130211450879,
+                  "after_cv_percent": 24.180722402375146
+                }
+              }
+            },
+            {
+              "prompt_tokens": 2048,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 29.192,
+                  "after_median": 26.0295,
+                  "after_change_percent": -10.833447519868466,
+                  "before_cv_percent": 13.427505465917159,
+                  "after_cv_percent": 16.729673213081583
+                },
+                "wall_ms": {
+                  "before_median": 32.91205,
+                  "after_median": 30.10335,
+                  "after_change_percent": -8.533956408063315,
+                  "before_cv_percent": 12.219428060272397,
+                  "after_cv_percent": 24.495295299119487
+                }
+              }
+            },
+            {
+              "prompt_tokens": 3072,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 40.8155,
+                  "after_median": 36.454,
+                  "after_change_percent": -10.685891389300629,
+                  "before_cv_percent": 12.011555676788715,
+                  "after_cv_percent": 15.915999910775957
+                },
+                "wall_ms": {
+                  "before_median": 45.989050000000006,
+                  "after_median": 40.81975,
+                  "after_change_percent": -11.240284372040755,
+                  "before_cv_percent": 16.51808521033579,
+                  "after_cv_percent": 14.53615065080865
+                }
+              }
+            },
+            {
+              "prompt_tokens": 4096,
+              "metrics": {
+                "prompt_ms": {
+                  "before_median": 51.138000000000005,
+                  "after_median": 45.9485,
+                  "after_change_percent": -10.148030818569364,
+                  "before_cv_percent": 3.76725646441179,
+                  "after_cv_percent": 4.458326027816065
+                },
+                "wall_ms": {
+                  "before_median": 58.019,
+                  "after_median": 50.727050000000006,
+                  "after_change_percent": -12.568210413829938,
+                  "before_cv_percent": 9.841494897211422,
+                  "after_cv_percent": 4.176227606355687
+                }
+              }
+            }
+          ]
+        },
+        "decode-gpu": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/decode-gpu/report.json",
+            "sha256": "2065090fda944cf13752f726ef6328f517cc84dc2d5a8c3e9c15cfbbc60b2f82"
+          },
+          "raw_harness_roles": {
+            "before": "baseline",
+            "after": "final"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "case": "cpu-sampler-history-64",
+              "baseline_decode_tps": 584.0865262044783,
+              "final_decode_tps": 636.1635490438981,
+              "final_decode_tps_change_percent": 8.915977428520328,
+              "baseline_decode_tps_cv": 0.11137912811554591,
+              "final_decode_tps_cv": 0.16764659895872766,
+              "native_decode_latency_change_percent": -7.344213138088584,
+              "native_latency_pairs": {
+                "improved": 8,
+                "worsened": 0,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -8.2123701532846
+            },
+            {
+              "case": "cpu-sampler-history-512",
+              "baseline_decode_tps": 444.91123712326447,
+              "final_decode_tps": 547.4410124948415,
+              "final_decode_tps_change_percent": 23.044995679255177,
+              "baseline_decode_tps_cv": 0.03952838150760448,
+              "final_decode_tps_cv": 0.029098749188485085,
+              "native_decode_latency_change_percent": -18.729988019085376,
+              "native_latency_pairs": {
+                "improved": 8,
+                "worsened": 0,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -18.677585105752538
+            },
+            {
+              "case": "disabled-penalties-control",
+              "baseline_decode_tps": 610.3862413732505,
+              "final_decode_tps": 567.7874087139519,
+              "final_decode_tps_change_percent": -6.978996211228406,
+              "baseline_decode_tps_cv": 0.11111486209544667,
+              "final_decode_tps_cv": 0.05920511776616336,
+              "native_decode_latency_change_percent": 7.502445143476466,
+              "native_latency_pairs": {
+                "improved": 3,
+                "worsened": 5,
+                "equal": 0
+              },
+              "wall_latency_change_percent": 6.8907558732475005
+            },
+            {
+              "case": "backend-sampling-control",
+              "baseline_decode_tps": 674.442149045643,
+              "final_decode_tps": 650.3170290397011,
+              "final_decode_tps_change_percent": -3.5770480893105083,
+              "baseline_decode_tps_cv": 0.037117455411712026,
+              "final_decode_tps_cv": 0.030226282328423514,
+              "native_decode_latency_change_percent": 3.7096829868643377,
+              "native_latency_pairs": {
+                "improved": 1,
+                "worsened": 7,
+                "equal": 0
+              },
+              "wall_latency_change_percent": 4.823388764365344
+            }
+          ]
+        },
+        "decode-cpu": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/decode-cpu/report.json",
+            "sha256": "671db784b0df157c26eeb9a1126d85e0465c9dc1681be80ee01d48ad819c290a"
+          },
+          "raw_harness_roles": {
+            "before": "baseline",
+            "after": "final"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "case": "cpu-sampler-history-64",
+              "baseline_decode_tps": 263.9836299359159,
+              "final_decode_tps": 286.2604032804536,
+              "final_decode_tps_change_percent": 8.438694986482886,
+              "baseline_decode_tps_cv": 0.030931745566766592,
+              "final_decode_tps_cv": 0.028927601765358593,
+              "native_decode_latency_change_percent": -7.782007751140386,
+              "native_latency_pairs": {
+                "improved": 8,
+                "worsened": 0,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -7.967426207130501
+            },
+            {
+              "case": "cpu-sampler-history-512",
+              "baseline_decode_tps": 250.83370749305905,
+              "final_decode_tps": 292.36557452936785,
+              "final_decode_tps_change_percent": 16.55753026632516,
+              "baseline_decode_tps_cv": 0.060094146639206314,
+              "final_decode_tps_cv": 0.11497055746489737,
+              "native_decode_latency_change_percent": -14.206063215524722,
+              "native_latency_pairs": {
+                "improved": 7,
+                "worsened": 1,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -14.086683907118235
+            },
+            {
+              "case": "disabled-penalties-control",
+              "baseline_decode_tps": 301.14057649647816,
+              "final_decode_tps": 282.70111106651586,
+              "final_decode_tps_change_percent": -6.123208517593426,
+              "baseline_decode_tps_cv": 0.0690604207949803,
+              "final_decode_tps_cv": 0.054306925960338134,
+              "native_decode_latency_change_percent": 6.517842323651468,
+              "native_latency_pairs": {
+                "improved": 1,
+                "worsened": 7,
+                "equal": 0
+              },
+              "wall_latency_change_percent": 6.916383755338917
+            },
+            {
+              "case": "backend-sampling-control",
+              "baseline_decode_tps": 296.63206945383945,
+              "final_decode_tps": 296.44626074987195,
+              "final_decode_tps_change_percent": -0.06263945240634339,
+              "baseline_decode_tps_cv": 0.0658960571096088,
+              "final_decode_tps_cv": 0.034302025869617,
+              "native_decode_latency_change_percent": 0.06329616532678717,
+              "native_latency_pairs": {
+                "improved": 3,
+                "worsened": 5,
+                "equal": 0
+              },
+              "wall_latency_change_percent": 0.058957214338062336
+            }
+          ]
+        },
+        "decode-gpu-reversed": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/decode-gpu-reversed/report.json",
+            "sha256": "b452b07d854685fb88bf0dba65c0e1b38d1c5dd97c4d1aae37ae48be86c6c386"
+          },
+          "raw_harness_roles": {
+            "before": "final",
+            "after": "baseline"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "case": "cpu-sampler-history-64",
+              "baseline_decode_tps": 671.8230931292186,
+              "final_decode_tps": 845.442718399876,
+              "final_decode_tps_change_percent": 25.843057055685836,
+              "baseline_decode_tps_cv": 0.0937018595934346,
+              "final_decode_tps_cv": 0.06822521853054288,
+              "native_decode_latency_change_percent": -20.535600931019893,
+              "native_latency_pairs": {
+                "improved": 8,
+                "worsened": 0,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -21.19965798498886
+            },
+            {
+              "case": "cpu-sampler-history-512",
+              "baseline_decode_tps": 559.9105710487936,
+              "final_decode_tps": 849.4471990204956,
+              "final_decode_tps_change_percent": 51.711227282127936,
+              "baseline_decode_tps_cv": 0.02306138201698935,
+              "final_decode_tps_cv": 0.06879551364929624,
+              "native_decode_latency_change_percent": -34.08531800266288,
+              "native_latency_pairs": {
+                "improved": 8,
+                "worsened": 0,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -33.432070874680576
+            },
+            {
+              "case": "disabled-penalties-control",
+              "baseline_decode_tps": 933.3122363390103,
+              "final_decode_tps": 911.4997720827084,
+              "final_decode_tps_change_percent": -2.337102569431959,
+              "baseline_decode_tps_cv": 0.04406114948236151,
+              "final_decode_tps_cv": 0.04130203011537322,
+              "native_decode_latency_change_percent": 2.390514368439045,
+              "native_latency_pairs": {
+                "improved": 3,
+                "worsened": 5,
+                "equal": 0
+              },
+              "wall_latency_change_percent": 2.284647628570924
+            },
+            {
+              "case": "backend-sampling-control",
+              "baseline_decode_tps": 1139.5872275169882,
+              "final_decode_tps": 1158.4403730171416,
+              "final_decode_tps_change_percent": 1.654383714113039,
+              "baseline_decode_tps_cv": 0.06803543924973576,
+              "final_decode_tps_cv": 0.06704856224244983,
+              "native_decode_latency_change_percent": -1.6488889287604613,
+              "native_latency_pairs": {
+                "improved": 5,
+                "worsened": 3,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -2.600014686101948
+            }
+          ]
+        },
+        "decode-cpu-reversed": {
+          "status": "passed",
+          "report": {
+            "path": ".build/dense-default-20261030/performance-release/decode-cpu-reversed/report.json",
+            "sha256": "a36caad46236a15c463435c3f42d0367378ecf71341d0a6d0a0128f2d430493a"
+          },
+          "raw_harness_roles": {
+            "before": "final",
+            "after": "baseline"
+          },
+          "requested_strict_native_cpu_mask": "14",
+          "cases": [
+            {
+              "case": "cpu-sampler-history-64",
+              "baseline_decode_tps": 235.57314260286867,
+              "final_decode_tps": 240.24068789657252,
+              "final_decode_tps_change_percent": 1.9813571454418533,
+              "baseline_decode_tps_cv": 0.24456354439039027,
+              "final_decode_tps_cv": 0.2353586138505391,
+              "native_decode_latency_change_percent": -1.928992667045637,
+              "native_latency_pairs": {
+                "improved": 5,
+                "worsened": 3,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -2.658816395980901
+            },
+            {
+              "case": "cpu-sampler-history-512",
+              "baseline_decode_tps": 203.99076805436124,
+              "final_decode_tps": 217.76591295974694,
+              "final_decode_tps_change_percent": 6.7528276091959105,
+              "baseline_decode_tps_cv": 0.12308388805762703,
+              "final_decode_tps_cv": 0.12942161743401165,
+              "native_decode_latency_change_percent": -6.3135784090553315,
+              "native_latency_pairs": {
+                "improved": 6,
+                "worsened": 2,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -6.239084477946955
+            },
+            {
+              "case": "disabled-penalties-control",
+              "baseline_decode_tps": 232.4512341585189,
+              "final_decode_tps": 237.2231974305197,
+              "final_decode_tps_change_percent": 2.0528879054032334,
+              "baseline_decode_tps_cv": 0.24865959505153162,
+              "final_decode_tps_cv": 0.34348180180198984,
+              "native_decode_latency_change_percent": -1.9752892178700021,
+              "native_latency_pairs": {
+                "improved": 3,
+                "worsened": 5,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -1.89906123777408
+            },
+            {
+              "case": "backend-sampling-control",
+              "baseline_decode_tps": 249.46116870079413,
+              "final_decode_tps": 251.86415857912164,
+              "final_decode_tps_change_percent": 0.9632721159940072,
+              "baseline_decode_tps_cv": 0.13162943476453096,
+              "final_decode_tps_cv": 0.1187485133490816,
+              "native_decode_latency_change_percent": -0.8939080548910239,
+              "native_latency_pairs": {
+                "improved": 6,
+                "worsened": 2,
+                "equal": 0
+              },
+              "wall_latency_change_percent": -1.1743707347419141
+            }
+          ]
+        }
+      },
+      "startup_order_control": "Forward and reversed CPU/GPU startup orders are all retained; reversed medians, CVs and paired outcomes are normalized to final versus baseline. No best-order selection or pooled best-case gain.",
+      "control_interpretation": "Review disabled-penalty and backend-sampling controls in both orders, including negative changes. Process/startup-order variance is not evidence that every control is unchanged or that every model benefits.",
+      "interpretation": "Small synthetic fixtures and paired measured latencies; CPU placement/noise remain relevant; no trained-Qwen TPS or language-quality claim. Root must review every final control before approving defaults."
+    }
+  },
+  "optional_earlier_component_evidence": {
+    "async_writeback_component": {
+      "report": {
+        "path": ".build/dense-default-20261030/async-cache-benchmark.json",
+        "sha256": "5db9e3f59e84fc4dc075d0e764b425a21c2fc38b33042e6b4aef058e517012c0"
+      },
+      "summary": {
+        "sync_wall_median_us": 5547.55,
+        "async_wall_median_us": 3689.15,
+        "sync_pressure_median_us": 2016.45,
+        "async_pressure_median_us": 118.1,
+        "sync_independent_median_us": 3510.05,
+        "async_independent_median_us": 3504.3
+      },
+      "trials": 24,
+      "scope": "Earlier042 component-only experiment (same042 patch); pre048, not final release payload, not model TPS or raw SSD bandwidth"
+    },
+    "fixture_generator_reproduction": {
+      "status": "passed",
+      "fixtures": [
+        {
+          "name": "dense-d64-l2-f32.gguf",
+          "bytes": 469312,
+          "sha256": "9c57a007c041111618cac9642002dc504943c6a3456c24673d71e85d500b4ed7"
+        },
+        {
+          "name": "dense-d256-l4-f32.gguf",
+          "bytes": 14179936,
+          "sha256": "71099f10a7bffa665c1e39b8e382bc6086a0923efb87480b72d8e008fdbeed63"
+        },
+        {
+          "name": "dense-vocab-131072.gguf",
+          "bytes": 37836064,
+          "sha256": "802c9968c4ebf5d30a356696b18d1108fde50a027648c90c7f7ff74e23237d1c"
+        }
+      ],
+      "byte_exact_reproduction": true,
+      "prefill_log": {
+        "path": ".build/dense-default-20261030/generator-prefill-repro.log",
+        "sha256": "6e5dedb22cf37feebfdab70f7900ab2d2d8793ac207365b51922f87c0ae2ad35"
+      },
+      "decode_log": {
+        "path": ".build/dense-default-20261030/generator-decode-repro.log",
+        "sha256": "a83b931a4dcc4ada52db42d093ccf100356782d6f4cf388dc6beb688c8e84f2e"
+      }
+    }
+  },
+  "tracked_inputs_sha256": {
+    "LLAMA_CPP_VERSION": "e27baf5cae7a8e224d3febe87f1d7a8d49a613fa291e8ef9297ff859244454ea",
+    "README.md": "3e0e33a6662534b235b29624b37f4e8f8b3d14668296439172015e7ed500b161",
+    "cmake/apply-git-patches.cmake": "aae7850f2a8057c1ee0435393c62679c683cf4e9b63fca41cabcac198ab4426a",
+    "docs/dense-default-runtime.md": "f0569b5ea025acdc14dadbeed874c17ded0e91ac463fffaeca81edc93aa8891f",
+    "docs/execution-pipeline.md": "60ce53ece8a2688fcb88e3ce090aa99fbcf13ecb36901173193f9c21bc23d459",
+    "docs/resident-execution.md": "acf83f774f2fd73fe9b94a6b8abe10e9d18c052a89a9c6537046352bf952e515",
+    "integration/generate_dense_decode_fixture.py": "6164d72edca366f5a1861a9ee3dbfd567580b3fbefd8ddd0bc9dfff8bf82b991",
+    "integration/generate_dense_prefill_fixtures.py": "5a9d0b40f83ecc203fd2d0f7ecf4365700ee6ee609f16b4a6388e93be20e68c4",
+    "integration/native_dense_decode_benchmark.py": "ff40c9567454406af1dc217d20a024f3f9bdb99e05c2929a01c4b06f0a2ca62f",
+    "integration/native_dense_logprob_smoke.py": "8ad77b35c7fc0fae62300880f002ffd18e6759bd152593d856c78e49c773327f",
+    "integration/native_dense_prefill_benchmark.py": "ac6022f569cfcff74b8e64fbd008a4556c86fb79f6d80b8d6e850562ed663ed0",
+    "integration/native_execution_features_smoke.py": "f0ece2b2077880ec9757488b41880f313d96614eeac2afd6c2edb5ad6c4be1e3",
+    "integration/native_prefix_disk_smoke.py": "299c476b1167fe2b650229eb506742dee83970d5abac7ade4d828bbc0741a3fb",
+    "integration/native_sglang_smoke.py": "5e550b15820eae012450b872b7442fdfb33439da858ddc4808a8435445d28641",
+    "llama/compat/001-llama-cpp-hooks.patch": "de62fe6dd48c1b19082ae234e0b21fbc3da326dc18d6c971b93953886bf3ebf7",
+    "llama/compat/002-moe-ram-limit.patch": "8485d05e3448e295d5e68bcf6951afaeb694b3ce0ed61c57f86e8eca47711f63",
+    "llama/compat/003-runtime-performance.patch": "c5c6d73983ddeb8335c3588179b765f629d15db6ad10b6a934e463e230fdc33a",
+    "llama/compat/004-gpu-first-moe.patch": "5bce41f1be9133933e70a793229d031af50e771e86799b9f047b2ec58475c36c",
+    "llama/compat/005-live-runtime-activity.patch": "26e2326f8c2593f49de9f18c14aedb52d5f9996cf2d1ca9ae197a902f5636ac6",
+    "llama/compat/006-moe-residency-pipeline.patch": "d235058da91715858ced1f9057b25fe8b49b71012437b532c50d798b1a4d5c10",
+    "llama/compat/007-dense-runtime.patch": "6c705a9a0b6476bb6a2fd04eaf7f36dfa8864d4fb75c07fea14fbccdb6b58ad8",
+    "llama/compat/008-runtime-efficiency.patch": "117dafa6e5b65932bfeff566eb80a4016f3b7dfb450b5e243311cb02e2b54656",
+    "llama/compat/009-bounded-copy-pipeline.patch": "bcf03171c2f496ebbb50d8b6871b5a2fb9e7a333c11efae096809c26ea0e4a58",
+    "llama/compat/010-scheduler-exception-contract.patch": "27cd6c45a84f83d01303fad255f729331b22d76dcd992b83b5c0fd494a9d0072",
+    "llama/compat/011-moe-read-and-execution-batching.patch": "e1a37558908d74860d8e8b94382962dd6e8d844722032d699cf2a26d6313740d",
+    "llama/compat/012-expert-major-and-packed-rows.patch": "5024e3a04816e2d2ac45b8975b8704c317922e87add5d1cea58d91a96c293bf5",
+    "llama/compat/013-resident-gpu-tuning.patch": "f0a3563d5125b7858feb76aab2aa0555cf21b7132169aff8c604f44b937f7184",
+    "llama/compat/014-kv-reclamation-and-prompt-state.patch": "08e586d6efd8556cb293909a5848c22de722f2e9d7d0d8336c9aa97d047d18df",
+    "llama/compat/015-mtp-checkpoint-state.patch": "1f7c1f571181c49177d7c4755eafc9aea7a2afd180449891c60434fd328ab6a1",
+    "llama/compat/016-tuning-reuse.patch": "3e3b41c883b9daaccd6a594f2f7c8d97a494d915024646ba8ff5b1a3d2c4733b",
+    "llama/compat/017-sampler-output-view.patch": "802e2050a6dded02a7907ccb6cd6c3d56338572ccc0d3e173937d8ff8874799d",
+    "llama/compat/018-speculative-round-efficiency.patch": "d0dc4b31e7d5d5a018bda5488ac92034cf080a2f16c813e90429c1b20907f53d",
+    "llama/compat/019-cuda-graph-reuse.patch": "6b34e48f7e1178131f80e42bb9ab3c32bc818fdbad01183b502e521046961a18",
+    "llama/compat/020-checkpoint-restore-transaction.patch": "1a11670075bdd1a1ff39d1e3490e0d6dd6bc01215d7d4be8d36aad1059c70627",
+    "llama/compat/021-sampler-batch-fences-and-owned-candidates.patch": "a2d6b09b62c72c66701ce0171643830f9cd180634aca5945da9a58142c9fffff",
+    "llama/compat/022-sampler-init-and-mtp-state-transactions.patch": "aec56568d045f0f4bccda8dcc0776437fab8abad52584d4c5ddae1e36480a545",
+    "llama/compat/023-speculative-snapshot-and-clone-ownership.patch": "dd9844d6c00b48d46c7d49aff57c04b10e869c4feb3ffd443592d2bad01d806e",
+    "llama/compat/024-moe-binding-transaction.patch": "f652aa79595e58126f5a5dddddf85edc76832ddec76c61807df7148778d12851",
+    "llama/compat/025-prompt-prefix-index.patch": "f61cea4f7e83a126a9e87321f453bf4c457f24f62de89fecaf484a539a71eef9",
+    "llama/compat/026-postverify-candidate-and-residual-work.patch": "1cfc44df1cc2d2a7c0a203a65fdbcda01bc14810d4329f7ec170100eb948c0a3",
+    "llama/compat/027-overlapped-admission-and-decode-metadata.patch": "451494cd9cbdeb80cae49dffbd6056071114da6dc258c782cf0ad46c48f73cc3",
+    "llama/compat/028-device-mtp-state.patch": "4ecd423c8590c352a7cd5ef78970953a9b49a4a68a483dc9af0565c2549dd23c",
+    "llama/compat/029-compact-backend-sampler-outputs.patch": "84cbf27957cfd79e7ee9abc23ddd7ff3a42c11878cad16d1d4b5743aa0378572",
+    "llama/compat/030-bounded-graph-variants.patch": "51b618b7dc58f7d353e63b28daf17ff3adf6f3f7ac0e0d2d91925e464a4c101d",
+    "llama/compat/032-retained-prefix.patch": "ad0e339346baf4f39247f6842f2f680189f1200d3a0f7a6bdf6027ddfde53281",
+    "llama/compat/033-graph-owned-sampler-bindings.patch": "c42b6036590db9d78f5404fab9efd0eb2ec206625f21303ab2aef3191e56c69a",
+    "llama/compat/034-device-attention-mask.patch": "a1828741b99b5c7d6849cd20be5b246188bd2ec31538d65d0ebf03ce1799edc7",
+    "llama/compat/036-paged-state-cache.patch": "206bdfc1f7c9ee66dd5dd83f1f63a749cb2fcff0d7722bf205d07acdd18a3d98",
+    "llama/compat/037-grammar-first-device-mask.patch": "49e572c59882e5df6ea385c6d7368295862570ae43edb44be6bda9e81dce20a6",
+    "llama/compat/038-hybrid-retained-prefix.patch": "31c5d2787f01bacbfa13b2235a49a44ac4c3bac884bede878be650ed8dc028db",
+    "llama/compat/039-sampler-binding-preflight.patch": "a0f722ccaf01fd55dc69c6dc747f7b7ffddb19c76d3b28c6d61a5681804b7c71",
+    "llama/compat/040-device-mask-placement.patch": "b41c11f70ff0da68b46d73e7748d6f3eb043253eebfcdb2cab07ec338c87c856",
+    "llama/compat/041-grammar-mask-validation.patch": "8921e176f94ea0942dac65dc960d8a360de9c16a55b8ed7be0341803e3ea5f27",
+    "llama/compat/042-async-prefix-writeback.patch": "05455200ea6e4f830b2d2cb534faf5625c2d783776ffdaf23dd676193f4395c3",
+    "llama/compat/043-canonical-penalties.patch": "14c528f02201d768b4b391d8d17ae5a77a5f58d3ac313effdb96e5bd35090f94",
+    "llama/compat/044-hybrid-text-device-mask.patch": "2e57d95a2ea79dfce97c8d6d4552ff1c593720a1554bdb14d759acd7e6cf75cb",
+    "llama/compat/045-auto-device-mask.patch": "14cdda2537ccbc5f94cfb2f87b72c29c1137978998cf7d227aef7ca8c6cfe825",
+    "llama/compat/046-shared-cache-diagnostics.patch": "b0205b8a65f33c7e988aa79bd66f1cb4ce389db286df66cb98757b72a44d7834",
+    "llama/compat/047-preserve-mask-execution.patch": "7bf31f5dadb71d3da5d924f7de3a1d93e828114edfeb8e9755ee61b03efe3c4a",
+    "llama/compat/048-conservative-extended-mask-default.patch": "761139f0a431f151e500e49a78250d06321cad2893a6ab2ca168f3519ecbb577",
+    "llama/compat/compat.cmake": "ee23efb755b0aafceda8070cb90ab1124797418ffc017303187a8ac56e382e74",
+    "llama/compat/llama-ollama-compat-util.cpp": "9dbf99715d8d9ca5d4417a0374ea7f31fb1541b9c233f507fd19efaae0bbbddc",
+    "llama/compat/llama-ollama-compat-util.h": "88936749149a3f9378858918e738af7f631ea096366ee3dae83cad5057a880d0",
+    "llama/compat/llama-ollama-compat.cpp": "122d5463b47ba5bb53dda7ed888cf924822d671fa6c842aa3ca1a867296ab2b9",
+    "llama/compat/llama-ollama-compat.h": "07d214fc541440118ab0c219a95e48c21ff824c0cc4e9b1a0441cbef0c576c00",
+    "llama/server/CMakeLists.txt": "59734d4dd425f9c36ca3fdf081a3233a1edc33fa285350b2f601890ff289560f",
+    "scripts/gpu-first/CMakeLists.txt": "fcd28d7c6ce8f52d7f06972ca790d9b76bebddffe861e05cb2a1514bd3b06d8f",
+    "scripts/gpu-first/build-integrity.ps1": "ec5e966dc5fbd0613dec8f2deae331afe041e8299269bf4f4231a903b449ee8b",
+    "scripts/gpu-first/build-windows.ps1": "d5994b4bda79cfceb99bc76fe8d87dc8fc6a2bf7d918c24dc0456f26254397c6"
+  },
+  "payload_sha256": {
+    "lib/ollama/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/CPP_HTTPLIB_LICENSE": "4b45cbe16d7b71b89ae6127e26e0d90a029198ca5e958ad8e3d0b8bbed364d8b",
+    "lib/ollama/cuda_v12/concrt140.dll": "5e0e8eac57b86e2de7ca7d6e8d34dddea602ce3660208fb53947a027635d59a1",
+    "lib/ollama/cuda_v12/cublas64_12.dll": "0a60a7ecbf906f7f3842826fecaf412f1587ff6269729339245a1ec224364161",
+    "lib/ollama/cuda_v12/cublaslt64_12.dll": "a21ddfc1c9cd090ab07d2c6aad235aa4f15fe60fe896d5db28adf7a279c09ef3",
+    "lib/ollama/cuda_v12/cudart64_12.dll": "9d9b868955149875ac4ef43442aaaa8913d4a7b3e4d6dd60ee871626aa045768",
+    "lib/ollama/cuda_v12/ggml-cuda.dll": "6365461e141100388970a5719a6e6a6c2630617bc5c2eab0d70f79fe50fce5cb",
+    "lib/ollama/cuda_v12/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/cuda_v12/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/cuda_v12/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/cuda_v12/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/cuda_v12/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/cuda_v12/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/cuda_v12/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/cuda_v12/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/cuda_v12/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/cuda_v12/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715",
+    "lib/ollama/ggml-base.dll": "0eef4b6bdc6e2def2414584dce0dd51c51318214d055f10ac9faa6336fd6a8e7",
+    "lib/ollama/ggml-cpu.dll": "b8f80ddae7822f5d2e38b8b9225ee9dbafd2b3dd79d9246c1a79771653f45c95",
+    "lib/ollama/ggml.dll": "1866e693361de2bce4ef5ae85454da132ce372b5b6a2a3e328da3f87f31b91bb",
+    "lib/ollama/llama-common.dll": "0701aac4d37ed312cfb0384d956e380c9dc98ea1ef7a2c6556cbcc9550a2e0eb",
+    "lib/ollama/llama-quantize-impl.dll": "f53247b244f617cc90d04b31d5033d95e4197da913971fe0b89e52094c68f2dd",
+    "lib/ollama/llama-quantize.exe": "a1546f1dd6c5e7d52be71f5f815f813fc2c115f2165d2eff7e9eddb66257970e",
+    "lib/ollama/llama-server-impl.dll": "10f74f5fdec0e54ac7c374b9b73156b592f2c2272882fe607d8600ec75284711",
+    "lib/ollama/llama-server.exe": "8a947838e7b8859a51556e588f167affaa24105bb71b5b00014bf956472a6143",
+    "lib/ollama/llama.dll": "680dcb2957ab4eee3fe7bd59dbeaedab7894729e6f52e26493c213bbcebc19eb",
+    "lib/ollama/LLAMA_CPP_LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "lib/ollama/LLAMA_CPP_VENDORS_LICENSE": "7547ae6372a35e7382898dd9f5519ebc16e93095f69c2466b5b74b617c33d4da",
+    "lib/ollama/msvcp140.dll": "1e57a6df9e3742e31a1c6d9bff81ebeeae8a7de3b45a26e5079d5e1cce54cd98",
+    "lib/ollama/msvcp140_1.dll": "1274292f4cc655f295272b37e08a9683b8bb8c419b61ea2e1f43eb4d22f02f90",
+    "lib/ollama/msvcp140_2.dll": "583ad842bcf2f77af57d07b8f00eca77bb2df763df96bb9c50f7e52031b54e42",
+    "lib/ollama/msvcp140_atomic_wait.dll": "c9fd25862b1b8b2977bf188a4e0c4460dade43c31710283c2b42dbd3b15b4317",
+    "lib/ollama/msvcp140_codecvt_ids.dll": "08df3ab1b59d1f7d63f0811838e4fccc107087fcbc469d94975c0e44477058e7",
+    "lib/ollama/mtmd.dll": "14ac330dd1692b291af40c3fbc8f00890172a86d1509149ea993448016a6b66f",
+    "lib/ollama/vccorlib140.dll": "233e79c5ab80a2902b79c8b41e741dc06cd4a9ff8bca99a025fe8077a35be125",
+    "lib/ollama/vcomp140.dll": "d49b394de1154176b39611c37c669ebff50aa5a818dbd5ff3d2214a299368ddd",
+    "lib/ollama/vcruntime140.dll": "a06c9ea4f815dac75d2c99684d433fbfc782010fae887837a03f085a29a217e8",
+    "lib/ollama/vcruntime140_1.dll": "6d3a6cde6fc4d3c79aabf785c04d2736a3e2fd9b0366c9b741f054a13ecd939e",
+    "lib/ollama/vcruntime140_threads.dll": "52890aa0ef3e8eee53684fcb7d1c1aa76ad0e03f5664d184b424402916f26715"
+  },
+  "private_artifacts": {
+    "root": ".build/dense-default-20261030",
+    "sha256": {
+      "release-suite-before.json": "946c8a342ed9d6ea0a58daf62d7e8e2e0e9f92a727d56e62ee0a9a70339da730",
+      "release-suite-after.json": "0eae0cebc2bc81b5afc229f8a40883a3803bcd6cec31cb70f283a05bb8432e48",
+      "patch-replay.json": "8cbc854114ba786b5d159a7ea3f07f4b9334675cb893e34c065bf49784da8eb5",
+      "patch-replay-cmake.log": "814fe8b9cbe87dd122cf553d5294614bbb5fa5b50c69d143a9565f6621f53b6a",
+      "replay_final.py": "6f3b9996817a3ebaf504c18e606220c7c1886bd59ee03a6b8bb3974d88191ae7",
+      "native-release/runner-summary-all.json": "f6208841fe183f2e26da1a4c5edcbab8630e7a1b14e878403e5163318d10094d",
+      "native-release/native-cpu-tests.log": "09b80ec410c7a6ce25192542eb3342242ec6eae78383386ad76c91bca421135f",
+      "native-release/native-cuda-tests.log": "9ac9ddce0786cc10ac9f12cc141c16fdbbad6297358ef9890f4fb4683e56a8d9",
+      "native-release/sampling-probability.log": "343545344037fe03c5466e1c237cea48daeab6ec3e1493bf4b9498fcd33abb67",
+      "native-release/native-server-tests.log": "758cb8bcd21f7019d592d4d3861f6f4c5eb504a56f7d0728da7bba88c1f54740",
+      "native-release/graph-variants-llama-tied-wide.log": "ed934012ec8df83a0b73aa07b06cc05a4b257b52bf4b002168235b968b1c80ec",
+      "native-release/graph-variants-llama-tied-wide-Q8_0.log": "97117875963b1d78e2032fe675fc21d0568800badfb624f027d9b99363709f26",
+      "native-release/graph-variants-llama-tied-wide-Q4_K_M.log": "a548c757afcedf04352051e8b9ba9a8f49cfaad6c176be618d4764ff0211878e",
+      "native-release/graph-variants-qwen3moe-q4.log": "79865874fb32a6964f9f9c779580fca761158cb620b4038a01928eb8c055bcf1",
+      "native-release/graph-variants-gpt-oss-wide-Q8_0.log": "f83cfb4810f749cfe1b2bc90a47e5385c38600bd9153ee64e1cd113ec8d494ff",
+      "native-release/graph-variants-gemma4-q4.log": "9dd6c517f2ab5a1e4b2f1613b1c0f6a52b6ca8e81fcc8dbc80c7cf6c92b3005d",
+      "native-release/graph-variants-nemotron_h_moe-q4.log": "33a52b252c2ca86c8d24168ddd779a13f05c9be2e28c3e25aff7b7ca3bcdf180",
+      "native-release/mtp-graph-variants-cpu.log": "8b13bf1e89810f55cec4e8c303bdf167b30fdb6b7c77f73b55628ffadc6d4fe5",
+      "native-release/mtp-graph-variants-cuda.log": "3e0a772734425428bb5ea4b570a7d92f89149ff2fae10aa1ee772e4c2b009144",
+      "native-release/native-custom-test.log": "c62e8581ae3a6ab4dcf1b13300d0e21183858c533ca7ebbc1d417bf3e817040c",
+      "native-release/native-moe-cache-gpu.log": "71bdbcccc38a732cda789c96acc002e2b58786e7597dac9ab606048ff9613d3b",
+      "native-release/native-cpu-tests.xml": "fd7783723dec00b2395e437a16e558d494eb4a36245ce00083b0adec2f21fe9a",
+      "native-release/native-cuda-tests.xml": "409598f80303fb85632860bd4d2ad223d61f9c35295ea4de9b6a99478ad9c741",
+      "http-comparison/smoke-cpu-draft-caches.json": "e18885730143dcb3fd18671991d46f833c53ab41af0ce686563bbd440771f59e",
+      "http-comparison/smoke-cpu-draft.json": "676b46cfa2eda9144005e0a4956fa3d34e178b58488647e0b7de710a39c00485",
+      "http-comparison/smoke-cpu-plain-caches-device-mask.json": "7fd61a1006f3039ff6d499101c27a3d614e49523d7c7741e6c279d267e39e4bc",
+      "http-comparison/smoke-cpu-plain-caches.json": "53b49ab95700cc07c2e7abdeca2d42fccc185ff70ea82ab16697f9f2050141a3",
+      "http-comparison/smoke-cpu-plain-device-mask.json": "f9a5c9b3b2c0ec2ccb8ada8ab3ba6879800123491f55d92097271925e68e4bf4",
+      "http-comparison/smoke-cpu-plain.json": "96334de630fc783eaa590babe4eeb04778d288518b47ab15e866cbd1716f83ac",
+      "http-comparison/smoke-gpu-draft-caches.json": "c170e1f9240db8ae150265023eca9a408c65ccd334f6b0f397bba78b52452827",
+      "http-comparison/smoke-gpu-draft.json": "30d3b14928adc766294780077fd4c2e6e0566ff998a7a118630a58d812aa4007",
+      "http-comparison/smoke-gpu-plain-caches-device-mask.json": "7da3799137c20dfa16e5e02d3f84c2ec0332e8f242fcda96ebbed69ba013a8af",
+      "http-comparison/smoke-gpu-plain-caches.json": "a084c5d1991999bb78944c16f450a3f5c929d16b9520d85a5767c754e5cd3ab3",
+      "http-comparison/smoke-gpu-plain-device-mask.json": "c37babbf8315a5afe6d9e750d15e967e26115d1d507e3735f3aba71206b7003d",
+      "http-comparison/smoke-gpu-plain.json": "1d7ab8c06d3bbcb7be186cdb4366d9e9e9904e80ee661b8b741c14515496ffa2",
+      "http-features/cpu.json": "4e9aad85f7ef0d6f818b29d5ad03a9b86c2e2beecf9c7f64861edde2206f115a",
+      "http-features/gpu.json": "d351de9e0ac81c57d5469fcb9fdc562b5ef3264410e4dd5075c84181f49d6395",
+      "meaningful-mask-expectation-fix.json": "9dd29322efe9823f48029c8b6f98fe33538492f956e640e67206d5677a68528b",
+      "meaningful-cpu-release/report.json": "2c246231de25532c2ac2023c03825db2b6a28aba5208a5c76b0bcd142178be42",
+      "meaningful-cpu-release/responses.json": "1bb49336e9066479c6fcfd5968fb582df69060fcba688688ee5ba2ffdab8430c",
+      "meaningful-gpu-release/report.json": "bb2fb397ef463384afb43115a5c7f0f74286f3c0a58f1213c731cb3da9044ece",
+      "meaningful-gpu-release/responses.json": "c114969ff1f9614b24de8b96d69e689ce5fbc47bd725ab4d2172cc56ff2f59a8",
+      "prefix-disk-release/report.json": "d0dcd0f576e3e258016e7d785fb44455b74bf07e5b76ffdd396fb9460ea823e2",
+      "prefix-disk-release/sync/responses.json": "262f8b68ce48199adbe825d0aa9ea281c289e00a15cc5471f3acde02ca1c0bb9",
+      "prefix-disk-release/async/responses.json": "46113d96ac8100663171c1c3a0fc0bd177a755cc088d75af404c0bb33382fa0f",
+      "constraints-release/report.json": "fa1dd4036feb09b2267b8aa886eca4bda2c8589e45d3d181bbc305fde04cf922",
+      "constraints-release/cpu.modules.json": "6f8fd7793868bdac5f39062905f6b0079a5da2e339c26d7a5f93623f012e894c",
+      "constraints-release/cpu.stdout.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "constraints-release/cpu.stderr.log": "8768258ca691d8713f86d8ad9ea210ddab7239290b654dbb00b820c04f199dfa",
+      "constraints-release/gpu.modules.json": "7303c251f4190b02ba76070665fcfc4e107e5588969763ae8015e0fdbe01a83a",
+      "constraints-release/gpu.stdout.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "constraints-release/gpu.stderr.log": "687abe5cf437752503f01a542e1de42dc697396e00ac18dc177b2008b579651f",
+      "http_constraints_release.py": "5ee7fbaafabb88fb04d34e0dde1a14534a2e9115ebc93c0f07ddfc190b241304",
+      "performance-release/ordinary-auto/report.json": "02fa5057dbdd1e0a6c178bd260316652ef86ad5a9f97d19aca0715dabaf5150d",
+      "performance-release/ordinary-auto/responses.json": "8b3f5eece6ebadbba4ea06ae9bc0b265132a3c243f38ebfa2b7df38c898d9e49",
+      "performance-release/hybrid-auto/report.json": "d7b42849a88056a638e1ea7d8c0291a4dde110fec4d96e4217de5fcc96997da2",
+      "performance-release/hybrid-auto/responses.json": "d786cf5dbcc8ab8fe3d06df65e6e981c191375df087806d0adf9053432ac602f",
+      "performance-release/decode-gpu/report.json": "2065090fda944cf13752f726ef6328f517cc84dc2d5a8c3e9c15cfbbc60b2f82",
+      "performance-release/decode-gpu/responses.json": "a4018f6cf5b3af40d7f2c89a1fbff1cd8951c2e3cb8f435b86390f4d8b2a2f46",
+      "performance-release/decode-cpu/report.json": "671db784b0df157c26eeb9a1126d85e0465c9dc1681be80ee01d48ad819c290a",
+      "performance-release/decode-cpu/responses.json": "9712ef64ee145ebf84d808d3fd882576b4d026d5154a8e819097832be304f137",
+      "performance-release/decode-gpu-reversed/report.json": "b452b07d854685fb88bf0dba65c0e1b38d1c5dd97c4d1aae37ae48be86c6c386",
+      "performance-release/decode-gpu-reversed/responses.json": "9cdfa9d656b1f6c586ad2e49389c12d6438dc76651475cff43f7426cc609cf4b",
+      "performance-release/decode-cpu-reversed/report.json": "a36caad46236a15c463435c3f42d0367378ecf71341d0a6d0a0128f2d430493a",
+      "performance-release/decode-cpu-reversed/responses.json": "45096e8a0963fa927955dd9cd37758136c15370cac5f8d81baeebb86357e2ffe",
+      "async-cache-benchmark.json": "5db9e3f59e84fc4dc075d0e764b425a21c2fc38b33042e6b4aef058e517012c0",
+      "generator-prefill-repro.log": "6e5dedb22cf37feebfdab70f7900ab2d2d8793ac207365b51922f87c0ae2ad35",
+      "generator-decode-repro.log": "a83b931a4dcc4ada52db42d093ccf100356782d6f4cf388dc6beb688c8e84f2e"
+    },
+    "record_generator_sha256": "f846a915aa71fd62e46255a4d7add8db8cee0a6053a943e7745bda379e7bea37"
+  },
+  "scope": "Windows CPU/CUDA, only local/generated fixtures <=64MiB. Native runtime only; no user models, context or saved profiles changed. Other backends/OS and trained-model throughput or language quality are not certified."
+}

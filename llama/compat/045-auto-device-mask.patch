@@ -1,0 +1,83 @@
+diff --git a/src/llama-device-mask.h b/src/llama-device-mask.h
+--- a/src/llama-device-mask.h
++++ b/src/llama-device-mask.h
+@@ -2,6 +2,16 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++
++// Unset selects capability-gated automatic admission. Explicit 0 (or an
++// unrecognized value) retains the host path; 1 keeps the manual opt-in.
++inline bool llama_device_mask_enabled(const char * setting) {
++    return !setting || (setting[0]=='1' && setting[1]=='\0');
++}
++
++inline bool llama_device_mask_default_admit(uint32_t n_tokens, uint32_t n_stream) {
++    return n_stream && n_tokens && n_tokens%n_stream==0 && n_tokens/n_stream>=512;
++}
+ 
+ // Admission is independent of backend/model names. Semantic capability and a
+ // CUDA backend are checked separately before graph construction.
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1668,8 +1668,17 @@
+ void llm_graph_result::prepare_device_masks(const llama_model & model,const llm_graph_params & params) {
+     try {
+     const char * enabled=std::getenv("WILDLLAMA_DEVICE_MASK");
+-    if (!enabled || std::strcmp(enabled,"1") || !params.sched || !params.cparams.offload_kqv ||
++    if (!llama_device_mask_enabled(enabled) || !params.sched || !params.cparams.offload_kqv ||
+             params.cparams.training || params.cparams.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT) { return; }
++    if (!enabled) {
++        const auto & batch=params.ubatch;
++        const uint32_t streams=params.cparams.kv_unified ? 1 : batch.n_seqs_unq;
++        // Decode and short batches should not inspect every device/model layer
++        // merely to discover that the automatic size threshold is not met.
++        if (!batch.token || batch.is_mixed() ||
++                (batch.n_pos!=1 && batch.n_pos!=3 && batch.n_pos!=4) ||
++                !llama_device_mask_default_admit(batch.n_tokens,streams)) { return; }
++    }
+     const auto scheduler=params.sched;
+     ggml_backend_t backend=nullptr;
+     llama_device_mask_placement placement;
+diff --git a/tests/test-device-mask-policy.cpp b/tests/test-device-mask-policy.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-device-mask-policy.cpp
+@@ -0,0 +1,36 @@
++#include "../src/llama-device-mask.h"
++
++#include <cstdio>
++#include <initializer_list>
++#include <stdexcept>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++int main() {
++    try {
++        require(llama_device_mask_enabled(nullptr), "unset must select automatic admission");
++        require(llama_device_mask_enabled("1"), "explicit enable ignored");
++        for (const char * value : {"", "0", "auto", "true", "10", "1x", "-1"}) {
++            require(!llama_device_mask_enabled(value), "invalid/disabled value admitted");
++        }
++        require(!llama_device_mask_default_admit(0,1), "empty batch admitted");
++        require(!llama_device_mask_default_admit(512,0), "empty stream set admitted");
++        require(!llama_device_mask_default_admit(1,1), "single-token decode admitted");
++        require(!llama_device_mask_default_admit(128,1), "short prompt admitted");
++        require(!llama_device_mask_default_admit(511,2), "uneven streams admitted");
++        require(!llama_device_mask_default_admit(256,2), "short per-stream prompt admitted");
++        require(!llama_device_mask_default_admit(256,1), "unmeasured small prompt admitted");
++        require(!llama_device_mask_default_admit(511,1), "sub-boundary prompt admitted");
++        require(llama_device_mask_default_admit(512,1), "boundary prompt rejected");
++        require(!llama_device_mask_default_admit(512,2), "short per-stream prompt admitted");
++        require(llama_device_mask_default_admit(1024,2), "boundary per-stream prompt rejected");
++        require(llama_device_mask_default_admit(4096,1), "large prompt rejected");
++        std::puts("DEVICE_MASK_POLICY default_auto=1 explicit_disable=1 short_decode_fallback=1 per_stream_boundary=512 PASS");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++}

@@ -68,10 +68,11 @@ the complete existing topology/input contract, including warmup state. Layout,
 adapter and scheduler changes invalidate stale arenas. Failed optional admission
 uses the original scheduler.
 
-Backend samplers currently retain graph-owned input bindings, so requests with
-attached backend samplers use the original arena. Training, encoder, pipeline,
-custom callback and managed-weight-provider paths also retain their original
-execution. Adding a graph key alone would not preserve these lifetimes.
+Supported complete backend samplers now retain separate graph-owned bindings;
+their logical RNG and history stay with the original sampler. See the
+[binding admission rules](execution-pipeline.md#samplers-and-persistent-graph-arenas).
+Unsupported samplers, training, encoder, pipeline, custom callback and
+managed-weight-provider paths retain their original execution.
 
 ## Retained prefix cells
 
@@ -87,11 +88,13 @@ prompt-cache accounting budget. Pressure releases optional references before
 retrying active work. Position shifts, state replacement and incompatible changes
 invalidate retained handles; an invalid entry cannot restore stale state.
 
-Hybrid/recurrent caches, MTP/draft state, sliding windows, multimodal positions,
-physical KV growth and split-stream layouts retain complete serialized snapshots.
-This is capability-based sharing for eligible memories, rather than a universal
-paged-memory implementation. Existing KV sharing between live sequences remains
-available independently.
+Eligible plain hybrid memories can now combine retained attention cells with a
+bounded recurrent snapshot; see [retained hybrid prefixes](execution-pipeline.md#retained-hybrid-prefixes).
+Unsupported recurrent layouts, MTP/draft state, sliding windows, multimodal
+positions, physical KV growth and split-stream layouts retain complete serialized
+snapshots. This is capability-based sharing for eligible memories, rather than a
+universal paged-memory implementation. Existing KV sharing between live sequences
+remains available independently.
 
 ## Validation and rejected candidates
 

@@ -1,0 +1,258 @@
+diff --git a/src/llama-device-mask-graph.h b/src/llama-device-mask-graph.h
+new file mode 100644
+--- /dev/null
++++ b/src/llama-device-mask-graph.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include "ggml.h"
++#include <vector>
++
++// ggml_graph_clear resets membership/use counts, not tensor COMPUTE flags.
++// Rebuild every original root in its original order without promoting ordered
++// placeholders or unselected branches to executable work. A newly introduced
++// operation must receive its own COMPUTE flag from its proven active consumer.
++inline void llama_device_mask_rebuild_order(ggml_cgraph * graph,
++        const std::vector<ggml_tensor *> & roots,
++        const std::vector<ggml_tensor *> & leafs, ggml_tensor * promoted) {
++    ggml_graph_clear(graph);
++    // Select branches may deliberately register an otherwise orphan input
++    // leaf. Keep its original allocation contract; the promoted former mask
++    // leaf is now reached as an operation from its existing consumers.
++    for (auto * leaf : leafs) {
++        if (leaf!=promoted) { ggml_build_forward_order(graph,leaf); }
++    }
++    for (auto * root : roots) { ggml_build_forward_order(graph,root); }
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include "llama-kv-cache.h"
+ #include "llama-device-mask.h"
++#include "llama-device-mask-graph.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-kv-cache-dsa-iswa.h"
+@@ -1747,6 +1748,7 @@
+         if (!placement.all_kv_regular_on_device) { continue; }
+ 
+         std::vector<ggml_tensor *> consumers;
++        bool has_active_consumer=false;
+         placement.all_consumers_on_device=true;
+         for (int i=0;i<ggml_graph_n_nodes(gf);++i) {
+             auto * node=ggml_graph_node(gf,i);
+@@ -1759,16 +1761,18 @@
+                     placement.all_consumers_on_device=false;break;
+                 }
+                 consumers.push_back(node);
++                has_active_consumer |= (node->flags & GGML_TENSOR_FLAG_COMPUTE)!=0;
+             }
+             if (!placement.all_consumers_on_device) { break; }
+         }
+         placement.all_consumers_on_device &= !consumers.empty();
+-        if (!llama_device_mask_placement_admit(placement)) { continue; }
++        if (!has_active_consumer || !llama_device_mask_placement_admit(placement)) { continue; }
+         // Promotion adds one graph node and one net leaf. Preserve the entire
+         // original graph when metadata/graph capacity is insufficient.
+         if (gf->n_nodes+1>gf->size || gf->n_leafs+1>gf->size ||
+                 ggml_get_mem_size(get_ctx())-ggml_used_mem(get_ctx())<2*ggml_tensor_overhead()) { continue; }
+         const auto roots=std::vector<ggml_tensor *>(ggml_graph_nodes(gf),ggml_graph_nodes(gf)+ggml_graph_n_nodes(gf));
++        const auto leafs=std::vector<ggml_tensor *>(gf->leafs,gf->leafs+gf->n_leafs);
+         auto * keys=ggml_new_tensor_3d(get_ctx(),GGML_TYPE_I32,mask->ne[0],2,ns);
+         auto * queries=ggml_new_tensor_3d(get_ctx(),GGML_TYPE_I32,mask->ne[1],2,ns);
+         ggml_tensor operation=*mask;
+@@ -1778,14 +1782,15 @@
+         ggml_set_name(keys,"attn_inp_mask_keys");ggml_set_name(queries,"attn_inp_mask_queries");
+         mask->op=GGML_OP_ATTN_MASK;mask->src[0]=keys;mask->src[1]=queries;
+         mask->flags &= ~GGML_TENSOR_FLAG_INPUT;
++        mask->flags |= GGML_TENSOR_FLAG_COMPUTE;
+         ggml_set_name(mask,"attn_inp_kq_mask_device");
+         inp->self_mask_keys=keys;inp->self_mask_queries=queries;
+         ggml_backend_sched_set_tensor_backend(scheduler,mask,backend);
+         for (auto * consumer:consumers) { ggml_backend_sched_set_tensor_backend(scheduler,consumer,backend); }
+-        // Re-expand every original root, including KV writes/other side effects,
+-        // in its original order. Only the new integer mask node is inserted.
+-        ggml_graph_clear(gf);
+-        for (auto * root:roots) { ggml_build_forward_expand(gf,root); }
++        // Preserve all ordered roots and KV writes without executing inactive
++        // embedding/sampler branches whose input indices were never populated.
++        // Only the new mask operation gains a COMPUTE flag.
++        llama_device_mask_rebuild_order(gf,roots,leafs,mask);
+     }
+     } catch (const std::exception &) {
+         // All optional allocations precede descriptor promotion.
+diff --git a/tests/test-hybrid-device-mask.cpp b/tests/test-hybrid-device-mask.cpp
+--- a/tests/test-hybrid-device-mask.cpp
++++ b/tests/test-hybrid-device-mask.cpp
+@@ -7,6 +7,8 @@
+ #include "llama-hybrid-prefix-transaction.h"
+ #include "llama-prefix-text.h"
+ #include "llama-device-mask.h"
++#include "llama-device-mask-graph.h"
++#include "../ggml/src/ggml-impl.h"
+ #include "llama-kv-cache.h"
+ #include <climits>
+ #include <filesystem>
+@@ -140,7 +142,27 @@
+ }
+ 
+ static size_t mask_ops=0,cuda_mask_ops=0,cuda_attention=0,cpu_attention=0;
++static bool guard_inactive_inputs=false;
++static size_t inactive_get_rows=0,inactive_set_rows=0,cpu_input_embeddings=0;
+ static bool observe(ggml_tensor * t,bool ask,void *) {
++    if (guard_inactive_inputs && ask) {
++        const auto named=[](const ggml_tensor * tensor,const char * prefix) {
++            return tensor && std::strncmp(tensor->name,prefix,std::strlen(prefix))==0;
++        };
++        if (t->op==GGML_OP_GET_ROWS && named(t->src[1],"inp_mixed_tokens")) {
++            require(!(t->flags & GGML_TENSOR_FLAG_COMPUTE),"inactive mixed GET_ROWS became executable");
++            ++inactive_get_rows;
++        }
++        if (t->op==GGML_OP_SET_ROWS && named(t->src[2],"inp_mixed_slots")) {
++            require(!(t->flags & GGML_TENSOR_FLAG_COMPUTE),"inactive mixed SET_ROWS became executable");
++            ++inactive_set_rows;
++        }
++        if (t->op==GGML_OP_GET_ROWS && named(t->src[1],"inp_tokens") &&
++                (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[0]->buffer && t->buffer &&
++                ggml_backend_buffer_is_host(t->src[0]->buffer) && ggml_backend_buffer_is_host(t->buffer)) {
++            ++cpu_input_embeddings;
++        }
++    }
+     if(t->op!=GGML_OP_ATTN_MASK && t->op!=GGML_OP_FLASH_ATTN_EXT && t->op!=GGML_OP_SOFT_MAX)return false;
+     if(ask)return true;
+     const bool host=t->buffer && ggml_backend_buffer_is_host(t->buffer);
+@@ -235,6 +257,122 @@
+     }
+     compact(false);
+ }
++
++static void execution_flag_unit() {
++    ggml_context_ptr ctx(ggml_init({128*ggml_tensor_overhead()+ggml_graph_overhead_custom(64,false),nullptr,true}));
++    require(bool(ctx),"cannot allocate graph execution fixture");
++    auto * table=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,4,8);
++    auto * ids=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_I32,4);
++    auto * bad_ids=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_I32,4);
++    auto * bad_slots=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_I64,4);
++    auto * mixed_input=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,4,4);
++    ggml_set_input(ids);ggml_set_input(bad_ids);ggml_set_input(bad_slots);ggml_set_input(mixed_input);
++    auto * selected=ggml_get_rows(ctx.get(),table,ids);
++    auto * inactive=ggml_get_rows(ctx.get(),table,bad_ids);
++    ggml_set_name(inactive,"inactive_sentinel_get_rows");
++    auto * mixed=ggml_set_rows(ctx.get(),ggml_dup(ctx.get(),mixed_input),inactive,bad_slots);
++    ggml_set_name(mixed,"inactive_sentinel_set_rows");
++    auto * graph=ggml_new_graph_custom(ctx.get(),64,false);
++    ggml_build_forward_order(graph,selected);ggml_build_forward_order(graph,inactive);
++    ggml_tensor * choices[]={selected,mixed};
++    auto * chosen=ggml_build_forward_select(graph,choices,2,0);
++    auto * mask=ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,4,4);ggml_set_input(mask);
++    auto * output=ggml_add(ctx.get(),chosen,mask);ggml_set_output(output);ggml_build_forward_expand(graph,output);
++    auto * side_source=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,4);
++    auto * side_destination=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,4);
++    auto * side_effect=ggml_cpy(ctx.get(),side_source,side_destination);ggml_build_forward_expand(graph,side_effect);
++    auto * orphan=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,4);ggml_set_input(orphan);ggml_build_forward_order(graph,orphan);
++    require(!(inactive->flags & GGML_TENSOR_FLAG_COMPUTE) && !(mixed->flags & GGML_TENSOR_FLAG_COMPUTE),"unit inactive branches were already active");
++    const std::vector<ggml_tensor *> roots(graph->nodes,graph->nodes+graph->n_nodes);
++    const std::vector<ggml_tensor *> leafs(graph->leafs,graph->leafs+graph->n_leafs);
++    std::vector<int32_t> flags,use_counts;
++    for (int i=0;i<graph->n_nodes;++i) {flags.push_back(roots[i]->flags);use_counts.push_back(ggml_node_get_use_count(graph,i));}
++    auto * keys=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,4,2,1);
++    auto * queries=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_I32,4,2,1);
++    ggml_set_input(keys);ggml_set_input(queries);
++    mask->op=GGML_OP_ATTN_MASK;mask->src[0]=keys;mask->src[1]=queries;
++    mask->flags &= ~GGML_TENSOR_FLAG_INPUT;mask->flags |= GGML_TENSOR_FLAG_COMPUTE;
++    llama_device_mask_rebuild_order(graph,roots,leafs,mask);
++    require(graph->n_nodes==int(roots.size())+1 && graph->n_leafs==int(leafs.size())+1,"graph promotion lost original nodes or leaves");
++    for(size_t i=0;i<roots.size();++i) {
++        require(roots[i]->flags==flags[i],"graph promotion changed an original compute/input/output flag");
++        int at=-1;for(int j=0;j<graph->n_nodes;++j)if(graph->nodes[j]==roots[i]){at=j;break;}
++        require(at>=0 && ggml_node_get_use_count(graph,at)==use_counts[i],"original graph use count changed");
++    }
++    bool orphan_kept=false;for(int i=0;i<graph->n_leafs;++i)orphan_kept |= graph->leafs[i]==orphan;
++    require(orphan_kept,"standalone input leaf allocation contract lost");
++    require(!(inactive->flags & GGML_TENSOR_FLAG_COMPUTE) && !(mixed->flags & GGML_TENSOR_FLAG_COMPUTE),"unselected sentinel branch was promoted");
++    const auto cpu=ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    require(cpu!=nullptr,"CPU backend missing for execution-flag unit");
++    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_dev_init(cpu,nullptr),ggml_backend_free);
++    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));
++    require(bool(buffer),"cannot allocate tiny CPU execution-flag graph");
++    float values[32];for(int i=0;i<32;++i)values[i]=float(i)/8.f;
++    const int32_t good[4]={0,1,2,3},poison[4]={INT_MAX,INT_MAX,INT_MAX,INT_MAX};
++    const int64_t slots[4]={INT64_MAX,INT64_MAX,INT64_MAX,INT64_MAX};
++    const int32_t positions[8]={0,1,2,3,1,1,1,1};const float side[4]={7,11,13,17};
++    ggml_backend_tensor_set(table,values,0,sizeof(values));ggml_backend_tensor_set(ids,good,0,sizeof(good));
++    ggml_backend_tensor_set(bad_ids,poison,0,sizeof(poison));ggml_backend_tensor_set(bad_slots,slots,0,sizeof(slots));
++    ggml_backend_tensor_set(keys,positions,0,sizeof(positions));ggml_backend_tensor_set(queries,positions,0,sizeof(positions));
++    ggml_backend_tensor_set(side_source,side,0,sizeof(side));
++    require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"execution-flag graph failed");
++    float actual[16],stored[4];ggml_backend_tensor_get(output,actual,0,sizeof(actual));ggml_backend_tensor_get(side_destination,stored,0,sizeof(stored));
++    for(int q=0;q<4;++q)for(int k=0;k<4;++k){const float expected=k<=q ? values[q*4+k] : -INFINITY;require(actual[q*4+k]==expected,"selected graph output changed");}
++    require(std::memcmp(stored,side,sizeof(side))==0,"disconnected KV-like write side effect was lost");
++    std::puts("DEVICE_MASK_EXECUTION_GUARD original_flags_exact=1 use_counts_exact=1 poisoned_inactive_get_set_rows=1 orphan_leaf=1 side_effect=1 PASS");
++}
++
++static std::vector<float> host_embedding_decode(llama_context * ctx,int n,int start,bool use_compact,bool output_last) {
++    compact(use_compact);
++    auto batch=llama_batch_init(n,0,1);batch.n_tokens=n;
++    for(int i=0;i<n;++i){batch.token[i]=3+(i*13+start)%256;batch.pos[i]=start+i;batch.n_seq_id[i]=1;batch.seq_id[i][0]=0;batch.logits[i]=output_last && i==n-1;}
++    mask_ops=cuda_mask_ops=cuda_attention=cpu_attention=0;
++    require(llama_decode(ctx,batch)==0,"file-loaded hybrid CPU-input decode failed");
++    llama_batch_free(batch);
++    require(mask_ops==cuda_mask_ops,"hybrid mask did not execute on CUDA");
++    if(use_compact && output_last && n>=256)require(mask_ops>0,"file-loaded hybrid compact mask never executed");
++    if(!use_compact)require(mask_ops==0,"disabled file-loaded mask unexpectedly executed");
++    if(!output_last)return {};
++    const auto * out=llama_get_logits_ith(ctx,-1);require(out,"file-loaded hybrid logits missing");
++    return {out,out+llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))};
++}
++static void host_embedding_graph_tests(const std::string & directory) {
++    if(!gpu)return;
++    const auto file=(std::filesystem::path(directory)/"hybrid-cpu-input-mask.gguf").string();
++    {auto generated=tiny_model(false,128,file);}
++    ggml_backend_dev_t devices[]={ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU),nullptr};
++    auto p=llama_model_default_params();p.devices=devices;p.n_gpu_layers=99;
++    p.gpu_exclusive=false;p.no_host=false;p.load_mode=LLAMA_LOAD_MODE_MMAP;
++    llama_model_ptr model(llama_model_load_from_file(file.c_str(),p));
++    require(bool(model),"cannot load hybrid fixture with normal CPU input embeddings");
++    auto context=[&](bool use_compact){
++        compact(use_compact);auto cp=llama_context_default_params();
++        cp.n_ctx=2048;cp.n_batch=cp.n_ubatch=512;cp.n_seq_max=1;cp.kv_unified=false;cp.n_rs_seq=0;
++        cp.n_outputs_max=cp.n_outputs_max_per_seq=1;cp.n_threads=cp.n_threads_batch=2;
++        cp.op_offload=true;cp.offload_kqv=true;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;cp.cb_eval=observe;
++        llama_context_ptr result(llama_init_from_model(model.get(),cp));require(bool(result),"cannot create normal CPU-input hybrid context");return result;
++    };
++    auto reference=context(false),candidate=context(true);
++    inactive_get_rows=inactive_set_rows=cpu_input_embeddings=0;guard_inactive_inputs=true;
++    for(int repeat=0;repeat<2;++repeat){
++        for(auto * ctx : {reference.get(),candidate.get()})llama_memory_clear(llama_get_memory(ctx),true);
++        // Real HTTP prefill emits no output for all but its final microbatch.
++        host_embedding_decode(reference.get(),512,0,false,false);
++        host_embedding_decode(candidate.get(),512,0,true,false);
++        auto a=host_embedding_decode(reference.get(),512,512,false,true);
++        auto b=host_embedding_decode(candidate.get(),512,512,true,true);
++        equal_mask(a,b,"file-loaded-cpu-embedding-one-output-prefill");
++        a=host_embedding_decode(reference.get(),1,1024,false,true);
++        b=host_embedding_decode(candidate.get(),1,1024,true,true);
++        equal_mask(a,b,"file-loaded-cpu-embedding-single-decode");
++    }
++    guard_inactive_inputs=false;
++    require(cpu_input_embeddings>0,"file-loaded fixture did not execute CPU input embedding GET_ROWS");
++    // The scheduler may omit inactive nodes from callbacks; the shared unit verifies their flags and poisoned indices.
++    std::printf("HYBRID_CPU_INPUT_EXECUTION_GUARD cpu_embedding_ops=%zu inactive_get_rows_observed=%zu inactive_set_rows_observed=%zu output_free_and_single_output=1 PASS\n",
++        cpu_input_embeddings,inactive_get_rows,inactive_set_rows);
++}
++
+ int main(int argc,char ** argv) {
+     try {
+         std::setvbuf(stdout,nullptr,_IONBF,0);
+@@ -243,7 +381,9 @@
+         ggml_backend_load_all();
+         if(gpu && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))return 77;
+         position_proof();
++        execution_flag_unit();
+         graph_tests(dir);
++        host_embedding_graph_tests(dir);
+         return 0;
+     } catch(const std::exception & e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+ }

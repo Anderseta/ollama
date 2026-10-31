@@ -1,0 +1,345 @@
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -3055,7 +3055,12 @@
+ #endif
+ }
+ 
+-static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++#if defined(_MSC_VER)
++__declspec(noinline)
++#elif defined(__GNUC__) || defined(__clang__)
++__attribute__((noinline))
++#endif
++static void llama_sampler_penalties_apply_general(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
+ 
+     if (ctx->is_disabled()) {
+@@ -3084,6 +3089,52 @@
+         cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+     }
+ 
++    cur_p->sorted = false;
++}
++
++static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    auto * ctx = (llama_sampler_penalties *) smpl->ctx;
++    if (ctx->is_disabled()) {
++        return;
++    }
++    if (ctx->token_count.empty()) {
++        cur_p->sorted = false;
++        return;
++    }
++    if (ctx->n_vocab <= 0 || cur_p->size != (size_t) ctx->n_vocab ||
++            ctx->token_count.size() > cur_p->size - cur_p->size / 4) {
++        llama_sampler_penalties_apply_general(smpl, cur_p);
++        return;
++    }
++
++    // Prove a canonical prefix before updating its sparse history rows.
++    // Reordered or duplicate-ID candidates keep the original loop in the suffix.
++    size_t canonical_end = 0;
++    for (; canonical_end < cur_p->size && cur_p->data[canonical_end].id == (llama_token) canonical_end; ++canonical_end) {}
++    if (canonical_end == 0 || (canonical_end < cur_p->size && ctx->token_count.size() > cur_p->size / 8)) {
++        llama_sampler_penalties_apply_general(smpl, cur_p);
++        return;
++    }
++    for (const auto & entry : ctx->token_count) {
++        if (entry.first < 0 || (size_t) entry.first >= canonical_end) {
++            continue;
++        }
++        auto & candidate = cur_p->data[entry.first];
++        const int count = entry.second;
++        assert(count > 0 && count <= ctx->penalty_last_n);
++        if (candidate.logit <= 0) {
++            candidate.logit *= ctx->penalty_repeat;
++        } else {
++            candidate.logit /= ctx->penalty_repeat;
++        }
++        candidate.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
++    }
++    if (canonical_end < cur_p->size) {
++        auto suffix = *cur_p;
++        suffix.data += canonical_end;
++        suffix.size -= canonical_end;
++        llama_sampler_penalties_apply_general(smpl, &suffix);
++    }
+     cur_p->sorted = false;
+ }
+ 
+@@ -3294,6 +3345,21 @@
+ }
+ 
+ static struct llama_sampler_i llama_sampler_penalties_i = {
++    /* .name              = */ llama_sampler_penalties_name,
++    /* .accept            = */ llama_sampler_penalties_accept,
++    /* .apply             = */ llama_sampler_penalties_apply_general,
++    /* .reset             = */ llama_sampler_penalties_reset,
++    /* .clone             = */ llama_sampler_penalties_clone,
++    /* .free              = */ llama_sampler_penalties_free,
++    /* .backend_init      = */ llama_sampler_penalties_backend_init,
++    /* .backend_accept    = */ nullptr,
++    /* .backend_apply     = */ llama_sampler_penalties_backend_apply,
++    /* .backend_set_input = */ llama_sampler_penalties_backend_set_input,
++    /* .backend_reset     = */ llama_sampler_penalties_backend_reset,
++    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_penalties>,
++};
++
++static struct llama_sampler_i llama_sampler_penalties_canonical_i = {
+     /* .name              = */ llama_sampler_penalties_name,
+     /* .accept            = */ llama_sampler_penalties_accept,
+     /* .apply             = */ llama_sampler_penalties_apply,
+@@ -3322,7 +3388,8 @@
+     }
+ 
+     return llama_sampler_init(
+-        /* .iface = */ &llama_sampler_penalties_i,
++        /* .iface = */ n_vocab > 0 && penalty_last_n <= n_vocab - n_vocab / 4
++            ? &llama_sampler_penalties_canonical_i : &llama_sampler_penalties_i,
+         /* .ctx   = */ new llama_sampler_penalties(
+             n_vocab,
+             penalty_last_n,
+@@ -4722,7 +4789,7 @@
+            iface == &llama_sampler_dist_i      || iface == &llama_sampler_top_k_i  ||
+            iface == &llama_sampler_top_p_i     || iface == &llama_sampler_min_p_i  ||
+            iface == &llama_sampler_temp_i      || iface == &llama_sampler_temp_ext_i ||
+-           iface == &llama_sampler_penalties_i || iface == &llama_sampler_logit_bias_i ||
++           iface == &llama_sampler_penalties_i || iface == &llama_sampler_penalties_canonical_i || iface == &llama_sampler_logit_bias_i ||
+            iface == &llama_sampler_token_mask_i;
+ }
+ 
+@@ -4761,7 +4828,7 @@
+             }
+         } else if(sampler->iface==&llama_sampler_dist_i) {
+             result.payload=vector_bytes(static_cast<const llama_sampler_dist *>(sampler->ctx)->inp_uniforms.size(),sizeof(ggml_tensor *));
+-        } else if(sampler->iface==&llama_sampler_penalties_i) {
++        } else if(sampler->iface==&llama_sampler_penalties_i || sampler->iface==&llama_sampler_penalties_canonical_i) {
+             const auto & ctx=*static_cast<const llama_sampler_penalties *>(sampler->ctx);
+             add(result.payload,vector_bytes(ctx.host_token_ids.size(),sizeof(int32_t)));
+             add(result.payload,vector_bytes(ctx.host_counts.size(),sizeof(int32_t)));
+@@ -4780,7 +4847,7 @@
+         } else if (sampler->iface == &llama_sampler_dist_i) {
+             const auto & ctx = *static_cast<llama_sampler_dist *>(sampler->ctx);
+             e.uniforms = ctx.inp_uniforms; e.transactional = ctx.backend_transactional;
+-        } else if (sampler->iface == &llama_sampler_penalties_i) {
++        } else if (sampler->iface == &llama_sampler_penalties_i || sampler->iface == &llama_sampler_penalties_canonical_i) {
+             const auto & ctx = *static_cast<llama_sampler_penalties *>(sampler->ctx);
+             e.input0 = ctx.inp_token_ids; e.input1 = ctx.inp_counts;
+             e.n_max = ctx.n_max; e.has_candidates = ctx.has_candidates;
+@@ -4847,7 +4914,7 @@
+                 auto & ctx = *static_cast<llama_sampler_dist *>(e.identity->ctx);
+                 ctx.inp_uniforms.swap(e.uniforms);
+                 std::swap(ctx.backend_transactional, e.transactional);
+-            } else if (e.iface == &llama_sampler_penalties_i) {
++            } else if (e.iface == &llama_sampler_penalties_i || e.iface == &llama_sampler_penalties_canonical_i) {
+                 auto & ctx = *static_cast<llama_sampler_penalties *>(e.identity->ctx);
+                 std::swap(ctx.inp_token_ids, e.input0); std::swap(ctx.inp_counts, e.input1);
+                 std::swap(ctx.n_max, e.n_max); std::swap(ctx.has_candidates, e.has_candidates);
+diff --git a/tests/test-penalties-canonical.cpp b/tests/test-penalties-canonical.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-penalties-canonical.cpp
+@@ -0,0 +1,202 @@
++#include "llama.h"
++#include "../src/llama-sampler.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++static void require(bool value, const char * message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++static std::vector<llama_token_data> candidates(int n) {
++    std::vector<llama_token_data> data;
++    for (int i = 0; i < n; ++i) {
++        data.push_back({i, float((i * 17) % 193 - 96) / 13.0f, float(i % 11) / 16.0f});
++    }
++    if (n > 8) {
++        data[0].logit = 0.0f;
++        data[1].logit = -0.0f;
++        data[2].logit = std::numeric_limits<float>::infinity();
++        data[3].logit = -std::numeric_limits<float>::infinity();
++        data[4].logit = std::numeric_limits<float>::quiet_NaN();
++    }
++    return data;
++}
++
++static void reference(llama_token_data_array & cur, int last, float repeat, float freq, float presence,
++        const std::vector<llama_token> & history) {
++    if (last <= 0 || (repeat == 1.0f && freq == 0.0f && presence == 0.0f)) { return; }
++    std::unordered_map<llama_token, int> count;
++    const size_t begin = history.size() > (size_t) last ? history.size() - last : 0;
++    for (size_t i = begin; i < history.size(); ++i) { ++count[history[i]]; }
++    for (size_t i = 0; i < cur.size; ++i) {
++        const auto it = count.find(cur.data[i].id);
++        if (it == count.end()) { continue; }
++        if (cur.data[i].logit <= 0) { cur.data[i].logit *= repeat; }
++        else { cur.data[i].logit /= repeat; }
++        cur.data[i].logit -= float(it->second) * freq + float(it->second > 0) * presence;
++    }
++    cur.sorted = false;
++}
++
++static void compare(llama_sampler * sampler, int last, float repeat, float freq, float presence,
++        const std::vector<llama_token> & history, std::vector<llama_token_data> data, bool sorted) {
++    auto expected = data;
++    llama_token_data_array actual = {data.data(), data.size(), data.empty() ? -1 : 3, sorted};
++    llama_token_data_array control = {expected.data(), expected.size(), actual.selected, sorted};
++    reference(control, last, repeat, freq, presence, history);
++    llama_sampler_apply(sampler, &actual);
++    require(actual.size == control.size && actual.selected == control.selected && actual.sorted == control.sorted,
++            "penalty candidate metadata changed");
++    for (size_t i = 0; i < data.size(); ++i) {
++        require(std::memcmp(&data[i], &expected[i], sizeof(data[i])) == 0, "penalty candidate bytes changed");
++    }
++}
++
++static void correctness(bool check_binding_variants = true) {
++    std::mt19937 rng(1442);
++    int comparisons = 0;
++    for (int n : {16, 8192, 32768}) {
++        for (int history_size : {0, 1, 64, 512, n / 2, n}) {
++            for (int mode = 0; mode < 7; ++mode) {
++                auto data = candidates(n);
++                if (mode == 1) { std::reverse(data.begin(), data.end()); }
++                if (mode == 2) { std::shuffle(data.begin(), data.end(), rng); }
++                if (mode == 3) { data.back().id = 4; }
++                if (mode == 4) { data.resize(n / 3); }
++                if (mode == 5) { data.back().id = n + 17; data[0].id = -6; }
++                if (mode == 6) { data.clear(); }
++                for (const auto & values : std::vector<std::vector<float>>{
++                        {1.0f, 0.0f, 0.0f}, {1.13f, 0.25f, -0.125f}, {0.87f, -0.25f, 0.5f}}) {
++                    const int last = history_size == 0 ? 64 : std::max(1, history_size - 3);
++                    auto * sampler = llama_sampler_init_penalties(n, last, values[0], values[1], values[2]);
++                    std::vector<llama_token> history;
++                    for (int i = 0; i < history_size; ++i) {
++                        llama_token token = i < 8 ? i : (i * 61) % n;
++                        if (i % 31 == 0) { token = -6; }
++                        if (i % 37 == 0) { token = n + 17; }
++                        history.push_back(token);
++                        llama_sampler_accept(sampler, token);
++                    }
++                    for (bool sorted : {false, true}) {
++                        compare(sampler, last, values[0], values[1], values[2], history, data, sorted);
++                        ++comparisons;
++                    }
++                    auto * clone = llama_sampler_clone(sampler);
++                    require(clone != nullptr, "penalty clone failed");
++                    require(clone->iface == sampler->iface, "penalty clone changed builtin variant");
++                    compare(clone, last, values[0], values[1], values[2], history, data, true);
++                    ++comparisons;
++                    llama_sampler_reset(clone);
++                    compare(clone, last, values[0], values[1], values[2], {}, data, true);
++                    ++comparisons;
++                    llama_sampler_free(clone);
++                    llama_sampler_free(sampler);
++                }
++            }
++        }
++    }
++    for (int last : {-1, 0}) {
++        auto * sampler = llama_sampler_init_penalties(8192, last, 1.13f, 0.25f, -0.125f);
++        for (llama_token token : {0, 1, 4, -6, 9000}) { llama_sampler_accept(sampler, token); }
++        compare(sampler, last, 1.13f, 0.25f, -0.125f, {0, 1, 4, -6, 9000}, candidates(8192), true);
++        ++comparisons;
++        llama_sampler_free(sampler);
++    }
++    {
++        std::vector<llama_token> history;
++        auto * sampler = llama_sampler_init_penalties(8192, 16384, 1.13f, 0.25f, -0.125f);
++        for (int i = 0; i < 16384; ++i) { history.push_back(i); llama_sampler_accept(sampler, i); }
++        compare(sampler, 16384, 1.13f, 0.25f, -0.125f, history, candidates(8192), true);
++        ++comparisons;
++        llama_sampler_free(sampler);
++        sampler = llama_sampler_init_penalties(0, 64, 1.13f, 0.25f, -0.125f);
++        llama_sampler_accept(sampler, 4);
++        compare(sampler, 64, 1.13f, 0.25f, -0.125f, {4}, candidates(8192), true);
++        ++comparisons;
++        llama_sampler_free(sampler);
++    }
++    if (check_binding_variants) {
++        auto * short_window = llama_sampler_init_penalties(8192, 6144, 1.13f, 0.25f, -0.125f);
++        auto * long_window = llama_sampler_init_penalties(8192, 6145, 1.13f, 0.25f, -0.125f);
++        require(short_window->iface != long_window->iface, "long penalty window did not select the direct legacy callback");
++        require(short_window->iface->backend_apply == long_window->iface->backend_apply &&
++                short_window->iface->backend_init == long_window->iface->backend_init &&
++                short_window->iface->copy_state == long_window->iface->copy_state, "builtin backend callbacks changed");
++        for (auto * sampler : {short_window, long_window}) {
++            require(llama_sampler_backend_can_bind_graph(sampler), "builtin penalty variant lost graph binding support");
++            auto snapshot = llama_sampler_backend_capture_bindings(sampler);
++            require(snapshot && snapshot->matches(sampler), "penalty binding capture failed");
++            llama_sampler_accept(sampler, 4);
++            snapshot->swap_bindings(sampler);
++            compare(sampler, sampler == short_window ? 6144 : 6145, 1.13f, 0.25f, -0.125f, {4}, candidates(8192), true);
++            snapshot->swap_bindings(sampler);
++            llama_sampler_i copied = *sampler->iface;
++            llama_sampler custom = {&copied, sampler->ctx};
++            require(!llama_sampler_backend_can_bind_graph(&custom) && !llama_sampler_backend_capture_bindings(&custom),
++                    "copied custom penalty callbacks admitted as a builtin");
++        }
++        llama_sampler_free(short_window);
++        llama_sampler_free(long_window);
++        std::puts("PENALTIES_BINDINGS builtin_variants=2 custom_copies_rejected=2 original_history_preserved=1");
++    }
++    std::printf("PENALTIES_CANONICAL comparisons=%d bytes_exact=1 fallback_cases=1 clone_reset=1\n", comparisons);
++}
++
++static void benchmark(int vocab, int history_size, const std::string & mode, int repetitions) {
++    auto data = candidates(vocab);
++    for (auto & item : data) { if (!std::isfinite(item.logit)) { item.logit = -2.0f; } }
++    if (mode == "late-duplicate") { data.back().id = 0; }
++    if (mode == "reverse") { std::reverse(data.begin(), data.end()); }
++    if (mode == "filtered") { data.resize(vocab / 2); }
++    const float repeat = mode == "disabled" ? 1.0f : 1.13f;
++    const float freq = mode == "disabled" ? 0.0f : 0.25f;
++    const float presence = mode == "disabled" ? 0.0f : -0.125f;
++    auto * sampler = llama_sampler_init_penalties(vocab, std::max(64, history_size), repeat, freq, presence);
++    for (int i = 0; i < history_size; ++i) { llama_sampler_accept(sampler, (i * 61) % vocab); }
++    auto cur = data;
++    volatile double checksum = 0;
++    using clock = std::chrono::steady_clock;
++    for (int i = 0; i < 4; ++i) {
++        std::copy(data.begin(), data.end(), cur.begin());
++        llama_token_data_array p = {cur.data(), cur.size(), -1, false};
++        llama_sampler_apply(sampler, &p);
++    }
++    const auto start = clock::now();
++    for (int i = 0; i < repetitions; ++i) {
++        std::copy(data.begin(), data.end(), cur.begin());
++        llama_token_data_array p = {cur.data(), cur.size(), -1, false};
++        llama_sampler_apply(sampler, &p);
++        checksum += cur[(size_t(i) * 8191) % cur.size()].logit;
++    }
++    const auto end = clock::now();
++    const double us = std::chrono::duration<double, std::micro>(end - start).count() / repetitions;
++    llama_sampler_free(sampler);
++    std::printf("{\"vocab\":%d,\"history\":%d,\"mode\":\"%s\",\"repetitions\":%d,\"us_per_apply_with_input_copy\":%.9f,\"checksum\":%.9g}\n",
++            vocab, history_size, mode.c_str(), repetitions, us, double(checksum));
++}
++
++int main(int argc, char ** argv) {
++    try {
++        if (argc == 6 && std::string(argv[1]) == "--bench") {
++            benchmark(std::stoi(argv[2]), std::stoi(argv[3]), argv[4], std::stoi(argv[5]));
++        } else {
++            correctness(!(argc == 2 && std::string(argv[1]) == "--legacy"));
++        }
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++}

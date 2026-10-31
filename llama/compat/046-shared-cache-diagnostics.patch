@@ -1,0 +1,24 @@
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -172,7 +172,7 @@
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
+ 
+-    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
++    LLAMA_API const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
+     // The stream holding seq_id's cells.
+     uint32_t get_stream(llama_seq_id seq_id) const;
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -86,7 +86,7 @@
+     // llama_memory_hybrid specific API
+     //
+ 
+-    llama_kv_cache * get_mem_attn() const;
++    LLAMA_API llama_kv_cache * get_mem_attn() const;
+     llama_memory_recurrent * get_mem_recr() const;
+ 
+ private:

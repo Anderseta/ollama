@@ -1,0 +1,48 @@
+diff --git a/src/llama-device-mask.h b/src/llama-device-mask.h
+--- a/src/llama-device-mask.h
++++ b/src/llama-device-mask.h
+@@ -11,6 +11,13 @@
+ 
+ inline bool llama_device_mask_default_admit(uint32_t n_tokens, uint32_t n_stream) {
+     return n_stream && n_tokens && n_tokens%n_stream==0 && n_tokens/n_stream>=512;
++}
++
++// Extended text/cache proofs add host work. Small hybrid/M-RoPE masks did not
++// show a consistent end-to-end gain, so automatic admission starts at 2 MiB.
++// Manual 1 keeps the separately checked original size policy.
++inline bool llama_device_mask_default_layout_admit(uint64_t dense_bytes, bool extended_text) {
++    return !extended_text || dense_bytes>=2ull*1024*1024;
+ }
+ 
+ // Admission is independent of backend/model names. Semantic capability and a
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1724,7 +1724,9 @@
+         const uint32_t ns=params.cparams.kv_unified ? 1 : batch.n_seqs_unq;
+         const auto plan=llama_device_mask_admit(mask->ne[0],batch.n_tokens,ns,batch.n_seqs_unq,
+             mask->type==GGML_TYPE_F16);
+-        if (!plan.eligible || !inp->mctx->can_use_device_mask(batch,params.cparams.causal_attn,ns)) { continue; }
++        if (!plan.eligible || (!enabled &&
++                !llama_device_mask_default_layout_admit(plan.dense_bytes,hybrid || batch.n_pos>1)) ||
++                !inp->mctx->can_use_device_mask(batch,params.cparams.causal_attn,ns)) { continue; }
+ 
+         // Inspect actual cache storage without allocating or copying any KV
+         // data. The probe context owns only a bounded set of view descriptors.
+diff --git a/tests/test-device-mask-policy.cpp b/tests/test-device-mask-policy.cpp
+--- a/tests/test-device-mask-policy.cpp
++++ b/tests/test-device-mask-policy.cpp
+@@ -27,7 +27,13 @@
+         require(!llama_device_mask_default_admit(512,2), "short per-stream prompt admitted");
+         require(llama_device_mask_default_admit(1024,2), "boundary per-stream prompt rejected");
+         require(llama_device_mask_default_admit(4096,1), "large prompt rejected");
++        require(llama_device_mask_default_layout_admit(256*1024,false), "ordinary size policy changed");
++        require(!llama_device_mask_default_layout_admit(256*1024,true), "small extended mask admitted");
++        require(!llama_device_mask_default_layout_admit(2*1024*1024-1,true), "sub-boundary extended mask admitted");
++        require(llama_device_mask_default_layout_admit(2*1024*1024,true), "extended mask boundary rejected");
++        require(llama_device_mask_default_layout_admit(128ull*1024*1024,true), "large extended mask rejected");
+         std::puts("DEVICE_MASK_POLICY default_auto=1 explicit_disable=1 short_decode_fallback=1 per_stream_boundary=512 PASS");
++        std::puts("DEVICE_MASK_EXTENDED_POLICY automatic_min_dense_bytes=2097152 manual_policy_unchanged=1 PASS");
+         return 0;
+     } catch (const std::exception & error) {
+         std::fprintf(stderr, "FAIL: %s\n", error.what());

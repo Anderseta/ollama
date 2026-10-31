@@ -28,8 +28,16 @@ limits.
 
 ## Compact causal attention metadata
 
-`WILDLLAMA_DEVICE_MASK=1` opts in; the default remains disabled. Eligible prefill
-batches upload key/query positions and sequence-membership bitsets, then expand
+Eligible text batches now use automatic admission when `WILDLLAMA_DEVICE_MASK`
+is unset, with at least 512 queries per stream and the required position/memory proofs.
+Automatic admission additionally requires a dense mask of at least 2 MiB for
+hybrid inputs or text M-RoPE layouts with multiple position coordinates;
+ordinary one-dimensional text retains the 256 KiB dense-mask floor.
+`WILDLLAMA_DEVICE_MASK=0` disables it; explicit `1` retains the wider manual
+admission with the original 32-query/256 KiB minimum, including the guarded
+hybrid/text M-RoPE path. See
+[dense runtime defaults](dense-default-runtime.md) for the current policy.
+Eligible prefill batches upload key/query positions and sequence-membership bitsets, then expand
 the exact existing zero/negative-infinity mask on CUDA. The dense GPU mask still
 exists; the improvement removes its dense CPU construction, host reservation
 and host-to-device transfer. This is not approximate or sparse attention.
@@ -38,6 +46,8 @@ Admission requires at least 32 queries per stream, a dense mask of at least
 256 KiB, at least a fourfold staging-byte reduction, no more than 8 MiB of compact
 metadata, at most 32 active sequence IDs and at most 65,535 query rows across
 streams. Smaller batches retain the original path.
+These base checks apply to both modes; automatic admission also requires the
+larger query-count and extended-layout size thresholds above.
 
 Placement is checked after the actual graph consumers are known: one regular
 CUDA device, compatible attention/KV storage on that device, and supported
@@ -49,8 +59,9 @@ Explicit tensor-buffer overrides retain the host path as well.
 SWA, ALiBi, media/spatial positions and unsupported memory/input classes also
 retain the original implementation. Debug logs contain `device-mask inputs:`
 when compact metadata is populated for execution, rather than only reserved.
-This path requires ordinary one-dimensional token positions; the pure-text
-M-RoPE retention support described below does not extend mask eligibility.
+The hybrid/text M-RoPE extension additionally proves aligned query coordinates
+and token-backed neutral/aligned cached keys. Those proven layouts can also
+use automatic admission; smaller batches require explicit manual opt-in.
 
 ## Cold serialized snapshots on an explicit disk
 
@@ -83,6 +94,11 @@ Disk restore cost is tracked separately from RAM restore cost. Media entries
 and live native resident handles keep their original eviction path. Serialized
 entries must fit the RAM-cache materialization budget. These are page-framed
 snapshots, not a new paged-attention allocator or per-token SSD KV streaming.
+
+`WILDLLAMA_PREFIX_DISK_ASYNC=1` additionally permits bounded proactive writes
+near RAM-cache pressure. Pending vectors remain charged to the existing cache,
+and completed prewrites remain in RAM until eviction. This optional extension
+is described in [bounded prefix prewrites](dense-default-runtime.md#optional-asynchronous-prefix-prewrites).
 
 ## Bounded state-file staging and failed restores
 

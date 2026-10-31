@@ -1,0 +1,410 @@
+diff --git a/src/llama-device-mask.h b/src/llama-device-mask.h
+--- a/src/llama-device-mask.h
++++ b/src/llama-device-mask.h
+@@ -32,6 +32,21 @@
+         n_sequences > 0 && n_sequences <= 32;
+ }
+ 
++// For equal ordinary positions the host M-RoPE mask additionally compares
++// (y,x). Text queries must therefore be aligned, not merely individually
++// neutral/aligned: a neutral query at p>0 can mask an aligned cached key at p.
++inline bool llama_device_mask_text_query(uint32_t n_pos, uint32_t ple_heads,
++        int32_t position, int32_t x, int32_t y, int32_t tail) {
++    return (n_pos==3 || n_pos==4) && !ple_heads && position>=0 &&
++        x==position && y==position && (n_pos==3 || tail==0);
++}
++
++inline bool llama_device_mask_text_key(uint32_t ple_heads, int32_t token,
++        int32_t position, int32_t x, int32_t y) {
++    return !ple_heads && token>=0 && position>=0 &&
++        ((x==0 && y==0) || (x==position && y==position));
++}
++
+ struct llama_device_mask_placement {
+     uint32_t cuda_backends = 0;
+     bool pipeline = false;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1202,7 +1202,13 @@
+     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+     // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+-    if (inp_attn->self_kq_mask->buffer) {
++    if (inp_attn->self_mask_keys && inp_attn->self_mask_keys->buffer &&
++            inp_attn->self_mask_queries && inp_attn->self_mask_queries->buffer) {
++        mctx->get_attn()->set_input_mask_metadata(inp_attn->self_mask_keys,inp_attn->self_mask_queries,*ubatch);
++        LLAMA_LOG_DEBUG("device-mask inputs: hybrid kv_rows=%lld query_rows=%lld streams=%lld dense_bytes=%zu compact_bytes=%zu\n",
++            (long long)inp_attn->self_kq_mask->ne[0],(long long)inp_attn->self_kq_mask->ne[1],(long long)inp_attn->self_kq_mask->ne[3],
++            ggml_nbytes(inp_attn->self_kq_mask),ggml_nbytes(inp_attn->self_mask_keys)+ggml_nbytes(inp_attn->self_mask_queries));
++    } else if (inp_attn->self_kq_mask->buffer) {
+         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+     }
+ 
+@@ -1237,7 +1243,12 @@
+     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
++    inp_attn->mctx=mctx->get_attn();
+     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
++    if (inp_attn->self_mask_keys) {
++        const uint32_t ns=params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
++        res &= mctx->get_attn()->can_use_device_mask(params.ubatch,params.cparams.causal_attn,ns);
++    }
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+ 
+@@ -1683,9 +1694,20 @@
+     if (!placement.all_layers_on_device) { return; }
+ 
+     for (auto & input : inputs) {
+-        // Derived/auxiliary memory inputs must define their own complete proof.
+-        if (typeid(*input)!=typeid(llm_graph_input_attn_kv)) { continue; }
+-        auto * inp=static_cast<llm_graph_input_attn_kv *>(input.get());
++        // Only the exact ordinary input and exact plain hybrid wrapper share
++        // this proof. ISWA, K-only, compressed/indexer and derived inputs keep
++        // their complete original host contracts.
++        llm_graph_input_attn_kv * inp=nullptr;
++        bool hybrid=false;
++        if (typeid(*input)==typeid(llm_graph_input_attn_kv)) {
++            inp=static_cast<llm_graph_input_attn_kv *>(input.get());
++        } else if (typeid(*input)==typeid(llm_graph_input_mem_hybrid)) {
++            const auto * wrapper=static_cast<llm_graph_input_mem_hybrid *>(input.get());
++            if (!wrapper->mctx || typeid(*wrapper->mctx)!=typeid(llama_memory_hybrid_context)) { continue; }
++            inp=wrapper->get_attn();hybrid=true;
++        }
++        if (!inp || typeid(*inp)!=typeid(llm_graph_input_attn_kv) ||
++                !inp->mctx || typeid(*inp->mctx)!=typeid(llama_kv_cache_context)) { continue; }
+         auto * mask=inp->self_kq_mask;
+         if (!mask || mask->op!=GGML_OP_NONE || !(mask->flags & GGML_TENSOR_FLAG_INPUT)) { continue; }
+         const auto & batch=params.ubatch;
+@@ -1702,6 +1724,10 @@
+         placement.all_kv_regular_on_device=true;
+         try {
+             for (uint32_t il=0;il<model.hparams.n_layer();++il) {
++                // Recurrent layers have no K/V entry. Their model placement
++                // was still required above; the graph's attention consumers
++                // must all pass the same CUDA check below.
++                if (hybrid && model.hparams.is_recr(il)) { continue; }
+                 if (!device_mask_regular_storage(inp->mctx->get_k(probe.get(),il),device) ||
+                         !device_mask_regular_storage(inp->mctx->get_v(probe.get(),il),device)) {
+                     placement.all_kv_regular_on_device=false;break;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2019,11 +2019,21 @@
+ }
+ 
+ bool llama_kv_cache::can_use_device_mask(const llama_ubatch & ubatch, bool causal_attn, uint32_t n_stream) const {
+-    if (!llama_device_mask_supported(causal_attn, hparams.use_alibi,
+-            n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE, ubatch.n_pos,
++    const bool text_mrope=ubatch.n_pos==3 || ubatch.n_pos==4;
++    if (typeid(*this)!=typeid(llama_kv_cache) ||
++            !llama_device_mask_supported(causal_attn, hparams.use_alibi,
++            n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE, text_mrope ? 1 : ubatch.n_pos,
+             ubatch.token != nullptr, ubatch.is_mixed(), ubatch.n_seqs_unq) ||
+             n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
+         return false;
++    }
++    if (text_mrope) {
++        if (!ubatch.pos) { return false; }
++        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
++            if (!llama_device_mask_text_query(ubatch.n_pos,hparams.ple_n_heads,
++                    ubatch.pos[i],ubatch.pos[2*ubatch.n_tokens+i],ubatch.pos[ubatch.n_tokens+i],
++                    ubatch.n_pos==4 ? ubatch.pos[3*ubatch.n_tokens+i] : 0)) { return false; }
++        }
+     }
+     const uint32_t nq = ubatch.n_tokens / n_stream;
+     for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -2031,6 +2041,18 @@
+         for (uint32_t q = 0; q < nq; ++q) {
+             if (seq_to_stream[ubatch.seq_id[s*nq+q][0]] != stream) {
+                 return false;
++            }
++        }
++        if (text_mrope) {
++            // Scan only the occupied physical prefix, never the complete
++            // logical allocation. Foreign spatial/media cells conservatively
++            // retain the host path even if no current query could see them.
++            const auto & cells=v_cells.at(stream);
++            for (uint32_t k=0;k<cells.used_max_p1();++k) {
++                if (cells.is_empty(k)) { continue; }
++                const auto & ext=cells.ext_get(k);
++                if (!llama_device_mask_text_key(hparams.ple_n_heads,ext.tok,
++                        cells.pos_get(k),ext.x,ext.y)) { return false; }
+             }
+         }
+     }
+diff --git a/tests/test-hybrid-device-mask.cpp b/tests/test-hybrid-device-mask.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test-hybrid-device-mask.cpp
+@@ -0,0 +1,249 @@
++#include "llama.h"
++#include "llama-cpp.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "llama-ext.h"
++#include "llama-memory-hybrid.h"
++#include "llama-hybrid-prefix-transaction.h"
++#include "llama-prefix-text.h"
++#include "llama-device-mask.h"
++#include "llama-kv-cache.h"
++#include <climits>
++#include <filesystem>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++static void require(bool b,const char * message){if(!b)throw std::runtime_error(message);}
++static bool gpu=false;
++static void recurrent_cap(const char * value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_PREFIX_RECURRENT_MIB",value);
++#else
++    setenv("WILDLLAMA_PREFIX_RECURRENT_MIB",value,1);
++#endif
++}
++static llama_model_ptr tiny_model(bool gpu = false, int embedding_width = 32, const std::string & export_path = {}) {
++    const int dim=embedding_width, vocab=259;
++    gguf_context_ptr metadata(gguf_init_empty());
++    gguf_set_val_str(metadata.get(), "general.architecture", "qwen35");
++    gguf_set_val_str(metadata.get(), "general.name", "mtp-rollback-diagnostic-fixture");
++    auto u32=[&](const char * key, uint32_t value) {
++        gguf_set_val_u32(metadata.get(), (std::string("qwen35.")+key).c_str(),value);
++    };
++    u32("context_length",512); u32("embedding_length",dim); u32("block_count",3);
++    u32("feed_forward_length",64); u32("attention.head_count",2);
++    u32("attention.head_count_kv",1); u32("rope.dimension_count",16);
++    u32("nextn_predict_layers",1); u32("full_attention_interval",2);
++    u32("ssm.conv_kernel",4); u32("ssm.inner_size",128);
++    u32("ssm.state_size",128); u32("ssm.time_step_rank",1); u32("ssm.group_count",1);
++    gguf_set_val_f32(metadata.get(),"qwen35.attention.layer_norm_rms_epsilon",1e-6f);
++    const uint32_t sections[]={4,4,0,0};
++    gguf_set_arr_data(metadata.get(),"qwen35.rope.dimension_sections",GGUF_TYPE_UINT32,sections,4);
++    gguf_set_val_str(metadata.get(),"tokenizer.ggml.model","llama");
++    std::vector<std::string> strings={"<unk>","<s>","</s>"};
++    for(int i=0;i<256;++i){char name[16];std::snprintf(name,sizeof(name),"<0x%02X>",i);strings.emplace_back(name);}
++    std::vector<const char *> names;for(auto & t:strings)names.push_back(t.c_str());
++    std::vector<float> scores(vocab,0);std::vector<int32_t> types(vocab,6);types[0]=2;types[1]=types[2]=3;
++    gguf_set_arr_str(metadata.get(),"tokenizer.ggml.tokens",names.data(),names.size());
++    gguf_set_arr_data(metadata.get(),"tokenizer.ggml.scores",GGUF_TYPE_FLOAT32,scores.data(),scores.size());
++    gguf_set_arr_data(metadata.get(),"tokenizer.ggml.token_type",GGUF_TYPE_INT32,types.data(),types.size());
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.unknown_token_id",0);
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.bos_token_id",1);
++    gguf_set_val_u32(metadata.get(),"tokenizer.ggml.eos_token_id",2);
++    gguf_set_val_bool(metadata.get(),"tokenizer.ggml.add_bos_token",true);
++    gguf_context_ptr exported(gguf_init_empty());gguf_set_kv(exported.get(),metadata.get());
++    // Export only the ordinary hybrid trunk for the HTTP fixture; the in-memory
++    // regression model may also carry an unused MTP head.
++    gguf_set_val_u32(exported.get(),"qwen35.block_count",2);
++    gguf_set_val_u32(exported.get(),"qwen35.nextn_predict_layers",0);
++    ggml_context_ptr host_tensors(ggml_init({8*1024*1024,nullptr,false}));
++    struct capture {gguf_context * metadata;ggml_context * tensors;bool enabled;};
++    capture capture_state{exported.get(),host_tensors.get(),!export_path.empty()};
++    auto initialize=[](ggml_tensor * tensor, void * opaque) {
++        require(tensor->type == GGML_TYPE_F32,"unexpected tiny fixture type");
++        std::vector<float> values(ggml_nelements(tensor));
++        uint32_t state=2166136261u;
++        for (const char * p=tensor->name;*p;++p) state=(state^uint8_t(*p))*16777619u;
++        const std::string name(tensor->name);
++        for (auto & value:values) {
++            state^=state<<13; state^=state>>17; state^=state<<5;
++            value=(float(state&65535)/65535.f-.5f)*.12f;
++        }
++        if (name.find("norm")!=std::string::npos) std::fill(values.begin(),values.end(),1.f);
++        if (name.find("ssm_a")!=std::string::npos) std::fill(values.begin(),values.end(),-1.f);
++        if (name.find("ssm_dt.bias")!=std::string::npos) std::fill(values.begin(),values.end(),-1.f);
++        ggml_backend_tensor_set(tensor,values.data(),0,values.size()*sizeof(float));
++        auto & saved=*static_cast<capture *>(opaque);
++        if(saved.enabled && name.rfind("blk.2.",0)!=0){
++            auto * host=ggml_new_tensor(saved.tensors,tensor->type,ggml_n_dims(tensor),tensor->ne);
++            ggml_set_name(host,tensor->name);std::memcpy(host->data,values.data(),values.size()*sizeof(float));
++            gguf_add_tensor(saved.metadata,host);
++        }
++    };
++    auto params=llama_model_default_params();
++    ggml_backend_dev_t devices[]={gpu ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr, nullptr};
++    params.devices=devices; params.n_gpu_layers=gpu ? 99 : 0; params.gpu_exclusive=gpu; params.load_mode=LLAMA_LOAD_MODE_NONE;
++    params.use_extra_bufts=false; params.no_host=true; params.load_mtp=true;
++    llama_model_ptr model(llama_model_init_from_user(metadata.get(),initialize,&capture_state,params));
++    require(bool(model),"cannot initialize nonzero tiny recurrent fixture");
++    if(!export_path.empty()){require(gguf_write_to_file(exported.get(),export_path.c_str(),false),"cannot export tiny hybrid fixture");}
++    return model;
++}
++
++
++
++static void compact(bool value) {
++#ifdef _WIN32
++    _putenv_s("WILDLLAMA_DEVICE_MASK",value ? "1" : "0");
++#else
++    setenv("WILDLLAMA_DEVICE_MASK",value ? "1" : "0",1);
++#endif
++}
++static void position_proof() {
++    size_t checks=0;
++    for (const int32_t p : {0,1,2,17,1024,INT_MAX}) {
++        require(llama_device_mask_text_query(4,0,p,p,p,0),"aligned M-RoPE text query rejected");
++        require(llama_device_mask_text_query(3,0,p,p,p,31),"three-section query rejected");
++        require(!llama_device_mask_text_query(2,0,p,p,p,0),"unknown position layout admitted");
++        require(!llama_device_mask_text_query(4,1,p,p,p,0),"PLE query admitted");
++        require(!llama_device_mask_text_query(4,0,p,p,p,1),"nonzero fourth position admitted");
++        if(p)require(!llama_device_mask_text_query(4,0,p,0,0,0),"neutral query can mask aligned equal-p cached key");
++        const int32_t changed=p==INT_MAX ? p-1 : p+1;
++        require(!llama_device_mask_text_query(4,0,p,changed,p,0),"spatial x query admitted");
++        require(!llama_device_mask_text_query(4,0,p,p,changed,0),"spatial y query admitted");
++        for(const int32_t k : {0,1,2,17,1024,INT_MAX}) {
++            for(const bool neutral : {false,true}) {
++                const int32_t x=neutral ? 0 : k,y=x;
++                require(llama_device_mask_text_key(0,3,k,x,y),"token-backed text key rejected");
++                const bool host=k<=p && !(k==p && ((y>p)||(y==p && x>p)));
++                const bool device=k<=p;
++                require(host==device,"admitted text proof changes equal-position causal visibility");
++                ++checks;
++            }
++        }
++        require(!llama_device_mask_text_key(0,LLAMA_TOKEN_NULL,p,p,p),"embedding/media key admitted");
++        require(!llama_device_mask_text_key(1,3,p,p,p),"PLE key admitted");
++        require(!llama_device_mask_text_key(0,3,p,changed,p),"spatial cached key admitted");
++    }
++    require(!llama_device_mask_text_query(4,0,-1,-1,-1,0),"negative query admitted");
++    require(!llama_device_mask_text_key(0,3,-1,0,0),"negative key admitted");
++    // Concrete counterexample to using the prefix-retention helper alone.
++    require(llama_prefix_text_cell(4,0,llama_kv_cell_ext{7,7,3},7),"retention control rejected aligned text");
++    require(llama_kv_cell_ext{7,7,3}.is_2d_gt(0,0),"equal-p counterexample invalid");
++    require(!llama_device_mask_text_query(4,0,7,0,0,0),"equal-p neutral query counterexample admitted");
++    std::printf("MROPE_TEXT_PROOF exact_visibility=%zu unsupported_media_spatial_ple_negative PASS\n",checks);
++}
++
++static size_t mask_ops=0,cuda_mask_ops=0,cuda_attention=0,cpu_attention=0;
++static bool observe(ggml_tensor * t,bool ask,void *) {
++    if(t->op!=GGML_OP_ATTN_MASK && t->op!=GGML_OP_FLASH_ATTN_EXT && t->op!=GGML_OP_SOFT_MAX)return false;
++    if(ask)return true;
++    const bool host=t->buffer && ggml_backend_buffer_is_host(t->buffer);
++    bool cuda=false;
++    if(!host && t->buffer) {
++        const auto device=ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
++        const auto reg=device ? ggml_backend_dev_backend_reg(device) : nullptr;
++        cuda=reg && std::strcmp(ggml_backend_reg_name(reg),"CUDA")==0;
++    }
++    if(t->op==GGML_OP_ATTN_MASK){++mask_ops;if(cuda)++cuda_mask_ops;}
++    else {if(cuda)++cuda_attention;else if(host)++cpu_attention;}
++    return true;
++}
++static llama_context_ptr mask_context(llama_model * model,bool use_compact,bool flash) {
++    compact(use_compact);
++    auto p=llama_context_default_params();
++    p.n_ctx=2048;p.n_batch=512;p.n_ubatch=512;p.n_seq_max=1;p.kv_unified=true;
++    p.n_rs_seq=2;p.n_threads=p.n_threads_batch=1;p.op_offload=gpu;p.offload_kqv=gpu;
++    p.flash_attn_type=flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
++    p.cb_eval=observe;
++    llama_context_ptr ctx(llama_init_from_model(model,p));
++    require(bool(ctx),"cannot create hybrid mask context");
++    require(dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx.get())),"test model is not hybrid");
++    return ctx;
++}
++static std::vector<float> mask_decode(llama_context * ctx,int n,int start,bool use_compact,bool expect_mask,bool media=false) {
++    compact(use_compact);
++    std::vector<llama_token> tokens(n);std::vector<float> embeddings(size_t(n)*128,0.01f);
++    std::vector<llama_pos> positions(size_t(n)*(media ? 4 : 1));
++    std::vector<int32_t> nseq(n,1);std::vector<llama_seq_id> sid(n,0);
++    std::vector<llama_seq_id *> ids(n);std::vector<int8_t> logits(n,1);
++    for(int i=0;i<n;++i){tokens[i]=3+(i*13+start)%256;positions[i]=start+i;ids[i]=&sid[i];}
++    if(media)for(int j=1;j<4;++j)for(int i=0;i<n;++i)positions[size_t(j)*n+i]=j==3 ? 0 : (start+i)/2;
++    llama_batch batch{};batch.n_tokens=n;batch.token=media ? nullptr : tokens.data();
++    batch.embd=media ? embeddings.data() : nullptr;batch.pos=positions.data();batch.n_seq_id=nseq.data();
++    batch.seq_id=ids.data();batch.logits=logits.data();
++    mask_ops=cuda_mask_ops=cuda_attention=cpu_attention=0;
++    require(llama_decode(ctx,batch)==0,"hybrid mask decode failed");
++    require(expect_mask ? (mask_ops>0 && cuda_mask_ops==mask_ops) : mask_ops==0,"hybrid compact/fallback execution wrong");
++    if(expect_mask)require(cuda_attention>0 && cpu_attention==0,"hybrid compact attention silently used CPU");
++    const auto * values=llama_get_logits(ctx);require(values,"hybrid mask logits missing");
++    const int vocab=llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    std::printf("HYBRID_MASK n=%d pos=%d media=%d ops=%zu cuda_mask=%zu cuda_attention=%zu cpu_attention=%zu\n",
++        n,start,media,mask_ops,cuda_mask_ops,cuda_attention,cpu_attention);
++    return {values,values+size_t(n)*vocab};
++}
++static void equal_mask(const std::vector<float> & a,const std::vector<float> & b,const char * tag) {
++    require(a.size()==b.size(),"hybrid mask logits changed shape");
++    float maximum=0;
++    for(size_t i=0;i<a.size();++i){require(std::isfinite(a[i])&&std::isfinite(b[i]),"nonfinite hybrid mask logits");maximum=std::max(maximum,std::abs(a[i]-b[i])/(1+std::abs(a[i])));}
++    require(maximum<=1e-5f,"hybrid compact mask changed logits");
++    std::printf("HYBRID_MASK_LOGITS stage=%s elements=%zu max_scaled=%.9g\n",tag,a.size(),maximum);
++}
++static void graph_tests(const std::string & directory) {
++    std::filesystem::create_directories(directory);
++    auto model=tiny_model(gpu,128,(std::filesystem::path(directory)/"hybrid-text-mask.gguf").string());
++    for(const bool flash : {false,true}) {
++        auto reference=mask_context(model.get(),false,flash),candidate=mask_context(model.get(),true,flash);
++        auto clear=[&]{for(auto * ctx : {reference.get(),candidate.get()})llama_memory_clear(llama_get_memory(ctx),true);};
++        auto pair=[&](int n,int pos,bool eligible,const char * tag,bool media=false) {
++            auto a=mask_decode(reference.get(),n,pos,false,false,media);
++            auto b=mask_decode(candidate.get(),n,pos,true,gpu&&eligible,media);
++            equal_mask(a,b,tag);
++        };
++        pair(512,0,true,"hybrid-text-prefill");
++        pair(512,512,true,"hybrid-text-reuse");
++        pair(1,1024,false,"hybrid-single-decode-fallback");
++        clear();
++        for(auto * ctx : {reference.get(),candidate.get()})llama_set_causal_attn(ctx,false);
++        pair(512,0,false,"hybrid-noncausal-fallback");
++        clear();
++        for(auto * ctx : {reference.get(),candidate.get()})llama_set_causal_attn(ctx,true);
++        pair(512,0,true,"hybrid-causal-reentry");
++        for(auto * ctx : {reference.get(),candidate.get()}) {
++            auto * mem=dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
++            auto & cells=const_cast<llama_kv_cells &>(mem->get_mem_attn()->get_cells(0));
++            const auto index=cells.seq_pos_get(0).begin()->second;
++            auto ext=cells.ext_get(index);ext.tok=LLAMA_TOKEN_NULL;cells.ext_set(index,ext);
++        }
++        pair(512,512,false,"hybrid-cached-media-fallback");
++        clear();pair(512,0,true,"hybrid-cache-reset-reentry");
++        for(auto * ctx : {reference.get(),candidate.get()}) {
++            auto * mem=dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
++            auto & cells=const_cast<llama_kv_cells &>(mem->get_mem_attn()->get_cells(0));
++            const auto index=cells.seq_pos_get(0).begin()->second;
++            auto ext=cells.ext_get(index);ext.x=1;ext.y=0;cells.ext_set(index,ext);
++        }
++        pair(512,512,false,"hybrid-cached-spatial-fallback");
++        clear();pair(512,0,false,"hybrid-media-query-fallback",true);
++        pair(512,512,false,"hybrid-text-after-media-fallback");
++        std::printf("HYBRID_MASK_GRAPH backend=%s flash=%d actual_positive_media_negative PASS\n",gpu ? "CUDA" : "CPU-fallback",flash);
++    }
++    compact(false);
++}
++int main(int argc,char ** argv) {
++    try {
++        std::setvbuf(stdout,nullptr,_IONBF,0);
++        gpu=argc>1 && std::strcmp(argv[1],"--cuda")==0;
++        const std::string dir=argc>(gpu ? 2 : 1) ? argv[gpu ? 2 : 1] : ".";
++        ggml_backend_load_all();
++        if(gpu && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))return 77;
++        position_proof();
++        graph_tests(dir);
++        return 0;
++    } catch(const std::exception & e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -493,4 +493,14 @@
+     llama_test(test-hybrid-prefix NAME test-hybrid-prefix-cuda ARGS --cuda LABEL "backend cuda")
+     set_tests_properties(test-hybrid-prefix-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+ endif()
+-endif()
++
++llama_build(test-hybrid-device-mask.cpp LINK llama ggml)
++target_include_directories(test-hybrid-device-mask PRIVATE ../src)
++add_dependencies(test-hybrid-device-mask ggml-cpu)
++llama_test(test-hybrid-device-mask ARGS ${CMAKE_CURRENT_BINARY_DIR} LABEL "main behavior")
++if (TARGET ggml-cuda)
++    add_dependencies(test-hybrid-device-mask ggml-cuda)
++    llama_test(test-hybrid-device-mask NAME test-hybrid-device-mask-cuda ARGS --cuda ${CMAKE_CURRENT_BINARY_DIR} LABEL "backend cuda")
++    set_tests_properties(test-hybrid-device-mask-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
++endif()
++endif()
